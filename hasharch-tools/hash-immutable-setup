@@ -1,0 +1,81 @@
+#!/bin/bash
+# hash-immutable-setup — turn on the immutable-core safety net at install time.
+#
+# Run by Calamares (shellprocess@immutable) inside the freshly-installed target,
+# AFTER the bootloader step. It is NEVER fatal: every step is guarded so a quirk
+# can't abort the install (mirrors hash-keystore-install's posture).
+#
+# Delivers the "Rollback & immutable core":
+#   * snapper config for /  — automatic timeline snapshots + cleanup
+#   * snap-pac             — a snapshot before & after every pacman transaction
+#   * grub-btrfs           — boot INTO any snapshot from the GRUB menu (recovery)
+#   * locked UX            — the HasH look is made immutable (hash-ux-lock), with a
+#                            pacman hook that lifts the lock for updates + re-applies
+#
+# btrfs layout assumed (from partition.conf): @ -> /, @home -> /home,
+# @snapshots -> /.snapshots (pre-created), @var_log, @var_cache.
+set -uo pipefail
+log(){ printf '[hash-immutable] %s\n' "$*"; }
+
+root_fs="$(findmnt -no FSTYPE / 2>/dev/null || true)"
+if [ "$root_fs" != "btrfs" ]; then
+    log "root filesystem is '${root_fs:-unknown}', not btrfs — skipping immutable setup."
+    exit 0
+fi
+
+# ── 1) snapper config for / ────────────────────────────────────────────────────
+# @snapshots is pre-created as /.snapshots by the partitioner, so `snapper
+# create-config` would refuse (it wants to make /.snapshots itself). Instead we
+# drop the config from the template and register it — the robust path for a
+# layout that already has a @snapshots subvol.
+if command -v snapper >/dev/null 2>&1; then
+    if [ ! -f /etc/snapper/configs/root ]; then
+        if [ -f /usr/share/snapper/config-templates/default ]; then
+            install -Dm644 /usr/share/snapper/config-templates/default \
+                /etc/snapper/configs/root
+        fi
+    fi
+    if [ -f /etc/snapper/configs/root ]; then
+        prim="$(getent passwd 1000 | cut -d: -f1)"
+        sed -i \
+            -e "s/^ALLOW_USERS=.*/ALLOW_USERS=\"${prim:-}\"/" \
+            -e 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="yes"/' \
+            -e 's/^TIMELINE_CLEANUP=.*/TIMELINE_CLEANUP="yes"/' \
+            -e 's/^TIMELINE_LIMIT_HOURLY=.*/TIMELINE_LIMIT_HOURLY="5"/' \
+            -e 's/^TIMELINE_LIMIT_DAILY=.*/TIMELINE_LIMIT_DAILY="7"/' \
+            -e 's/^TIMELINE_LIMIT_WEEKLY=.*/TIMELINE_LIMIT_WEEKLY="2"/' \
+            -e 's/^TIMELINE_LIMIT_MONTHLY=.*/TIMELINE_LIMIT_MONTHLY="2"/' \
+            -e 's/^TIMELINE_LIMIT_YEARLY=.*/TIMELINE_LIMIT_YEARLY="0"/' \
+            /etc/snapper/configs/root 2>/dev/null || true
+        # register the config (idempotent)
+        if [ -f /etc/conf.d/snapper ]; then
+            grep -q 'SNAPPER_CONFIGS="root"' /etc/conf.d/snapper 2>/dev/null \
+                || sed -i 's/^SNAPPER_CONFIGS=.*/SNAPPER_CONFIGS="root"/' /etc/conf.d/snapper 2>/dev/null || true
+        fi
+        chmod 750 /.snapshots 2>/dev/null || true
+        systemctl enable snapper-timeline.timer snapper-cleanup.timer 2>/dev/null || true
+        log "snapper configured (timeline + cleanup; snap-pac covers pacman)."
+    fi
+else
+    log "snapper not installed — skipping snapshot config (non-fatal)."
+fi
+
+# ── 2) grub-btrfs: snapshots show up as boot entries (boot one to recover) ──────
+if command -v grub-mkconfig >/dev/null 2>&1; then
+    systemctl enable grub-btrfs.path 2>/dev/null || true
+    grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 \
+        && log "grub-btrfs enabled (snapshots in the boot menu)." \
+        || log "grub-mkconfig deferred — re-run after first boot (non-fatal)."
+fi
+
+# ── 3) locked UX — make the HasH front-facing look immutable ────────────────────
+if command -v hash-ux-lock >/dev/null 2>&1; then
+    if hash-ux-lock apply >/dev/null 2>&1; then
+        log "locked the HasH UX (the look can't be changed; updates still apply)."
+    else
+        log "UX lock skipped (non-fatal)."
+    fi
+fi
+
+log "immutable-core setup done."
+exit 0

@@ -1,0 +1,12 @@
+# Install to /usr/lib/systemd/system/hash-snapshot-backup.service
+[Unit]
+Description=HasH system-snapshot backup to cloud (rclone)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/bin/hash-snapshot-backup
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/bin/hash-snapshot-backup run

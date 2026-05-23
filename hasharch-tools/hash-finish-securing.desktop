@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Finish Securing HasH
+GenericName=Secure Boot & Keystore setup
+Comment=Turn on Secure Boot (your own keys) and set your TPM keystore PIN
+Exec=konsole -e hash-finish-securing
+Icon=security-high
+Terminal=false
+Categories=System;Security;Settings;
+Keywords=secure boot;tpm;keystore;encryption;pin;vault;

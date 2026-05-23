@@ -1,0 +1,100 @@
+#!/bin/bash
+# hash-snapshot-backup — send a btrfs SYSTEM snapshot to the user's cloud (rclone)
+# on a daily / weekly / monthly schedule, for off-machine disaster recovery.
+#
+# Reuses the destination configured in HasH Settings → Backups
+# (~<user>/.config/hash/backups.json: {"remote","path"}). A read-only btrfs
+# snapshot of / is streamed with `btrfs send`, zstd-compressed to one file, and
+# rclone-copied to <remote>:<path>/system-snapshots/. The user's DOCUMENTS are
+# handled by the normal folder backup (`hash-settings backup`) — the setup prompt
+# "also upload your documents?" simply turns those folders on there.
+#
+#   hash-snapshot-backup run                 # snapshot + send to cloud now
+#   hash-snapshot-backup schedule <when>     # off | daily | weekly | monthly
+#   hash-snapshot-backup status
+#
+# NEEDS root (btrfs send). rclone runs AS the owning user (their rclone remotes).
+set -uo pipefail
+log(){ printf '[hash-snapshot] %s\n' "$*"; }
+
+STAGE="/var/lib/hash/snapshots"        # transient send files (root-only)
+SUBVOL="/"                              # the system subvol (@)
+UNIT="hash-snapshot-backup"
+
+prim_user(){ getent passwd 1000 | cut -d: -f1; }
+prim_home(){ getent passwd 1000 | cut -d: -f6; }
+
+read_dest(){   # echo "remote|path" from the user's backups.json (or nothing)
+  local cfg; cfg="$(prim_home)/.config/hash/backups.json"
+  [ -f "$cfg" ] || return 0
+  python3 - "$cfg" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    r = d.get("remote", ""); p = (d.get("path") or "HasH-Backup").strip("/")
+    if r:
+        print(f"{r}|{p}")
+except Exception:
+    pass
+PY
+}
+
+cmd_run(){
+  [ "$(id -u)" -eq 0 ] || { log "needs root (btrfs send)."; exit 87; }
+  command -v btrfs >/dev/null 2>&1 || { log "btrfs not found — skipping."; exit 0; }
+  [ "$(findmnt -no FSTYPE / 2>/dev/null)" = "btrfs" ] || { log "root is not btrfs — nothing to snapshot."; exit 0; }
+  local dest; dest="$(read_dest)"
+  [ -n "$dest" ] || { log "no cloud destination set (HasH Settings → Backups) — skipping."; exit 0; }
+  command -v rclone >/dev/null 2>&1 || { log "rclone not installed — skipping."; exit 0; }
+  local remote="${dest%%|*}" rpath="${dest##*|}" user home stamp ro out
+  user="$(prim_user)"; home="$(prim_home)"
+  mkdir -p "$STAGE"; chmod 700 "$STAGE"
+  stamp="$(date +%Y-%m-%dT%H-%M-%S)"; ro="$STAGE/snap-$stamp"; out="$STAGE/system-$stamp.btrfs.zst"
+
+  if ! btrfs subvolume snapshot -r "$SUBVOL" "$ro" >/dev/null 2>&1; then
+    log "could not snapshot $SUBVOL — skipping."; exit 0
+  fi
+  sync
+  log "streaming system snapshot → cloud (this can take a while)…"
+  if btrfs send "$ro" 2>/dev/null | zstd -q -T0 -3 -o "$out" 2>/dev/null; then
+    if sudo -u "$user" rclone copy "$out" "$remote:$rpath/system-snapshots/" --stats-one-line 2>&1 | tail -1; then
+      log "system snapshot uploaded to $remote:$rpath/system-snapshots/"
+    else
+      log "upload failed — local file kept at $out"
+    fi
+  else
+    log "btrfs send failed — skipping upload."
+  fi
+  btrfs subvolume delete "$ro" >/dev/null 2>&1 || true
+  rm -f "$out" 2>/dev/null || true
+}
+
+cmd_schedule(){
+  [ "$(id -u)" -eq 0 ] || { log "needs root."; exit 87; }
+  local when="${1:-off}" oncal=""
+  case "$when" in
+    off)     systemctl disable --now "$UNIT.timer" 2>/dev/null || true; log "snapshot cloud backup OFF."; return 0;;
+    daily)   oncal="daily";;
+    weekly)  oncal="weekly";;
+    monthly) oncal="monthly";;
+    *) log "usage: hash-snapshot-backup schedule {off|daily|weekly|monthly}"; exit 2;;
+  esac
+  install -d /etc/systemd/system/"$UNIT.timer.d"
+  printf '[Timer]\nOnCalendar=\nOnCalendar=%s\n' "$oncal" > /etc/systemd/system/"$UNIT.timer.d"/schedule.conf
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable --now "$UNIT.timer" 2>/dev/null || true
+  log "snapshot cloud backup scheduled: $when."
+}
+
+cmd_status(){
+  local dest; dest="$(read_dest)"
+  echo "destination: ${dest:+${dest%%|*}:${dest##*|}/system-snapshots}"
+  echo -n "timer:       "; systemctl is-active "$UNIT.timer" 2>/dev/null || true
+}
+
+case "${1:-status}" in
+  run)      cmd_run;;
+  schedule) shift; cmd_schedule "${1:-off}";;
+  status)   cmd_status;;
+  *) echo "usage: hash-snapshot-backup {run|schedule <off|daily|weekly|monthly>|status}"; exit 2;;
+esac

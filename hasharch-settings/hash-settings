@@ -206,6 +206,14 @@ SECTIONS = [
                     "scheduled, automatic, timer", "kind": "page",
          "target": "backups"},
     ]),
+    ("devices", "Devices", "printer", "devices", [
+        {"name": "Printers", "icon": "printer",
+         "comment": "Set up & manage printers — CUPS, lpadmin, print, default "
+                    "printer, test page", "kind": "page", "target": "devices"},
+        {"name": "USB devices", "icon": "drive-removable-media",
+         "comment": "See connected USB devices — lsusb, hardware, peripherals",
+         "kind": "page", "target": "devices"},
+    ]),
     ("apps", "Apps", "applications-other", "apps", [
         {"name": "Software Center", "icon": "system-software-install",
          "comment": "Browse, search & install apps — no terminal",
@@ -1373,6 +1381,44 @@ def backup_timer_active():
     return r.stdout.strip() == "active"
 
 
+# ───────────────────────── Devices (printers + USB) ──────────────────────────
+def printers_available():
+    return have("lpstat")
+
+
+def list_printers():
+    """[{name, state, default}] from CUPS (lpstat). User-level, no root."""
+    if not have("lpstat"):
+        return []
+    default = ""
+    rd = _run(["lpstat", "-d"], timeout=6)
+    if ":" in (rd.stdout or ""):
+        default = rd.stdout.split(":", 1)[1].strip()
+    out = []
+    for ln in _run(["lpstat", "-p"], timeout=8).stdout.splitlines():
+        if ln.startswith("printer "):
+            name = ln.split()[1]
+            state = ("printing" if "printing" in ln else
+                     "disabled" if "disabled" in ln else
+                     "idle" if "idle" in ln else "ready")
+            out.append({"name": name, "state": state, "default": name == default})
+    return out
+
+
+def usb_devices():
+    """[{id, name}] from lsusb (read-only info)."""
+    if not have("lsusb"):
+        return []
+    out = []
+    for ln in _run(["lsusb"], timeout=6).stdout.splitlines():
+        if "ID " in ln:
+            rest = ln.split("ID ", 1)[1]
+            devid = rest.split()[0]
+            name = rest[len(devid):].strip() or "USB device"
+            out.append({"id": devid, "name": name})
+    return out
+
+
 TOGGLES = [
     {"id": "wifi", "name": "Wi-Fi", "icon": "network-wireless",
      "avail": wifi_available, "get": wifi_state, "set": wifi_set},
@@ -1908,6 +1954,7 @@ def gui(start_key="overview", shot=None):
         "security": "#ff6b6b", "disks": "#8a6cff", "apps": "#ff8f3d",
         "system": "#56c5d8", "services": "#b06cff", "eventviewer": "#ffb02e",
         "users": "#3ddc84", "updates": "#2ec8e0", "backups": "#37c8a0",
+        "devices": "#ff8f3d",
     }
     TOG_COLORS = {"wifi": "#3b9dff", "bluetooth": "#4f9bff", "night": "#ff8f3d",
                   "theme": "#c264ff", "visualiser": "#3ddc84"}
@@ -4202,13 +4249,42 @@ def gui(start_key="overview", shot=None):
             cc.addLayout(self.connList)
             v.addWidget(ccard)
 
-            # ── Deep Packet Inspection (relocated from Network) ──
-            self.section(v, "Deep Packet Inspection")
+            # ── Outbound (egress) control — per-app "no calling home" ──
+            self.section(v, "Outbound (egress) control")
+            gcard, gc = self.card()
+            gc.addWidget(self._lbl(
+                "See what each app is talking to in 'Connections & ports' above, "
+                "then Inspect its packets or Block where it's calling — block "
+                "telemetry and unknown destinations. Blocks drop outbound traffic "
+                "to that destination (firewalld); 'Refresh (admin)' lists them.", True))
+            grow = QHBoxLayout()
+            self.egAddr = QLineEdit()
+            self.egAddr.setPlaceholderText("Block a destination — host or IP (e.g. telemetry.example.com)…")
+            grow.addWidget(self.egAddr, 1)
+            egb = QPushButton("Block")
+            egb.setObjectName("danger")
+            egb.clicked.connect(self._block_typed)
+            grow.addWidget(egb)
+            egr = QPushButton("Refresh (admin)")
+            egr.clicked.connect(self._refresh_egress)
+            grow.addWidget(egr)
+            gc.addLayout(grow)
+            self.egList = QVBoxLayout()
+            self.egList.setSpacing(6)
+            gc.addLayout(self.egList)
+            if not have("firewall-cmd"):
+                gc.addWidget(self._lbl("firewalld isn't installed — egress blocking "
+                                       "is unavailable.", True))
+            v.addWidget(gcard)
+
+            # ── HasH Network Analyser (capture / intercept / monitor a device) ──
+            self.section(v, "HasH Network Analyser")
             dcard, dc = self.card()
             dc.addWidget(self._lbl(
-                "Capture & inspect traffic. Wireshark = full packet capture; "
-                "mitmweb = HTTP/S intercept proxy (Fiddler-style) on 127.0.0.1:8080 "
-                "with a web UI.", True))
+                "Capture & inspect traffic. Wireshark = full packet capture; the "
+                "intercept proxy (mitmweb, Fiddler-style) decrypts HTTP/S on "
+                "127.0.0.1:8080 with a web UI — and can read ANOTHER device's "
+                "traffic once you install the analyser's certificate on it.", True))
             drow = QHBoxLayout()
             drow.setSpacing(10)
             wb = QPushButton("Packet capture — Wireshark")
@@ -4220,6 +4296,10 @@ def gui(start_key="overview", shot=None):
             mb.setEnabled(have("mitmweb"))
             mb.clicked.connect(self._launch_mitm)
             drow.addWidget(mb)
+            adb = QPushButton("Monitor another device…")
+            adb.setEnabled(have("mitmweb") or have("mitmdump"))
+            adb.clicked.connect(self._monitor_device)
+            drow.addWidget(adb)
             drow.addStretch(1)
             dc.addLayout(drow)
             self.dpiNote = QLabel("")
@@ -4379,10 +4459,21 @@ def gui(start_key="overview", shot=None):
                 est = c["state"] in ("ESTAB", "ESTABLISHED")
                 pill = QLabel(c["state"])
                 pill.setObjectName("pill" if est else "rowsub")
+                widgets = [pill]
+                host = self._peer_host(c["peer"])
+                if host:                       # a real remote → offer inspect/block
+                    ib = QPushButton("Inspect")
+                    ib.setToolTip("Capture this app's packets to %s (Wireshark)" % host)
+                    ib.clicked.connect(lambda _=False, cc=c: self._inspect_conn(cc))
+                    bb = QPushButton("Block")
+                    bb.setObjectName("danger")
+                    bb.setToolTip("Drop outbound traffic to %s" % host)
+                    bb.clicked.connect(lambda _=False, h=host: self._block_host(h))
+                    widgets += [ib, bb]
                 self.connList.addWidget(self._row(
                     "network-server",
                     c["app"] + ("  ·  pid %s" % c["pid"] if c["pid"] else ""),
-                    "%s   %s → %s" % (c["proto"], c["local"], c["peer"]), [pill]))
+                    "%s   %s → %s" % (c["proto"], c["local"], c["peer"]), widgets))
                 shown += 1
             if matched == 0:
                 self.connList.addWidget(self._note(
@@ -4413,6 +4504,150 @@ def gui(start_key="overview", shot=None):
                     "(visit mitm.it) to decrypt HTTPS.")
             except Exception as e:
                 self.dpiNote.setText("Could not launch mitmweb: %s" % e)
+
+        # ── Egress control + per-app inspect (hooked into the connection monitor) ──
+        @staticmethod
+        def _peer_host(peer):
+            """Remote host from an ss peer 'addr:port' — None for wildcard/local."""
+            if not peer:
+                return None
+            if peer.startswith("["):                     # [ipv6]:port
+                host = peer[1:peer.find("]")] if "]" in peer else ""
+            elif peer.startswith("*"):
+                return None
+            else:
+                host = peer.rsplit(":", 1)[0]
+            if host in ("", "*", "0.0.0.0", "::", "127.0.0.1", "::1"):
+                return None
+            return host
+
+        @staticmethod
+        def _is_ip(s):
+            import socket
+            for fam in (socket.AF_INET, socket.AF_INET6):
+                try:
+                    socket.inet_pton(fam, s)
+                    return True
+                except OSError:
+                    pass
+            return False
+
+        def _inspect_conn(self, c):
+            host = self._peer_host(c["peer"])
+            if not host:
+                return
+            port = c["peer"].rsplit(":", 1)[-1]
+            flt = "host %s%s" % (host, (" and port %s" % port) if port.isdigit() else "")
+            try:
+                subprocess.Popen(["wireshark", "-k", "-f", flt],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.dpiNote.setText("Wireshark: capturing %s's packets — filter: %s"
+                                     % (c.get("app", "this app"), flt))
+            except Exception as e:
+                self.dpiNote.setText("Could not launch Wireshark: %s" % e)
+
+        def _egress_rule(self, host):
+            fam = "ipv6" if ":" in host else "ipv4"
+            return 'rule family="%s" destination address="%s" drop' % (fam, host)
+
+        def _block_host(self, host):
+            if not have("firewall-cmd"):
+                self.win.status("firewalld not installed.")
+                return
+            rule = self._egress_rule(host)
+            self.run_priv(["firewall-cmd", "--permanent", "--add-rich-rule=" + rule], timeout=30)
+            self.run_priv(["firewall-cmd", "--reload"], timeout=30)
+            self.win.status("Blocked outbound to %s." % host)
+            QTimer.singleShot(300, self._refresh_egress)
+
+        def _block_typed(self):
+            txt = self.egAddr.text().strip()
+            if not txt:
+                return
+            if self._is_ip(txt):
+                hosts = [txt]
+            else:
+                try:
+                    import socket
+                    hosts = sorted({i[4][0] for i in socket.getaddrinfo(txt, None)})
+                except Exception:
+                    self.win.status("Couldn't resolve %s." % txt)
+                    return
+            self.cli_echo("# block %s → %s (IP-based; domains with rotating IPs need "
+                          "the intercept proxy)" % (txt, ", ".join(hosts)))
+            for h in hosts:
+                self._block_host(h)
+            self.egAddr.clear()
+
+        def _refresh_egress(self):
+            self._clearlay(self.egList)
+            if not have("firewall-cmd"):
+                return
+            r = self.run_priv(["firewall-cmd", "--list-rich-rules"], timeout=20)
+            import re as _re
+            drops = []
+            for ln in (getattr(r, "stdout", "") or "").splitlines():
+                if "destination address=" in ln and ln.rstrip().endswith("drop"):
+                    m = _re.search(r'destination address="([^"]+)"', ln)
+                    if m:
+                        drops.append((m.group(1), ln.strip()))
+            if not drops:
+                self.egList.addWidget(self._note(
+                    "No outbound blocks yet — block a destination above, or from a "
+                    "connection in 'Connections & ports'."))
+                return
+            for host, rule in drops:
+                ub = QPushButton("Unblock")
+                ub.clicked.connect(lambda _=False, rl=rule: self._unblock_egress(rl))
+                self.egList.addWidget(self._row("network-offline", host,
+                                                "outbound blocked (firewalld)", [ub]))
+
+        def _unblock_egress(self, rule):
+            self.run_priv(["firewall-cmd", "--permanent", "--remove-rich-rule=" + rule], timeout=30)
+            self.run_priv(["firewall-cmd", "--reload"], timeout=30)
+            QTimer.singleShot(300, self._refresh_egress)
+
+        def _lan_ip(self):
+            try:
+                import re as _re
+                r = subprocess.run(["ip", "route", "get", "1.1.1.1"],
+                                   capture_output=True, text=True, timeout=4)
+                m = _re.search(r"src (\S+)", r.stdout)
+                return m.group(1) if m else "your-ip"
+            except Exception:
+                return "your-ip"
+
+        def _monitor_device(self):
+            import shutil
+            capem = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+            if not os.path.exists(capem):
+                self._launch_mitm()      # starts mitmweb, which generates the CA
+                self.dpiNote.setText("Starting the analyser to create its certificate — "
+                                     "click 'Monitor another device…' again in a few seconds.")
+                return
+            outdir = os.path.join(HOME, "HasH-Network-Analyser")
+            os.makedirs(outdir, exist_ok=True)
+            for ext in ("pem", "cer", "p12"):
+                src = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert." + ext)
+                if os.path.exists(src):
+                    shutil.copy(src, os.path.join(outdir, "HasH-Analyser-CA." + ext))
+            ip = self._lan_ip()
+            try:
+                subprocess.Popen(["xdg-open", outdir], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            QMessageBox.information(
+                self.win, "Monitor another device",
+                "Read another device's traffic in the HasH Network Analyser:\n\n"
+                "1.  On that device, set its Wi-Fi / network PROXY to:\n"
+                "        %s   ·   port 8080\n\n"
+                "2.  Install the HasH Analyser certificate on it — from the folder\n"
+                "     that just opened (HasH-Analyser-CA.cer / .pem), or browse to\n"
+                "     http://mitm.it from the device once the proxy is set.\n\n"
+                "3.  Its HTTP/S traffic then appears in the mitmweb window\n"
+                "     (web UI at 127.0.0.1:8081).\n\n"
+                "⚠  Only monitor devices you own or are authorised to monitor." % ip)
 
     class AppsPane(ToolPaneBase):
         TOOL = "hash-uninstaller"
@@ -5615,10 +5850,77 @@ def gui(start_key="overview", shot=None):
                 control=self.schedCombo, color="#3ddc84"))
             v.addWidget(scard)
 
+            # ── system snapshots → cloud (whole-system disaster recovery) ──
+            self.section(v, "System snapshots & recovery")
+            sncard, snc = self.card()
+            self._snap_avail = have("hash-snapshot-backup")
+            self.snapCombo = QComboBox()
+            for key, label in (("off", "Off"), ("daily", "Every day"),
+                               ("weekly", "Every week"), ("monthly", "Every month")):
+                self.snapCombo.addItem(label, key)
+            sidx = self.snapCombo.findData(self.cfg.get("snapshot_schedule", "off"))
+            if sidx >= 0:
+                self.snapCombo.setCurrentIndex(sidx)
+            self.snapCombo.currentIndexChanged.connect(self._apply_snapshot_sched)
+            snc.addWidget(Win11Row(
+                "Send system snapshots to the cloud",
+                "A whole-system recovery copy is sent to the destination above — "
+                "roll back even a broken machine", "drive-harddisk",
+                control=self.snapCombo, color="#8a6cff"))
+            self.docsToggle = Toggle(os.path.join(HOME, "Documents")
+                                     in self.cfg.get("sources", []))
+            self.docsToggle.toggled.connect(self._toggle_documents)
+            snc.addWidget(Win11Row(
+                "Also upload my Documents",
+                "Include your Documents folder in the cloud backup too",
+                "folder-documents", control=self.docsToggle, color="#3b9dff"))
+            snrow = QHBoxLayout()
+            snrow.addStretch(1)
+            self.snapNowBtn = QPushButton("Back up a snapshot now")
+            self.snapNowBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.snapNowBtn.clicked.connect(self._snapshot_now)
+            snrow.addWidget(self.snapNowBtn)
+            snc.addLayout(snrow)
+            snc.addWidget(self._lbl(
+                "Snapshots capture the whole system for disaster recovery; your "
+                "files are also covered by the folders above. Needs a btrfs system "
+                "(the HasH installer sets this up) — runs as a system task.", True))
+            if not self._snap_avail:
+                self.snapCombo.setEnabled(False)
+                self.snapNowBtn.setEnabled(False)
+                self.docsToggle.setEnabled(False)
+            v.addWidget(sncard)
+
             self.add_cli_card(v)
             self._rebuild_sources()
             self._reload_remotes()
             self._refresh_status()
+
+        # ── system snapshots → cloud (root, via hash-snapshot-backup) ──
+        def _apply_snapshot_sched(self, *a):
+            when = self.snapCombo.currentData()
+            self.cfg["snapshot_schedule"] = when
+            backup_save(self.cfg)
+            self.cli_echo("# system-snapshot cloud backup: %s" % when)
+            self.run_priv(["hash-snapshot-backup", "schedule", when], timeout=30)
+            self._refresh_status()
+
+        def _toggle_documents(self, on):
+            docs = os.path.join(HOME, "Documents")
+            srcs = set(self.cfg.get("sources", []))
+            srcs.add(docs) if on else srcs.discard(docs)
+            self.cfg["sources"] = sorted(srcs)
+            backup_save(self.cfg)
+            self._rebuild_sources()
+            self._refresh_status()
+
+        def _snapshot_now(self):
+            self.win.status("Backing up a system snapshot… a password prompt may "
+                            "appear; this can take a while.")
+            self.snapNowBtn.setEnabled(False)
+            self.run_priv(["hash-snapshot-backup", "run"], timeout=6 * 3600)
+            self.snapNowBtn.setEnabled(True)
+            self.win.status("System-snapshot backup finished — see the CLI output.")
 
         # ── sources ──
         def _all_sources(self):
@@ -5934,12 +6236,169 @@ def gui(start_key="overview", shot=None):
                             + (": " + why if why else ""))
             self.statusSub.setText("    ·    ".join(bits))
             self.runBtn.setEnabled(bool(cfg.get("remote")) and njobs > 0)
+            # keep the snapshot "Also upload my Documents" toggle in sync with the
+            # folder list (both write cfg["sources"]) so the two never disagree.
+            if hasattr(self, "docsToggle"):
+                want = os.path.join(HOME, "Documents") in cfg.get("sources", [])
+                if self.docsToggle.isChecked() != want:
+                    self.docsToggle.blockSignals(True)
+                    self.docsToggle.setChecked(want)
+                    self.docsToggle.blockSignals(False)
 
         def refresh(self):
             if not backup_available():
                 return
             self._reload_remotes()
             self._refresh_status()
+
+    class DevicesPage(CliPageMixin, BasePage):
+        """Printers (CUPS) + USB device info — replaces kcm_printer_manager / a
+        terminal. lpstat / lpoptions / lp are user-level; removing a printer
+        (lpadmin -x) goes via pkexec."""
+        def __init__(self, win):
+            super().__init__(win, "Devices", "Printers & USB devices")
+
+        def build_body(self, v):
+            self.section(v, "Printers")
+            pcard, pc = self.card()
+            ptop = QHBoxLayout()
+            self.printerMsg = QLabel("…")
+            self.printerMsg.setObjectName("muted")
+            ptop.addWidget(self.printerMsg, 1)
+            addp = QPushButton("Add a printer…")
+            addp.setObjectName("primary")
+            addp.clicked.connect(self._add_printer)
+            ptop.addWidget(addp)
+            pref = QPushButton("Refresh")
+            pref.clicked.connect(self._refresh_printers)
+            ptop.addWidget(pref)
+            pc.addLayout(ptop)
+            self.printerList = QVBoxLayout()
+            self.printerList.setSpacing(6)
+            pc.addLayout(self.printerList)
+            v.addWidget(pcard)
+
+            self.section(v, "USB devices")
+            ucard, uc = self.card()
+            utop = QHBoxLayout()
+            utop.addStretch(1)
+            uref = QPushButton("Refresh")
+            uref.clicked.connect(self._refresh_usb)
+            utop.addWidget(uref)
+            uc.addLayout(utop)
+            self.usbList = QVBoxLayout()
+            self.usbList.setSpacing(6)
+            uc.addLayout(self.usbList)
+            v.addWidget(ucard)
+
+            self.add_cli_card(v)
+            self._refresh_printers()
+            self._refresh_usb()
+
+        def refresh(self):
+            self._refresh_printers()
+            self._refresh_usb()
+
+        def _clear(self, lay):
+            while lay.count():
+                it = lay.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def _row(self, icon, name, sub, widgets=()):
+            f = QFrame()
+            f.setObjectName("row")
+            h = QHBoxLayout(f)
+            h.setContentsMargins(14, 11, 14, 11)
+            h.setSpacing(12)
+            ic = QLabel()
+            ic.setPixmap(QIcon.fromTheme(icon).pixmap(QSize(28, 28)))
+            h.addWidget(ic, 0, Qt.AlignmentFlag.AlignVCenter)
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            nm = QLabel(name)
+            nm.setObjectName("rowname")
+            col.addWidget(nm)
+            if sub:
+                sb = QLabel(sub)
+                sb.setObjectName("rowsub")
+                sb.setWordWrap(True)
+                col.addWidget(sb)
+            h.addLayout(col, 1)
+            for w in widgets:
+                h.addWidget(w)
+            return f
+
+        def _refresh_printers(self):
+            self._clear(self.printerList)
+            if not printers_available():
+                self.printerMsg.setText("CUPS not installed — install “cups” to set "
+                                        "up printers.")
+                return
+            printers = list_printers()
+            if not printers:
+                self.printerMsg.setText("No printers set up yet.")
+                self.printerList.addWidget(self._lbl(
+                    "Click “Add a printer…” to set one up.", True))
+                return
+            self.printerMsg.setText("%d printer%s"
+                                    % (len(printers), "" if len(printers) == 1 else "s"))
+            for p in printers:
+                badge = QLabel("default" if p["default"] else p["state"])
+                badge.setObjectName("pill" if p["default"] else "rowsub")
+                widgets = [badge]
+                if not p["default"]:
+                    sd = QPushButton("Set default")
+                    sd.clicked.connect(lambda _=False, n=p["name"]: self._set_default(n))
+                    widgets.append(sd)
+                tb = QPushButton("Test page")
+                tb.clicked.connect(lambda _=False, n=p["name"]: self._test_print(n))
+                widgets.append(tb)
+                rb = QPushButton("Remove")
+                rb.setObjectName("danger")
+                rb.clicked.connect(lambda _=False, n=p["name"]: self._remove_printer(n))
+                widgets.append(rb)
+                self.printerList.addWidget(
+                    self._row("printer", p["name"], "CUPS printer", widgets))
+
+        def _add_printer(self):
+            if have("system-config-printer"):
+                self.win.spawn(["system-config-printer"])
+                self.win.status("Opened the printer setup tool.")
+            else:
+                self.run_user(["xdg-open", "http://localhost:631/admin"])
+                self.win.status("Opened the CUPS admin page (localhost:631).")
+
+        def _set_default(self, name):
+            self.run_user(["lpoptions", "-d", name])
+            QTimer.singleShot(200, self._refresh_printers)
+
+        def _test_print(self, name):
+            tp = "/usr/share/cups/data/testprint"
+            self.run_user(["lp", "-d", name] + ([tp] if os.path.exists(tp) else []))
+            self.win.status("Sent a test page to %s." % name)
+
+        def _remove_printer(self, name):
+            if QMessageBox.question(
+                    self.win, "Remove printer", "Remove the printer “%s”?" % name) \
+                    != QMessageBox.StandardButton.Yes:
+                return
+            self.run_priv(["lpadmin", "-x", name], timeout=30)
+            QTimer.singleShot(300, self._refresh_printers)
+
+        def _refresh_usb(self):
+            self._clear(self.usbList)
+            if not have("lsusb"):
+                self.usbList.addWidget(self._lbl(
+                    "lsusb not found — install “usbutils” for USB info.", True))
+                return
+            devs = usb_devices()
+            for d in devs:
+                self.usbList.addWidget(self._row(
+                    "drive-removable-media", d["name"], "USB ID %s" % d["id"], []))
+            if not devs:
+                self.usbList.addWidget(self._lbl("No USB devices detected.", True))
 
     class DateTimePage(CliPageMixin, BasePage):
         """Date, time & timezone — native, timedatectl-backed (replaces kcm_clock)."""
@@ -6353,6 +6812,7 @@ def gui(start_key="overview", shot=None):
         "disks": DisksPane,
         "apps": AppsPane,
         "backups": BackupsPage,
+        "devices": DevicesPage,
     }
 
     # ─────────────────── account header (Win11 rail top) ─────────────────────

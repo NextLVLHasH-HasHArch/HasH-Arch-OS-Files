@@ -1,0 +1,17 @@
+# Install to /usr/share/libalpm/hooks/00-hash-ux-unlock.hook
+# Lifts the HasH UX immutable lock BEFORE any pacman transaction so package files
+# can be written; the matching zz- hook re-applies it afterwards. Without this, an
+# update touching a locked theme/branding file would fail. Runs first (00-).
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Unlocking the HasH UX (immutable) for this transaction…
+When = PreTransaction
+Exec = /usr/bin/hash-ux-lock release
+Depends = e2fsprogs
+AbortOnFail

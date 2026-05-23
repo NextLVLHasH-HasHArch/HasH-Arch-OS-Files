@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# hash-finish-securing — guided, idempotent setup of Secure Boot + the TPM keystore,
+# in the order that makes the seal stable (enrol SB keys → reboot with SB on →
+# seal the keystore to that PCR7 → set the PIN). Re-runnable; launch from the menu
+# entry or first-boot autostart. Runs as your user; uses sudo for privileged steps.
+#
+#   hash-finish-securing          interactive (menu / manual)
+#   hash-finish-securing --auto   first-boot autostart: exit silently if already done
+set -uo pipefail
+AUTO=0; [ "${1:-}" = "--auto" ] && AUTO=1
+
+sb_on(){    sudo -n hash-keystore require-secureboot >/dev/null 2>&1 || hash-keystore require-secureboot >/dev/null 2>&1; }
+ks_luks(){  hash-keystore status 2>/dev/null | grep -q '"luks":[[:space:]]*true'; }
+pin_set(){  hash-keystore status 2>/dev/null | grep -q '"pin_set":[[:space:]]*true'; }
+
+# Fully secured already → nothing to do (so the autostart never nags).
+if sb_on && ks_luks && pin_set; then
+    [ "$AUTO" -eq 1 ] && exit 0
+    echo "HasH is fully secured: Secure Boot on, keystore sealed (TPM + PIN)."; exit 0
+fi
+# First-boot autostart: don't pop a terminal — just nudge via a notification, so
+# the user opens the menu entry when ready (no per-login flicker, no nagging once done).
+if [ "$AUTO" -eq 1 ]; then
+    command -v notify-send >/dev/null 2>&1 && notify-send -i security-high \
+        "Finish securing HasH" \
+        "Open “Finish Securing HasH” from the menu to turn on Secure Boot and set your keystore PIN."
+    exit 0
+fi
+
+echo "════════════════════════════════════════════════════════════"
+echo "  HasH — Finish Securing your system"
+echo "  Sets up Secure Boot (your own keys) + your TPM-sealed PIN."
+echo "════════════════════════════════════════════════════════════"
+
+if ! sb_on; then
+    echo
+    echo "STEP 1 of 2 — Secure Boot"
+    echo "Signing the boot files now; then you'll switch Secure Boot on in firmware."
+    sudo hash-secureboot setup || true
+    echo
+    echo "NEXT: reboot into BIOS/UEFI, turn Secure Boot ON, save, boot back in, and"
+    echo "run this again (HasH menu → 'Finish Securing HasH') to seal the keystore."
+    read -r -p "Press Enter to close… " _
+    exit 0
+fi
+
+echo
+echo "STEP 2 of 2 — Keystore PIN"
+if ! ks_luks; then
+    echo "Sealing the keystore to this machine (TPM + Secure Boot)…"
+    sudo hash-keystore init || { echo "keystore init failed — see output above."; read -r -p "Enter… " _; exit 1; }
+fi
+echo "Set your keystore PIN. NOTE: TPM + PIN, NO recovery key — forget it and the"
+echo "only reset is a reinstall. Keep it safe."
+sudo hash-keystore set-pin || true
+echo
+echo "Done — your keystore is sealed to this machine and your PIN."
+read -r -p "Press Enter to close… " _

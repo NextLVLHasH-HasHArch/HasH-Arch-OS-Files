@@ -1,0 +1,18 @@
+# Install to /usr/share/libalpm/hooks/90-hash-sbctl-sign.hook
+# After a kernel or bootloader update, re-sign all sbctl-tracked boot files so the
+# machine keeps booting with Secure Boot ON. Without this, a kernel update would
+# ship an unsigned vmlinuz and SB-on boot would fail. Non-fatal.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/lib/modules/*/vmlinuz
+Target = boot/vmlinuz-*
+Target = usr/lib/grub/*
+Target = boot/grub/grub.cfg
+
+[Action]
+Description = Re-signing boot files for Secure Boot (sbctl)…
+When = PostTransaction
+Exec = /usr/bin/sbctl sign-all
+Depends = sbctl

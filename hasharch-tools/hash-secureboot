@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# hash-secureboot — boot HasH with Secure Boot ON using our OWN keys (sbctl); the
+# missing half of the Secure-Boot-gated keystore. Without it a laptop can't boot
+# with Secure Boot on, so hash-keystore (which requires SB on) just skips.
+#
+#   hash-secureboot status   # SB / Setup Mode / sbctl key + signing state
+#   hash-secureboot sign     # create keys (once) + sign GRUB + kernels   (SAFE)
+#   hash-secureboot enroll    # ALSO enrol our keys INTO firmware — needs Setup Mode
+#   hash-secureboot setup    # sign, then enrol if in Setup Mode (alias of enroll)
+#
+# A pacman hook (90-hash-sbctl-sign.hook) re-signs the kernel/bootloader after
+# updates so Secure Boot keeps booting. ENROLL touches firmware: it refuses unless
+# the firmware is in Setup Mode and you confirm, and keeps Microsoft's keys
+# (--microsoft) so option ROMs / other OSes still validate. A signing miss only
+# means "won't boot with Secure Boot on" (recover by turning SB off) — not a brick.
+set -uo pipefail
+log(){ printf '[hash-secureboot] %s\n' "$*"; }
+need_root(){ [ "$(id -u)" -eq 0 ] || { log "needs root."; exit 87; }; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+sb_json(){ have sbctl && sbctl status --json 2>/dev/null || echo '{}'; }
+in_setup_mode(){ sb_json | grep -q '"setup_mode":[[:space:]]*true'; }
+
+esp(){ local m; for m in /boot/efi /efi /boot; do [ -d "$m/EFI" ] && { echo "$m"; return; }; done; echo /boot/efi; }
+
+sign_boot(){
+  have sbctl || { log "sbctl not installed."; return 1; }
+  sbctl create-keys 2>/dev/null || true          # idempotent
+  local E n=0 f; E="$(esp)"
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    sbctl sign -s "$f" >/dev/null 2>&1 && { log "signed $f"; n=$((n + 1)); }
+  done < <(find "$E"/EFI -maxdepth 4 -iname '*.efi' 2>/dev/null; ls /boot/vmlinuz-* 2>/dev/null)
+  log "signed $n boot file(s)."
+  [ "$n" -gt 0 ]
+}
+
+cmd_enroll(){
+  need_root
+  have sbctl || { log "sbctl not installed."; exit 1; }
+  sign_boot || { log "no boot files signed — refusing to enrol (would not boot with Secure Boot on)."; exit 4; }
+  if ! in_setup_mode; then
+    log "Firmware is NOT in Secure Boot 'Setup Mode' — can't enrol keys yet."
+    log "In BIOS/UEFI: enable Secure Boot, choose 'Erase/Clear all Secure Boot keys'"
+    log "(that enters Setup Mode), save & reboot, then: sudo hash-secureboot setup"
+    exit 3
+  fi
+  log "About to ENROL HasH Secure Boot keys into firmware (keeping Microsoft's)."
+  log "A signing miss only means SB-on won't boot (recover by turning SB off)."
+  read -r -p "Type ENROLL to proceed: " a
+  [ "$a" = "ENROLL" ] || { log "cancelled."; exit 0; }
+  if sbctl enroll-keys --microsoft 2>&1; then
+    log "Keys enrolled. Reboot, ensure Secure Boot is ON, then set up the keystore:"
+    log "  sudo hash-keystore init && sudo hash-keystore set-pin"
+  else
+    log "enroll-keys failed (non-fatal). Boot files are signed; retry in Setup Mode."
+  fi
+}
+
+cmd_status(){
+  echo "sbctl installed: $(have sbctl && echo yes || echo NO)"
+  have sbctl && sbctl status 2>/dev/null || true
+  if [ -e /dev/tpmrm0 ] || [ -e /dev/tpm0 ]; then echo "tpm2: present"; else echo "tpm2: NOT present"; fi
+}
+
+case "${1:-status}" in
+  status)       cmd_status;;
+  sign)         need_root; sign_boot;;
+  enroll|setup) cmd_enroll;;
+  *) echo "usage: hash-secureboot {status|sign|enroll|setup}"; exit 2;;
+esac

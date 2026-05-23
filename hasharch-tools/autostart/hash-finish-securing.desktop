@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Finish Securing HasH (reminder)
+Comment=Reminds you to finish Secure Boot + keystore setup, until it's done
+Exec=hash-finish-securing --auto
+Icon=security-high
+Terminal=false
+NoDisplay=true
+X-KDE-autostart-phase=2
+X-GNOME-Autostart-enabled=true

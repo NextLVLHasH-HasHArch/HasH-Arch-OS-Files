@@ -1,0 +1,13 @@
+# Install to /usr/lib/systemd/system/hash-snapshot-backup.timer
+# OnCalendar here is the default; `hash-snapshot-backup schedule <daily|weekly|
+# monthly>` writes a drop-in (timer.d/schedule.conf) to change the cadence.
+[Unit]
+Description=HasH system-snapshot cloud backup schedule
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

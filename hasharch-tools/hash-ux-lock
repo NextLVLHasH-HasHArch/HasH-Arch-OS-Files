@@ -1,0 +1,57 @@
+#!/bin/bash
+# hash-ux-lock — make the HasH front-facing look IMMUTABLE (the "locked UX that
+# can't be changed"), and lift/re-apply the lock around pacman so updates still
+# work cleanly.
+#
+#   hash-ux-lock apply     # chattr +i the HasH UX assets (lock the look)
+#   hash-ux-lock release   # chattr -i (unlock) — used by the pacman PreTransaction hook
+#   hash-ux-lock status    # show which assets are locked
+#
+# Pairs with the alpm hooks in libalpm-hooks/ (installed to
+# /usr/share/libalpm/hooks/): a PreTransaction hook unlocks before any pacman
+# transaction and a PostTransaction hook re-locks after — so the look is enforced
+# yet the system updates normally. On the immutable btrfs core, a snapshot rollback
+# also restores the look, so it's protected two ways.
+set -uo pipefail
+
+# The system-wide HasH "look": branding / theme / layout / plasmoids. Globs are
+# expanded at run time; missing entries are skipped.
+TARGETS=(
+  /usr/share/plasma/look-and-feel/com.hash.*
+  /usr/share/plasma/desktoptheme/HasHTop*
+  /usr/share/plasma/plasmoids/com.hash.*
+  /usr/share/plasma/wallpapers/com.hash.*
+  /usr/share/sddm/themes/hash*
+  /usr/share/icons/HasH*
+  /usr/share/pixmaps/hash*
+)
+
+_apply(){            # $1 = +i | -i
+  local flag="$1" t
+  shopt -s nullglob
+  for t in "${TARGETS[@]}"; do
+    [ -e "$t" ] || continue
+    chattr -R "$flag" "$t" 2>/dev/null || true
+  done
+}
+
+case "${1:-status}" in
+  apply|lock)
+    [ "$(id -u)" -eq 0 ] || { echo "hash-ux-lock: needs root."; exit 87; }
+    _apply +i; echo "HasH UX locked (immutable).";;
+  release|unlock)
+    [ "$(id -u)" -eq 0 ] || { echo "hash-ux-lock: needs root."; exit 87; }
+    _apply -i; echo "HasH UX unlocked.";;
+  status)
+    shopt -s nullglob; found=0
+    for t in "${TARGETS[@]}"; do
+      [ -e "$t" ] || continue; found=1
+      if lsattr -d "$t" 2>/dev/null | cut -d' ' -f1 | grep -q 'i'; then
+        echo "locked:   $t"
+      else
+        echo "unlocked: $t"
+      fi
+    done
+    [ "$found" -eq 1 ] || echo "(no HasH UX assets found on this system)";;
+  *) echo "usage: hash-ux-lock {apply|release|status}"; exit 2;;
+esac

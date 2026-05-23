@@ -1,0 +1,16 @@
+# Install to /usr/share/libalpm/hooks/zz-hash-ux-lock.hook
+# Re-applies the HasH UX immutable lock AFTER a pacman transaction (pairs with
+# 00-hash-ux-unlock.hook). Runs last (zz-) so the look is re-locked once package
+# files are in place. Not AbortOnFail — a relock hiccup must never fail an update.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Re-locking the HasH UX (immutable)…
+When = PostTransaction
+Exec = /usr/bin/hash-ux-lock apply
+Depends = e2fsprogs
