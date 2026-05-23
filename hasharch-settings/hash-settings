@@ -42,6 +42,7 @@ import dataclasses
 import getpass
 import importlib.machinery
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -190,6 +191,20 @@ SECTIONS = [
         {"name": "Drives", "icon": "drive-harddisk",
          "comment": "Mount, auto-mount & writable-fix your drives "
                     "(HasH Disks)", "kind": "hash", "target": "hash-disks"},
+    ]),
+    ("backups", "Backups", "document-save", "backups", [
+        {"name": "Backups", "icon": "document-save",
+         "comment": "Scheduled, off-machine backups to Google Drive, Linode / "
+                    "S3, an SFTP/FTP server or any provider — rclone, backup, "
+                    "cloud, sync, restore", "kind": "page", "target": "backups"},
+        {"name": "Backup destinations", "icon": "folder-cloud",
+         "comment": "Connect Google Drive, OneDrive, Dropbox, a server (SFTP / "
+                    "FTP / WebDAV) or S3 / Linode object storage as a backup "
+                    "target", "kind": "page", "target": "backups"},
+        {"name": "Backup schedule", "icon": "appointment-soon",
+         "comment": "Run backups automatically every hour, day or week — "
+                    "scheduled, automatic, timer", "kind": "page",
+         "target": "backups"},
     ]),
     ("apps", "Apps", "applications-other", "apps", [
         {"name": "Software Center", "icon": "system-software-install",
@@ -777,6 +792,71 @@ def vis_apply(color, show):
     return r.returncode == 0
 
 
+# ---- Live / animated wallpapers (com.hash.matrixrain modes) ----
+WALL_DIRS = [os.path.expanduser("~/.local/share/hash/wallpapers"),
+             "/usr/share/hash/wallpapers"]
+
+
+def wallpaper_videos():
+    """Animated wallpaper files (.webm/.mp4/.mkv) in the HasH wallpaper dirs,
+    de-duplicated by basename (user dir wins)."""
+    import glob
+    seen, out = set(), []
+    for d in WALL_DIRS:
+        for ext in ("*.webm", "*.mp4", "*.mkv"):
+            for p in sorted(glob.glob(os.path.join(d, ext))):
+                b = os.path.basename(p)
+                if b not in seen:
+                    seen.add(b)
+                    out.append(p)
+    return out
+
+
+def wallpaper_apply(mode, video_path=""):
+    """Set the desktop wallpaper to com.hash.matrixrain in <mode> (weather/code/
+    video) on every desktop, live. For video, also persist videoPath."""
+    q = _qdbus()
+    if not q:
+        return False
+    vp = (video_path or "").replace("\\", "\\\\").replace("'", "\\'")
+    script = (
+        "var ds = desktops();"
+        "for (var i = 0; i < ds.length; i++) {"
+        " var d = ds[i];"
+        " d.wallpaperPlugin = 'com.hash.matrixrain';"
+        " d.currentConfigGroup = ['Wallpaper', 'com.hash.matrixrain', 'General'];"
+        " d.writeConfig('mode', '%s');"
+        " d.writeConfig('videoPath', '%s');"
+        "}" % (mode, vp))
+    r = _run([q, "org.kde.plasmashell", "/PlasmaShell",
+              "org.kde.PlasmaShell.evaluateScript", script], timeout=10)
+    return r.returncode == 0
+
+
+def wallpaper_thumb(video_path):
+    """Cached poster PNG for a video (ffmpegthumbnailer or ffmpeg first frame),
+    or None if neither tool is available / it fails."""
+    import hashlib
+    cache = os.path.expanduser("~/.cache/hash/wallpaper-thumbs")
+    try:
+        os.makedirs(cache, exist_ok=True)
+    except OSError:
+        return None
+    out = os.path.join(cache, hashlib.sha1(video_path.encode()).hexdigest()[:16] + ".png")
+    try:
+        if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(video_path):
+            return out
+    except OSError:
+        pass
+    if shutil.which("ffmpegthumbnailer"):
+        _run(["ffmpegthumbnailer", "-i", video_path, "-o", out, "-s", "480",
+              "-t", "10%"], timeout=20)
+    elif shutil.which("ffmpeg"):
+        _run(["ffmpeg", "-y", "-ss", "1", "-i", video_path, "-frames:v", "1",
+              "-vf", "scale=480:-1", out], timeout=20)
+    return out if os.path.exists(out) else None
+
+
 # ---- System / About (distro, kernel, CPU, RAM) ----
 def system_info():
     info = {}
@@ -1031,6 +1111,266 @@ def check_updates():
         lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
         return lines, len(lines), False
     return [], 0, False
+
+
+# ════════════════════════ Backups (rclone + systemd --user) ══════════════════
+# Scheduled, off-machine backups to ANY provider rclone supports — Google Drive,
+# Linode / S3, SFTP/FTP, WebDAV, or a custom remote.  Everything here is
+# USER-LEVEL: the remotes (creds / OAuth tokens) live in ~/.config/rclone, the
+# schedule is a systemd --user timer, and the one runner — `hash-settings backup
+# run` — is identical whether it's fired by the GUI button, the timer, or a
+# script/AI agent.  No root, no PAM, no helper: backups never touch a privileged
+# surface, so they can't endanger login.  rclone `sync` is made SAFE with a dated
+# --backup-dir, so an overwritten or locally-deleted file is KEPT on the remote
+# (versioned) rather than silently lost — a backup, not a destructive mirror.
+HASH_SHARE = os.path.join(HOME, ".local", "share", "hash")
+BACKUP_CFG = os.path.join(HOME, ".config", "hash", "backups.json")
+BACKUP_LOG = os.path.join(HASH_SHARE, "backup.log")
+BACKUP_STATE = os.path.join(HASH_SHARE, "backup-state.json")
+BACKUP_UNIT = "hash-backup"          # → hash-backup.service + hash-backup.timer
+SYSTEMD_USER_DIR = os.path.join(HOME, ".config", "systemd", "user")
+
+# Friendly destination types → (rclone backend, is_oauth, fixed params, fields).
+# Fields are (key, label, is_secret); OAuth providers collect only a name and
+# run rclone's guided browser sign-in instead of a credential form.
+BACKUP_PROVIDERS = [
+    ("drive",    "Google Drive",          True,  {}, []),
+    ("onedrive", "Microsoft OneDrive",    True,  {}, []),
+    ("dropbox",  "Dropbox",               True,  {}, []),
+    ("s3",       "Linode Object Storage", False, {"provider": "Linode"}, [
+        ("access_key_id", "Access key ID", False),
+        ("secret_access_key", "Secret access key", True),
+        ("endpoint", "Endpoint (e.g. us-east-1.linodeobjects.com)", False),
+        ("region", "Region (optional)", False)]),
+    ("sftp",     "SFTP server (SSH)",     False, {}, [
+        ("host", "Host or address", False),
+        ("user", "Username", False),
+        ("pass", "Password", True),
+        ("port", "Port (optional, default 22)", False)]),
+    ("ftp",      "FTP server",            False, {}, [
+        ("host", "Host or address", False),
+        ("user", "Username", False),
+        ("pass", "Password", True),
+        ("port", "Port (optional, default 21)", False)]),
+    ("webdav",   "WebDAV / Nextcloud",    False, {}, [
+        ("url", "Server URL", False),
+        ("user", "Username", False),
+        ("pass", "Password", True),
+        ("vendor", "Vendor (e.g. nextcloud, optional)", False)]),
+]
+
+# (key, friendly label, systemd OnCalendar)  — None = manual only.
+BACKUP_SCHEDULES = [
+    ("off", "Off (manual only)", None),
+    ("hourly", "Every hour", "hourly"),
+    ("daily", "Every day", "daily"),
+    ("weekly", "Every week", "weekly"),
+]
+
+_BACKUP_SERVICE = (
+    "[Unit]\n"
+    "Description=HasH scheduled backup\n"
+    "After=network-online.target\n"
+    "Wants=network-online.target\n\n"
+    "[Service]\n"
+    "Type=oneshot\n"
+    "ExecStart=%(exec)s backup run\n")
+
+_BACKUP_TIMER = (
+    "[Unit]\n"
+    "Description=HasH backup schedule\n\n"
+    "[Timer]\n"
+    "OnCalendar=%(oncal)s\n"
+    "Persistent=true\n"
+    "RandomizedDelaySec=300\n\n"
+    "[Install]\n"
+    "WantedBy=timers.target\n")
+
+
+def backup_available():
+    return have("rclone")
+
+
+def _self_cmd():
+    """Absolute path to re-invoke this program (for the systemd unit ExecStart):
+    prefer the deployed ~/.local/bin/hash-settings, else this script, else PATH."""
+    cand = os.path.join(BIN, "hash-settings")
+    if os.path.exists(cand):
+        return cand
+    real = os.path.realpath(sys.argv[0])
+    if os.path.exists(real):
+        return real
+    return shutil.which("hash-settings") or "hash-settings"
+
+
+def rclone_remotes():
+    """[(name, type)] for every configured rclone remote (no secrets read)."""
+    if not have("rclone"):
+        return []
+    r = _run(["rclone", "listremotes", "--long"], timeout=12)
+    out = []
+    for ln in r.stdout.splitlines():
+        if not ln.strip():
+            continue
+        name, _sep, typ = ln.partition(":")
+        out.append((name.strip(), typ.strip()))
+    return out
+
+
+def backup_default_sources():
+    """Common folders worth backing up — the XDG user dirs that exist."""
+    names = ["Documents", "Pictures", "Desktop", "Downloads", "Music", "Videos"]
+    return [os.path.join(HOME, n) for n in names
+            if os.path.isdir(os.path.join(HOME, n))]
+
+
+def backup_load():
+    """The backup JOB config (what/where/when) — never secrets (rclone owns those)."""
+    cfg = {"sources": [], "settings_backup": False, "remote": "",
+           "path": "HasH-Backup", "schedule": "off"}
+    try:
+        with open(BACKUP_CFG) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def backup_save(cfg):
+    os.makedirs(os.path.dirname(BACKUP_CFG), exist_ok=True)
+    tmp = BACKUP_CFG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, BACKUP_CFG)
+
+
+def backup_state_load():
+    try:
+        with open(BACKUP_STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _backup_write_state(state):
+    try:
+        os.makedirs(HASH_SHARE, exist_ok=True)
+        tmp = BACKUP_STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, BACKUP_STATE)
+    except Exception:
+        pass
+
+
+def backup_jobs(cfg):
+    """Expand the config into concrete (label, source_dir, remote, base) jobs."""
+    jobs = []
+    remote = cfg.get("remote", "")
+    base = (cfg.get("path") or "HasH-Backup").strip("/")
+    if not remote:
+        return jobs
+    for src in cfg.get("sources", []):
+        if os.path.isdir(src):
+            label = os.path.basename(src.rstrip("/")) or "root"
+            jobs.append((label, src, remote, base))
+    if cfg.get("settings_backup"):
+        jobs.append(("settings", os.path.join(HOME, ".config"), remote, base))
+    return jobs
+
+
+def backup_sync_argv(label, src, remote, base, stamp, log=BACKUP_LOG):
+    """`rclone sync` for one folder, made SAFE: overwritten/deleted files are
+    moved into a dated --backup-dir on the remote (kept, not lost).  `settings`
+    skips obvious cache dirs so we back up preferences, not throwaway data."""
+    dest = "%s:%s/%s" % (remote, base, label)
+    hist = "%s:%s/.hash-history/%s/%s" % (remote, base, label, stamp)
+    argv = ["rclone", "sync", src, dest,
+            "--backup-dir", hist,
+            "--log-file", log, "--log-level", "INFO",
+            "--stats-one-line", "--transfers", "4"]
+    if label == "settings":
+        for pat in ("**/[Cc]ache/**", "**/*Cache*/**", "**/GPUCache/**",
+                    "**/Crash Reports/**", "**/Trash/**"):
+            argv += ["--exclude", pat]
+    return argv
+
+
+def backup_run():
+    """Run every configured sync job now; write the log + state.  Used by the
+    GUI button, the systemd timer and `hash-settings backup run` alike."""
+    import datetime
+    cfg = backup_load()
+    os.makedirs(HASH_SHARE, exist_ok=True)
+    now = datetime.datetime.now().astimezone()
+    state = {"last_run": now.isoformat(timespec="seconds")}
+    if not have("rclone"):
+        state.update(result="error", message="rclone is not installed", jobs=0)
+        _backup_write_state(state)
+        return 1
+    jobs = backup_jobs(cfg)
+    if not jobs:
+        state.update(result="error",
+                     message="No destination or folders configured", jobs=0)
+        _backup_write_state(state)
+        return 1
+    stamp = now.strftime("%Y-%m-%dT%H-%M-%S")
+    try:
+        with open(BACKUP_LOG, "a") as f:
+            f.write("\n===== HasH backup %s → %s:%s =====\n"
+                    % (stamp, cfg.get("remote", "?"), cfg.get("path", "")))
+    except Exception:
+        pass
+    ok, failed = 0, []
+    for (label, src, remote, base) in jobs:
+        r = _run(backup_sync_argv(label, src, remote, base, stamp),
+                 timeout=6 * 3600)
+        if getattr(r, "returncode", 1) == 0:
+            ok += 1
+        else:
+            failed.append(label)
+    state.update(result=("ok" if not failed else "error"),
+                 jobs=len(jobs), ok=ok, failed=failed,
+                 remote=cfg.get("remote", ""), path=cfg.get("path", ""))
+    _backup_write_state(state)
+    return 0 if not failed else 1
+
+
+def backup_write_units(schedule):
+    """Write the systemd --user .service + .timer for `schedule`; return the
+    OnCalendar string (None for 'off').  The timer file is always written so the
+    schedule can be flipped on without regenerating it."""
+    oncal = {k: cal for k, _l, cal in BACKUP_SCHEDULES}.get(schedule)
+    os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
+    with open(os.path.join(SYSTEMD_USER_DIR, BACKUP_UNIT + ".service"), "w") as f:
+        f.write(_BACKUP_SERVICE % {"exec": _self_cmd()})
+    with open(os.path.join(SYSTEMD_USER_DIR, BACKUP_UNIT + ".timer"), "w") as f:
+        f.write(_BACKUP_TIMER % {"oncal": oncal or "daily"})
+    return oncal
+
+
+def backup_schedule_commands(schedule):
+    """Write the units and return the `systemctl --user` argv list that applies
+    `schedule` (daemon-reload + enable/disable --now).  The CALLER runs them —
+    the GUI via run_user() so they echo in the CLI console, the CLI via _run()."""
+    oncal = backup_write_units(schedule)
+    cmds = [["systemctl", "--user", "daemon-reload"]]
+    if oncal:
+        cmds.append(["systemctl", "--user", "enable", "--now",
+                     BACKUP_UNIT + ".timer"])
+    else:
+        cmds.append(["systemctl", "--user", "disable", "--now",
+                     BACKUP_UNIT + ".timer"])
+    return cmds
+
+
+def backup_timer_active():
+    """Is the scheduled-backup --user timer currently active?"""
+    if not have("systemctl"):
+        return False
+    r = _run(["systemctl", "--user", "is-active", BACKUP_UNIT + ".timer"],
+             timeout=8)
+    return r.stdout.strip() == "active"
 
 
 TOGGLES = [
@@ -1366,6 +1706,60 @@ def cli_list():
     return 0
 
 
+def cli_backup(args):
+    """Headless backup control (AI-scriptable, no display needed):
+
+        hash-settings backup run               run all configured jobs now
+        hash-settings backup status            show destination / schedule / last run
+        hash-settings backup schedule <key>    off | hourly | daily | weekly
+        hash-settings backup remotes           list configured rclone destinations
+    """
+    sub = args[0] if args else "status"
+    if sub == "run":
+        return backup_run()
+    if sub == "status":
+        cfg = backup_load()
+        st = backup_state_load()
+        dest = cfg.get("remote") or "(none)"
+        if cfg.get("remote"):
+            dest += ":" + (cfg.get("path") or "")
+        sys.stdout.write("destination: %s\n" % dest)
+        sys.stdout.write("schedule:    %s%s\n" % (
+            cfg.get("schedule", "off"),
+            "  (timer active)" if backup_timer_active() else ""))
+        labels = [l for l, _s, _r, _b in backup_jobs(cfg)]
+        sys.stdout.write("folders:     %s\n" % (", ".join(labels) or "(none)"))
+        if st.get("last_run"):
+            sys.stdout.write("last run:    %s — %s\n"
+                             % (st["last_run"], st.get("result", "?")))
+            if st.get("failed"):
+                sys.stdout.write("failed:      %s\n" % ", ".join(st["failed"]))
+        else:
+            sys.stdout.write("last run:    never\n")
+        return 0
+    if sub == "schedule":
+        key = args[1] if len(args) > 1 else ""
+        valid = [k for k, _l, _c in BACKUP_SCHEDULES]
+        if key not in valid:
+            sys.stderr.write("usage: hash-settings backup schedule <%s>\n"
+                             % "|".join(valid))
+            return 2
+        for argv in backup_schedule_commands(key):
+            _run(argv, timeout=20)
+        cfg = backup_load()
+        cfg["schedule"] = key
+        backup_save(cfg)
+        sys.stdout.write("schedule set to %s\n" % key)
+        return 0
+    if sub in ("remotes", "destinations"):
+        for name, typ in rclone_remotes():
+            sys.stdout.write("%-24s %s\n" % (name, typ))
+        return 0
+    sys.stderr.write(
+        "usage: hash-settings backup [run|status|schedule <key>|remotes]\n")
+    return 2
+
+
 # ════════════════════════════════════ GUI ════════════════════════════════════
 def gui(start_key="overview", shot=None):
     from PyQt6.QtCore import Qt, QSize, QTimer, QProcess
@@ -1513,7 +1907,7 @@ def gui(start_key="overview", shot=None):
         "display": "#2ec8e0", "power": "#3ddc84", "accounts": "#4f9bff",
         "security": "#ff6b6b", "disks": "#8a6cff", "apps": "#ff8f3d",
         "system": "#56c5d8", "services": "#b06cff", "eventviewer": "#ffb02e",
-        "users": "#3ddc84", "updates": "#2ec8e0",
+        "users": "#3ddc84", "updates": "#2ec8e0", "backups": "#37c8a0",
     }
     TOG_COLORS = {"wifi": "#3b9dff", "bluetooth": "#4f9bff", "night": "#ff8f3d",
                   "theme": "#c264ff", "visualiser": "#3ddc84"}
@@ -1550,59 +1944,101 @@ def gui(start_key="overview", shot=None):
         return eff
 
     # ─────────────────────────────── chrome ──────────────────────────────
-    class WinBtn(QPushButton):
-        """A circular window-control button (close / minimise) matching the rest
-        of the HasH suite: a flat coloured disc whose glyph is *painted*
-        (vector minus / cross) so it never depends on a glyph font being present
-        — which is why the old text "—"/"✕" buttons could look icon-less.
+    class TrafficLight(QPushButton):
+        """A macOS-style traffic-light window control: a flat coloured disc
+        (close=red, minimise=amber, full-screen=green) whose glyph (×, −, or the
+        full-screen corner arrows) is *painted* — never font-dependent — and is
+        only shown while the group is hovered, exactly like macOS.  `set_reveal`
+        is driven by the TrafficLights group so hovering ANY light shows all
+        three glyphs."""
+        COLORS = {"close": "#ff5f57", "min": "#febc2e", "full": "#28c840"}
 
-        kind="close"  -> danger-red disc, white cross
-        kind="min"    -> neutral disc, white minus
-        Both brighten on hover."""
         def __init__(self, kind):
             super().__init__()
             self.kind = kind
-            self.setFixedSize(28, 28)
+            self._reveal = False
+            self.setFixedSize(16, 16)
             self.setCursor(Qt.CursorShape.PointingHandCursor)
             self.setFlat(True)
-            self._hover = False
             self.setStyleSheet("QPushButton{ background:transparent; border:none; }")
 
+        def set_reveal(self, on):
+            if on != self._reveal:
+                self._reveal = on
+                self.update()
+
+        def paintEvent(self, _e):
+            from PyQt6.QtCore import QPointF
+            from PyQt6.QtGui import QPolygonF
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = self.rect().adjusted(2, 2, -2, -2)        # ~12px disc
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self.COLORS[self.kind]))
+            p.drawEllipse(r)
+            if not self._reveal:
+                return
+            ink = QColor(0, 0, 0, 160)                    # dark glyph on the disc
+            cx, cy = r.center().x() + 0.5, r.center().y() + 0.5
+            if self.kind == "full":
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(ink)
+                l, t, rt, b = r.left() + 2.6, r.top() + 2.6, \
+                    r.right() - 2.6, r.bottom() - 2.6
+                p.drawPolygon(QPolygonF([QPointF(l, t), QPointF(l + 4.4, t),
+                                         QPointF(l, t + 4.4)]))
+                p.drawPolygon(QPolygonF([QPointF(rt, b), QPointF(rt - 4.4, b),
+                                         QPointF(rt, b - 4.4)]))
+                return
+            pen = p.pen()
+            pen.setColor(ink)
+            pen.setWidthF(1.4)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            if self.kind == "min":
+                d = 3.2
+                p.drawLine(int(cx - d), int(cy), int(cx + d), int(cy))
+            else:  # close
+                d = 2.7
+                p.drawLine(int(cx - d), int(cy - d), int(cx + d), int(cy + d))
+                p.drawLine(int(cx - d), int(cy + d), int(cx + d), int(cy - d))
+
+    class TrafficLights(QWidget):
+        """The macOS cluster: close · minimise · full-screen, left-aligned, with
+        group hover-reveal of the glyphs.  Full-screen toggles maximise."""
+        def __init__(self, win):
+            super().__init__()
+            self._win = win
+            h = QHBoxLayout(self)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(8)
+            self.close_b = TrafficLight("close")
+            self.min_b = TrafficLight("min")
+            self.full_b = TrafficLight("full")
+            self.close_b.setToolTip("Close")
+            self.min_b.setToolTip("Minimise")
+            self.full_b.setToolTip("Toggle full screen")
+            self.close_b.clicked.connect(win.close)
+            self.min_b.clicked.connect(win.showMinimized)
+            self.full_b.clicked.connect(self._toggle_full)
+            for b in (self.close_b, self.min_b, self.full_b):
+                h.addWidget(b)
+
+        def _toggle_full(self):
+            if self._win.isMaximized():
+                self._win.showNormal()
+            else:
+                self._win.showMaximized()
+
         def enterEvent(self, e):
-            self._hover = True
-            self.update()
+            for b in (self.close_b, self.min_b, self.full_b):
+                b.set_reveal(True)
             super().enterEvent(e)
 
         def leaveEvent(self, e):
-            self._hover = False
-            self.update()
+            for b in (self.close_b, self.min_b, self.full_b):
+                b.set_reveal(False)
             super().leaveEvent(e)
-
-        def paintEvent(self, _e):
-            p = QPainter(self)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            r = self.rect().adjusted(3, 3, -3, -3)
-            if self.kind == "close":
-                disc = QColor(DANGER) if self._hover else QColor(224, 108, 117, 90)
-            else:
-                disc = QColor(ACCENT) if self._hover else QColor(255, 255, 255, 28)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(disc)
-            p.drawEllipse(r)
-            # glyph colour: dark on the bright hover disc, light otherwise
-            gc = QColor(0x12, 0x14, 0x1a) if self._hover else QColor("#e8eef0")
-            pen = p.pen()
-            pen.setColor(gc)
-            pen.setWidthF(1.8)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            p.setPen(pen)
-            cx, cy = r.center().x() + 0.5, r.center().y() + 0.5
-            d = 4.5
-            if self.kind == "close":
-                p.drawLine(int(cx - d), int(cy - d), int(cx + d), int(cy + d))
-                p.drawLine(int(cx - d), int(cy + d), int(cx + d), int(cy - d))
-            else:  # minimise: a horizontal bar
-                p.drawLine(int(cx - d), int(cy), int(cx + d), int(cy))
 
     class TitleBar(QWidget):
         def __init__(self, win):
@@ -1610,19 +2046,19 @@ def gui(start_key="overview", shot=None):
             self.win, self._off = win, None
             self.setFixedHeight(46)
             h = QHBoxLayout(self)
-            h.setContentsMargins(18, 0, 12, 0)
+            h.setContentsMargins(16, 0, 16, 0)
             h.setSpacing(8)
-            ttl = QLabel("  HasH Settings")
+            ttl = QLabel("HasH Settings")
             ttl.setObjectName("apptitle")
-            mn, cl = WinBtn("min"), WinBtn("close")
-            mn.setToolTip("Minimise")
-            cl.setToolTip("Close")
-            mn.clicked.connect(win.showMinimized)
-            cl.clicked.connect(win.close)
-            h.addWidget(ttl)
+            ttl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            h.addWidget(TrafficLights(win), 0)
             h.addStretch(1)
-            h.addWidget(mn)
-            h.addWidget(cl)
+            h.addWidget(ttl, 0)
+            h.addStretch(1)
+            # a spacer the width of the lights so the title sits truly centred
+            balance = QWidget()
+            balance.setFixedWidth(64)
+            h.addWidget(balance, 0)
 
         def mousePressEvent(self, e):
             if e.button() == Qt.MouseButton.LeftButton:
@@ -2932,8 +3368,22 @@ def gui(start_key="overview", shot=None):
                                        "a running Plasma session.", True))
             v.addWidget(vcard)
 
-            # Wallpaper — a native picker (Plasma containment config) is a later
-            # phase; for now this is a clearly-labelled placeholder, no KCM.
+            # Live / animated wallpaper — a fancy card picker: the live weather
+            # scene, the Matrix code rain, or any looping video you add. Applies
+            # the com.hash.matrixrain plugin live (mode = weather/code/video).
+            self.section(v, "Live wallpaper")
+            lwcard, lwc = self.card()
+            lwc.addWidget(self._lbl(
+                "Pick an animated background — the live weather scene, the Matrix "
+                "code rain, or your own looping video (.webm / .mp4). Use clips "
+                "you're licensed to use (your own, or freely-licensed).", True))
+            self.wallGrid = QGridLayout()
+            self.wallGrid.setSpacing(12)
+            lwc.addLayout(self.wallGrid)
+            v.addWidget(lwcard)
+            self._render_wall_cards()
+
+            # Wallpaper — static image (plasma-apply-wallpaperimage).
             self.section(v, "Wallpaper")
             wcard, wc = self.card()
             wc.addWidget(self._lbl("Set the desktop background image "
@@ -3058,6 +3508,103 @@ def gui(start_key="overview", shot=None):
                 subprocess.Popen(["plasma-apply-wallpaperimage", f],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self.win.status("Wallpaper set.")
+
+        # ── Live / animated wallpaper picker ──
+        def _render_wall_cards(self):
+            while self.wallGrid.count():
+                it = self.wallGrid.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+            cards = [("Live Weather", "weather", "", "weather"),
+                     ("Code Rain", "code", "", "rain")]
+            for p in wallpaper_videos():
+                cards.append((os.path.splitext(os.path.basename(p))[0], "video", p, "video"))
+            cards.append(("Add your own…", "_add", "", "add"))
+            cols = 3
+            for i, (title, mode, path, kind) in enumerate(cards):
+                self.wallGrid.addWidget(self._wall_card(title, mode, path, kind),
+                                        i // cols, i % cols)
+
+        def _wall_card(self, title, mode, path, kind):
+            from PyQt6.QtWidgets import QToolButton
+            b = QToolButton()
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            b.setObjectName("wallcard")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setIcon(QIcon(self._wall_pixmap(kind, path)))
+            b.setIconSize(QSize(208, 117))
+            b.setText(title if len(title) <= 22 else title[:21] + "…")
+            b.setStyleSheet(
+                "QToolButton#wallcard{border:1px solid rgba(255,255,255,.10);"
+                "border-radius:14px;padding:8px;background:rgba(255,255,255,.03);"
+                "color:#dfe7ea;font-size:12px;}"
+                "QToolButton#wallcard:hover{border-color:%s;"
+                "background:rgba(86,197,216,.10);}" % ACCENT)
+            if kind == "add":
+                b.clicked.connect(self._add_video)
+            else:
+                b.clicked.connect(lambda _=False, m=mode, p=path: self._apply_wall(m, p))
+            return b
+
+        def _wall_pixmap(self, kind, path):
+            from PyQt6.QtGui import QPixmap, QPainter, QLinearGradient, QColor, QBrush
+            W, H = 208, 117
+            px = QPixmap(W, H)
+            px.fill(Qt.GlobalColor.transparent)
+            p = QPainter(px)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if kind == "video" and path:
+                thumb = wallpaper_thumb(path)
+                if thumb:
+                    src = QPixmap(thumb)
+                    if not src.isNull():
+                        src = src.scaled(W, H, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                         Qt.TransformationMode.SmoothTransformation)
+                        p.drawPixmap((W - src.width()) // 2, (H - src.height()) // 2, src)
+                        p.setPen(QColor(255, 255, 255, 235))
+                        f = p.font(); f.setPixelSize(34); p.setFont(f)
+                        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "▶")
+                        p.end()
+                        return px
+            grad = QLinearGradient(0, 0, W, H)
+            c0, c1 = {"weather": ("#0b3a4a", "#56c5d8"), "rain": ("#06140c", "#71F79F"),
+                      "video": ("#1a1030", "#8700ff"),
+                      "add": ("#15151c", "#2a2a38")}.get(kind, ("#15151c", "#2a2a38"))
+            grad.setColorAt(0, QColor(c0)); grad.setColorAt(1, QColor(c1))
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(grad)); p.drawRect(0, 0, W, H)
+            glyph = {"weather": "☀", "rain": "#", "video": "▶", "add": "+"}.get(kind, "▶")
+            p.setPen(QColor(255, 255, 255, 235))
+            f = p.font(); f.setPixelSize(42); f.setBold(True); p.setFont(f)
+            p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, glyph)
+            p.end()
+            return px
+
+        def _apply_wall(self, mode, path):
+            if wallpaper_apply(mode, path):
+                self.win.status("Wallpaper set: %s" %
+                                (os.path.basename(path) if mode == "video" else mode))
+            else:
+                self.win.status("Could not apply the wallpaper (Plasma scripting "
+                                "unavailable).")
+
+        def _add_video(self):
+            from PyQt6.QtWidgets import QFileDialog
+            f, _sel = QFileDialog.getOpenFileName(
+                self.win, "Choose an animated wallpaper", os.path.expanduser("~"),
+                "Video (*.webm *.mp4 *.mkv)")
+            if not f:
+                return
+            os.makedirs(WALL_DIRS[0], exist_ok=True)
+            dest = os.path.join(WALL_DIRS[0], os.path.basename(f))
+            try:
+                if os.path.abspath(f) != os.path.abspath(dest):
+                    shutil.copyfile(f, dest)
+            except Exception as e:
+                self.win.status("Could not import the video: %s" % e)
+                return
+            self._render_wall_cards()
+            self._apply_wall("video", dest)
 
     # ───────────────────────────── Display & Sound page ──────────────────────
     class DisplaySoundPage(BasePage):
@@ -4953,6 +5500,447 @@ def gui(start_key="overview", shot=None):
             self.installBtn.setEnabled(True)
             QTimer.singleShot(600, self.refresh)
 
+    class BackupsPage(CliPageMixin, BasePage):
+        """Scheduled, off-machine backups to ANY rclone provider — Google Drive,
+        Linode/S3, SFTP/FTP, WebDAV, custom.  Pick what to back up, where, and
+        how often; the same `hash-settings backup run` powers the button, the
+        systemd --user timer and the CLI.  All user-level — never touches root,
+        PAM or the security helper.  rclone sync is made SAFE (dated --backup-dir
+        keeps replaced/deleted files), so a backup can't silently lose data."""
+        def __init__(self, win):
+            self.cfg = backup_load()
+            self._srcToggles = {}
+            self._pending_remote = ""
+            super().__init__(win, "Backups",
+                             "Keep your files & settings safe off the machine — "
+                             "scheduled, to Google Drive, a server, or any "
+                             "provider")
+
+        def build_body(self, v):
+            if not backup_available():
+                c, cc = self.card()
+                cc.addWidget(self._lbl(
+                    "Backups need <b>rclone</b>, which isn’t installed. Install "
+                    "“rclone” from the HasH Store, then reopen this page.", True))
+                v.addWidget(c)
+                self.add_cli_card(v)
+                return
+
+            # ── status / run-now ──
+            top, tc = self.card()
+            row = QHBoxLayout()
+            self.statusBig = QLabel("…")
+            self.statusBig.setObjectName("big")
+            row.addWidget(self.statusBig, 1)
+            self.runBtn = QPushButton("Back up now")
+            self.runBtn.setObjectName("primary")
+            self.runBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.runBtn.clicked.connect(self._run_now)
+            row.addWidget(self.runBtn, 0)
+            tc.addLayout(row)
+            self.statusSub = QLabel("")
+            self.statusSub.setObjectName("muted")
+            self.statusSub.setWordWrap(True)
+            tc.addWidget(self.statusSub)
+            v.addWidget(top)
+
+            # ── what to back up ──
+            self.section(v, "What to back up")
+            wcard, wc = self.card()
+            self.srcBox = QVBoxLayout()
+            self.srcBox.setSpacing(8)
+            wc.addLayout(self.srcBox)
+            addRow = QHBoxLayout()
+            addRow.addStretch(1)
+            addFolderBtn = QPushButton("Add another folder…")
+            addFolderBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            addFolderBtn.clicked.connect(self._add_folder)
+            addRow.addWidget(addFolderBtn)
+            wc.addLayout(addRow)
+            self.settingsToggle = Toggle(self.cfg.get("settings_backup", False))
+            self.settingsToggle.toggled.connect(self._save_sources)
+            wc.addWidget(Win11Row(
+                "App & desktop settings",
+                "Your preferences in ~/.config (themes, app settings) — caches "
+                "are skipped", "preferences-system",
+                control=self.settingsToggle, color="#c264ff"))
+            v.addWidget(wcard)
+
+            # ── destination ──
+            self.section(v, "Destination")
+            dcard, dc = self.card()
+            drow = QHBoxLayout()
+            drow.addWidget(QLabel("Save to"), 0)
+            self.remoteCombo = QComboBox()
+            self.remoteCombo.currentIndexChanged.connect(self._save_dest)
+            drow.addWidget(self.remoteCombo, 1)
+            refreshBtn = QPushButton("↻")
+            refreshBtn.setToolTip("Re-check connected destinations")
+            refreshBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            refreshBtn.clicked.connect(
+                lambda: (self._reload_remotes(), self._refresh_status()))
+            drow.addWidget(refreshBtn, 0)
+            addBtn = QPushButton("Add destination…")
+            addBtn.setObjectName("primary")
+            addBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            addBtn.clicked.connect(self._add_destination)
+            drow.addWidget(addBtn, 0)
+            dc.addLayout(drow)
+            prow = QHBoxLayout()
+            prow.addWidget(QLabel("Folder on destination"), 0)
+            self.pathEdit = QLineEdit(self.cfg.get("path", "HasH-Backup"))
+            self.pathEdit.editingFinished.connect(self._save_dest)
+            prow.addWidget(self.pathEdit, 1)
+            dc.addLayout(prow)
+            dc.addWidget(self._lbl(
+                "Your folders are kept as an up-to-date copy at the destination. "
+                "Replaced or deleted files are moved into a dated history folder "
+                "first, so a backup never loses your data.", True))
+            v.addWidget(dcard)
+
+            # ── schedule ──
+            self.section(v, "Schedule")
+            scard, sc = self.card()
+            self.schedCombo = QComboBox()
+            for key, label, _cal in BACKUP_SCHEDULES:
+                self.schedCombo.addItem(label, key)
+            idx = self.schedCombo.findData(self.cfg.get("schedule", "off"))
+            if idx >= 0:
+                self.schedCombo.setCurrentIndex(idx)
+            self.schedCombo.currentIndexChanged.connect(self._apply_schedule)
+            sc.addWidget(Win11Row(
+                "Run automatically",
+                "Back up in the background on a schedule (a systemd --user timer; "
+                "runs while you’re signed in)", "appointment-soon",
+                control=self.schedCombo, color="#3ddc84"))
+            v.addWidget(scard)
+
+            self.add_cli_card(v)
+            self._rebuild_sources()
+            self._reload_remotes()
+            self._refresh_status()
+
+        # ── sources ──
+        def _all_sources(self):
+            return sorted(set(backup_default_sources())
+                          | set(self.cfg.get("sources", [])))
+
+        def _rebuild_sources(self):
+            while self.srcBox.count():
+                it = self.srcBox.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+            self._srcToggles = {}
+            chosen = set(self.cfg.get("sources", []))
+            for src in self._all_sources():
+                tg = Toggle(src in chosen)
+                tg.toggled.connect(self._save_sources)
+                self._srcToggles[src] = tg
+                base = os.path.basename(src.rstrip("/")) or src
+                self.srcBox.addWidget(Win11Row(base, src, "folder",
+                                               control=tg, color="#3b9dff"))
+            if not self._srcToggles:
+                self.srcBox.addWidget(self._lbl(
+                    "No common folders found — use “Add another folder…”.", True))
+
+        def _save_sources(self, *a):
+            self.cfg["sources"] = [s for s, t in self._srcToggles.items()
+                                   if t.isChecked()]
+            self.cfg["settings_backup"] = self.settingsToggle.isChecked()
+            backup_save(self.cfg)
+            self._refresh_status()
+
+        def _add_folder(self):
+            from PyQt6.QtWidgets import QFileDialog
+            d = QFileDialog.getExistingDirectory(
+                self.win, "Choose a folder to back up", HOME)
+            if not d:
+                return
+            srcs = set(self.cfg.get("sources", []))
+            srcs.add(d)
+            self.cfg["sources"] = sorted(srcs)
+            backup_save(self.cfg)
+            self._rebuild_sources()
+            self._refresh_status()
+
+        # ── destination ──
+        def _reload_remotes(self):
+            self.remoteCombo.blockSignals(True)
+            self.remoteCombo.clear()
+            remotes = rclone_remotes()
+            names = [n for n, _t in remotes]
+            if not remotes:
+                self.remoteCombo.addItem("No destinations yet — add one →", "")
+            for name, typ in remotes:
+                self.remoteCombo.addItem("%s   (%s)" % (name, typ), name)
+            pending = getattr(self, "_pending_remote", "")
+            if pending and pending in names:
+                self.cfg["remote"] = pending
+                backup_save(self.cfg)
+                self._pending_remote = ""
+            idx = self.remoteCombo.findData(self.cfg.get("remote", ""))
+            if idx >= 0:
+                self.remoteCombo.setCurrentIndex(idx)
+            self.remoteCombo.blockSignals(False)
+
+        def _save_dest(self, *a):
+            self.cfg["remote"] = self.remoteCombo.currentData() or ""
+            self.cfg["path"] = self.pathEdit.text().strip() or "HasH-Backup"
+            backup_save(self.cfg)
+            self._refresh_status()
+
+        def _add_destination(self):
+            from PyQt6.QtWidgets import (QDialog, QFormLayout, QDialogButtonBox,
+                                         QWidget)
+            import re
+            dlg = QDialog(self.win)
+            dlg.setWindowTitle("Add a backup destination")
+            dlg.setMinimumWidth(460)
+            dlg.setStyleSheet("QDialog{ background:#12141a; } "
+                              "QLabel{ color:#cfe9ee; }" + app_qss())
+            outer = QVBoxLayout(dlg)
+            outer.setContentsMargins(20, 18, 20, 16)
+            outer.setSpacing(12)
+            intro = QLabel("Connect a cloud account or a server to back up to. "
+                           "Cloud sign-ins (Google Drive, OneDrive, Dropbox) open "
+                           "a browser; servers ask for their address and login.")
+            intro.setObjectName("muted")
+            intro.setWordWrap(True)
+            outer.addWidget(intro)
+
+            typeCombo = QComboBox()
+            for tkey, label, _o, _f, _flds in BACKUP_PROVIDERS:
+                typeCombo.addItem(label, tkey)
+            trow = QHBoxLayout()
+            trow.addWidget(QLabel("Type"), 0)
+            trow.addWidget(typeCombo, 1)
+            outer.addLayout(trow)
+
+            nameEdit = QLineEdit()
+            nrow = QHBoxLayout()
+            nrow.addWidget(QLabel("Name"), 0)
+            nrow.addWidget(nameEdit, 1)
+            outer.addLayout(nrow)
+
+            formHost = QWidget()
+            form = QFormLayout(formHost)
+            form.setContentsMargins(0, 0, 0, 0)
+            form.setSpacing(8)
+            outer.addWidget(formHost)
+            note = QLabel("")
+            note.setObjectName("muted")
+            note.setWordWrap(True)
+            outer.addWidget(note)
+
+            field_widgets = {}      # key -> (QLineEdit, is_secret)
+            auto_names = set()
+
+            def provider_for(tkey):
+                for p in BACKUP_PROVIDERS:
+                    if p[0] == tkey:
+                        return p
+                return BACKUP_PROVIDERS[0]
+
+            def rebuild():
+                while form.rowCount():
+                    form.removeRow(0)
+                field_widgets.clear()
+                _tk, label, oauth, _fixed, fields = provider_for(
+                    typeCombo.currentData())
+                if oauth:
+                    formHost.setVisible(False)
+                    note.setText("A browser window will open so you can sign in "
+                                 "to %s. When it reports success, come back and "
+                                 "press “↻”." % label)
+                else:
+                    formHost.setVisible(True)
+                    note.setText("")
+                    for key, flabel, secret in fields:
+                        e = QLineEdit()
+                        if secret:
+                            e.setEchoMode(QLineEdit.EchoMode.Password)
+                        form.addRow(QLabel(flabel), e)
+                        field_widgets[key] = (e, secret)
+
+            def on_type_change():
+                tkey = typeCombo.currentData()
+                suggest = {"drive": "gdrive", "onedrive": "onedrive",
+                           "dropbox": "dropbox", "s3": "linode",
+                           "sftp": "server", "ftp": "ftp",
+                           "webdav": "webdav"}.get(tkey, tkey)
+                cur = nameEdit.text().strip()
+                if cur == "" or cur in auto_names:
+                    nameEdit.setText(suggest)
+                    auto_names.add(suggest)
+                rebuild()
+
+            typeCombo.currentIndexChanged.connect(lambda _i: on_type_change())
+
+            bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                  | QDialogButtonBox.StandardButton.Cancel)
+            outer.addWidget(bb)
+            bb.rejected.connect(dlg.reject)
+
+            def on_ok():
+                name = nameEdit.text().strip()
+                if not re.match(r"^[A-Za-z0-9_-]+$", name or ""):
+                    QMessageBox.warning(dlg, "Destination name",
+                                        "Use letters, numbers, “-” or “_” "
+                                        "(no spaces or symbols).")
+                    return
+                if name in [n for n, _t in rclone_remotes()] \
+                        and QMessageBox.question(
+                            dlg, "Replace destination",
+                            "A destination called “%s” already exists. "
+                            "Replace it?" % name) \
+                        != QMessageBox.StandardButton.Yes:
+                    return
+                _tk, label, oauth, fixed, _flds = provider_for(
+                    typeCombo.currentData())
+                vals = {k: w.text().strip()
+                        for k, (w, _s) in field_widgets.items()}
+                secret_keys = [k for k, (_w, s) in field_widgets.items() if s]
+                dlg.accept()
+                self._create_remote(name, typeCombo.currentData(), label, oauth,
+                                    fixed, vals, secret_keys)
+
+            bb.accepted.connect(on_ok)
+            on_type_change()
+            dlg.exec()
+
+        def _spawn_terminal(self, inner_argv):
+            import shlex
+            cmd = " ".join(shlex.quote(c) for c in inner_argv)
+            script = (cmd + '; echo; echo "----"; '
+                      'read -r -p "Press Enter to close this window… " _')
+            for term in ("konsole", "xterm", "x-terminal-emulator"):
+                if have(term):
+                    self.win.spawn([term, "-e", "bash", "-lc", script])
+                    return True
+            return False
+
+        def _create_remote(self, name, tkey, label, oauth, fixed, vals,
+                           secret_keys):
+            if oauth:
+                inner = ["rclone", "config", "create", name, tkey]
+                for k, val in fixed.items():
+                    inner += [k, val]
+                self.cli_echo("$ " + CliConsole._fmt(inner)
+                              + "    # opens a browser to sign in")
+                if not self._spawn_terminal(inner):
+                    from PyQt6.QtCore import QProcess
+                    QProcess.startDetached(inner[0], inner[1:])
+                self._pending_remote = name
+                self.win.status("Connecting %s — sign in, then press “↻”." % label)
+                return
+            argv = ["rclone", "config", "create", name, tkey]
+            shown = list(argv)
+            for k, val in fixed.items():
+                argv += [k, val]
+                shown += [k, val]
+            for k, val in vals.items():
+                if not val:
+                    continue
+                argv += [k, val]
+                shown += [k, ("***" if k in secret_keys else val)]
+            argv.append("--obscure")
+            shown.append("--obscure")
+            r = self.run_user(argv, timeout=40, echo=shown)
+            self.cfg["remote"] = name
+            backup_save(self.cfg)
+            self._reload_remotes()
+            self._refresh_status()
+            self.win.status("Added destination “%s”." % name
+                            if getattr(r, "returncode", 1) == 0
+                            else "Couldn’t add “%s” — see the CLI output." % name)
+
+        # ── schedule ──
+        def _apply_schedule(self, *a):
+            key = self.schedCombo.currentData()
+            self.cfg["schedule"] = key
+            backup_save(self.cfg)
+            self.cli_echo("# set background backup schedule: %s" % key)
+            for argv in backup_schedule_commands(key):
+                self.run_user(argv, timeout=20)
+            self._refresh_status()
+
+        # ── run + status ──
+        def _run_now(self):
+            self._save_sources()
+            self._save_dest()
+            if not self.cfg.get("remote") or not backup_jobs(self.cfg):
+                self.win.status("Pick a destination and at least one folder "
+                                "first.")
+                return
+            import datetime
+            self.runBtn.setEnabled(False)
+            self.statusBig.setText("Backing up…")
+            self.win.status("Backing up… this can take a while on first run.")
+            stamp = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+            self.cli_echo("$ hash-settings backup run")
+            for (lbl, src, remote, base) in backup_jobs(self.cfg):
+                self.cli.append(backup_sync_argv(lbl, src, remote, base, stamp))
+            self._proc = QProcess(self)
+            self._proc.setProcessChannelMode(
+                QProcess.ProcessChannelMode.MergedChannels)
+            self._proc.finished.connect(self._run_done)
+            self._proc.start(_self_cmd(), ["backup", "run"])
+
+        def _run_done(self, code, _status):
+            self.runBtn.setEnabled(True)
+            if code == 0:
+                self.cli_echo("# ✓ backup complete")
+                self.win.status("Backup complete.")
+            else:
+                self.cli_echo("# ✗ backup finished with errors — see the log")
+                self.win.status("Backup finished with errors — see the CLI "
+                                "output / log.")
+            self._refresh_status()
+
+        @staticmethod
+        def _human_time(iso):
+            import datetime
+            try:
+                return datetime.datetime.fromisoformat(iso).strftime(
+                    "%d %b %Y, %H:%M")
+            except Exception:
+                return iso
+
+        def _refresh_status(self):
+            st = backup_state_load()
+            cfg = self.cfg
+            njobs = len(backup_jobs(cfg))
+            last = st.get("last_run")
+            self.statusBig.setText("Last backup: " + self._human_time(last)
+                                   if last else "No backups yet")
+            bits = []
+            if cfg.get("remote"):
+                bits.append("Destination: %s:%s"
+                            % (cfg["remote"], cfg.get("path", "")))
+            else:
+                bits.append("No destination set")
+            bits.append("%d folder%s selected"
+                        % (njobs, "" if njobs == 1 else "s"))
+            sched = cfg.get("schedule", "off")
+            slabel = {k: l for k, l, _c in BACKUP_SCHEDULES}.get(sched, sched)
+            if sched != "off" and backup_timer_active():
+                bits.append("Scheduled: " + slabel.lower())
+            else:
+                bits.append("Not scheduled")
+            if st.get("result") == "error":
+                why = ", ".join(st.get("failed", [])) or st.get("message", "")
+                bits.append("⚠ last run had errors"
+                            + (": " + why if why else ""))
+            self.statusSub.setText("    ·    ".join(bits))
+            self.runBtn.setEnabled(bool(cfg.get("remote")) and njobs > 0)
+
+        def refresh(self):
+            if not backup_available():
+                return
+            self._reload_remotes()
+            self._refresh_status()
+
     class DateTimePage(CliPageMixin, BasePage):
         """Date, time & timezone — native, timedatectl-backed (replaces kcm_clock)."""
         def __init__(self, win):
@@ -5364,6 +6352,7 @@ def gui(start_key="overview", shot=None):
         "security": SecurityPane,
         "disks": DisksPane,
         "apps": AppsPane,
+        "backups": BackupsPage,
     }
 
     # ─────────────────── account header (Win11 rail top) ─────────────────────
@@ -5615,8 +6604,11 @@ def gui(start_key="overview", shot=None):
             p = QPainter(self)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             path = QPainterPath()
+            # square the corners when maximised (full-screen) so there are no
+            # rounded gaps showing the desktop behind a screen-filling window.
+            radius = 0 if self.isMaximized() else 20
             path.addRoundedRect(0.5, 0.5, self.width() - 1,
-                                self.height() - 1, 20, 20)
+                                self.height() - 1, radius, radius)
             p.fillPath(path, QColor(0x12, 0x14, 0x1a))
             p.setPen(QColor(255, 255, 255, 30))
             p.drawPath(path)
@@ -5653,6 +6645,8 @@ def main():
         return cli_set(a[1], a[2])
     if a and a[0] in ("list", "--list-settings"):
         return cli_list()
+    if a and a[0] == "backup":
+        return cli_backup(a[1:])
     start = "overview"
     if "--page" in a:
         i = a.index("--page")
