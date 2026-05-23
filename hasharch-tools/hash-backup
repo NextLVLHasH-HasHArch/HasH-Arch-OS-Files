@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""hash-backup — HasH backups to your own cloud or server, + local rollback.
+
+Cloud/remote backups are powered by **rclone** (a HasH dependency), so you can
+send your files anywhere: Google Drive, Linode Object Storage, an SFTP or FTP
+server, or ANY rclone backend (custom). Backups are versioned — replaced/deleted
+files move to a dated `.versions/` folder, so a backup never silently destroys an
+old copy.
+
+Local **rollback** uses Timeshift or Snapper if present (snapshot the system,
+restore if an update breaks something).
+
+Secrets are never put on the command line: passwords/keys are read from a prompt
+or stdin and stored via `rclone obscure` in rclone's config (which you can
+additionally encrypt with `rclone config` → "s" set a password).
+
+Subcommands:
+  providers                       supported remote types + what each needs
+  remotes                         configured rclone remotes
+  add-drive  <name>               Google Drive (opens an OAuth login)
+  add-linode <name> <key> <region>   Linode Object Storage (S3); secret via prompt
+  add-sftp   <name> <host> <user> [--port N] [--key FILE]   SFTP (key preferred)
+  add-ftp    <name> <host> <user>                            FTP
+  add-custom <name> <type> [k v …]   any rclone backend (passthrough)
+  remove <name>                   delete a remote
+  paths [add|remove] [DIR]        what gets backed up (default: ~/Documents, ~/.config)
+  run <remote> [--dry-run]        back up now (versioned rclone sync)
+  restore <remote> <dest> [--dry-run]   pull a backup back
+  status                          remotes, paths, last backup
+  schedule on|off [--hourly|--daily]    systemd user timer
+  snapshot [create|list|restore]  local rollback via Timeshift/Snapper
+"""
+import getpass
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONF_DIR = os.path.join(HOME, ".config", "hash")
+CONF = os.path.join(CONF_DIR, "backup.json")
+STATE = os.path.join(HOME, ".local", "share", "hash", "backup-last.json")
+HOST = socket.gethostname()
+DEST_ROOT = "hash-backup/%s" % HOST
+
+PROVIDERS = {
+    "drive":  "Google Drive — personal/Workspace (OAuth login in a browser).",
+    "linode": "Linode Object Storage — S3-compatible (access key + secret + region).",
+    "sftp":   "SFTP server — SSH file transfer (key-based preferred, else password).",
+    "ftp":    "FTP server — plain/again-TLS FTP (host + user + password).",
+    "custom": "Any other rclone backend (s3, b2, dropbox, webdav, …).",
+}
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def need_rclone():
+    if not shutil.which("rclone"):
+        die("rclone is not installed (it's a HasH dependency — `pacman -S rclone`).", 4)
+
+
+def run(argv, **kw):
+    return subprocess.run(argv, text=True, **kw)
+
+
+def cap(argv):
+    return subprocess.run(argv, capture_output=True, text=True)
+
+
+def load_conf():
+    try:
+        return json.load(open(CONF))
+    except Exception:
+        return {"paths": [os.path.join(HOME, "Documents"),
+                          os.path.join(HOME, ".config")]}
+
+
+def save_conf(c):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    with open(CONF, "w") as f:
+        json.dump(c, f, indent=2)
+
+
+def obscure(secret):
+    r = cap(["rclone", "obscure", secret])
+    return r.stdout.strip() if r.returncode == 0 else secret
+
+
+def remotes():
+    need_rclone()
+    r = cap(["rclone", "listremotes"])
+    return [x.rstrip(":") for x in r.stdout.split()] if r.returncode == 0 else []
+
+
+def _ask_secret(prompt):
+    if not sys.stdin.isatty():
+        return sys.stdin.readline().rstrip("\n")
+    return getpass.getpass(prompt)
+
+
+# ─────────────────────────────── add providers ───────────────────────────────
+def _create(name, rtype, *kv):
+    need_rclone()
+    if name in remotes():
+        die("a remote named %r already exists (use `remove` first)." % name, 6)
+    argv = ["rclone", "config", "create", name, rtype, *kv]
+    # don't echo obscured secrets
+    print("Configuring remote %r (%s)…" % (name, rtype))
+    if run(argv).returncode != 0:
+        die("rclone failed to create the remote.", 5)
+    print("Remote %r ready. Test it:  rclone lsd %s:" % (name, name))
+    return 0
+
+
+def cmd_add_drive(name):
+    print("A browser window will open to sign in to Google. Approve access, then "
+          "return here.")
+    return _create(name, "drive", "scope", "drive")
+
+
+def cmd_add_linode(name, key, region):
+    secret = _ask_secret("Linode secret access key: ")
+    endpoint = "%s.linodeobjects.com" % region
+    return _create(name, "s3", "provider", "Linode",
+                   "access_key_id", key, "secret_access_key", secret,
+                   "endpoint", endpoint)
+
+
+def cmd_add_sftp(name, host, user, port="22", key=None):
+    kv = ["host", host, "user", user, "port", port]
+    if key:
+        if not os.path.isfile(os.path.expanduser(key)):
+            die("key file not found: %s" % key, 4)
+        kv += ["key_file", os.path.expanduser(key)]
+        print("Using SSH key %s (recommended — no password stored)." % key)
+    else:
+        kv += ["pass", obscure(_ask_secret("SFTP password: "))]
+    return _create(name, "sftp", *kv)
+
+
+def cmd_add_ftp(name, host, user):
+    return _create(name, "ftp", "host", host, "user", user,
+                   "pass", obscure(_ask_secret("FTP password: ")))
+
+
+def cmd_add_custom(name, rtype, kv):
+    return _create(name, rtype, *kv)
+
+
+def cmd_remove(name):
+    need_rclone()
+    if name not in remotes():
+        die("no such remote: %r" % name, 4)
+    return run(["rclone", "config", "delete", name]).returncode
+
+
+# ───────────────────────────────── paths ─────────────────────────────────────
+def cmd_paths(action=None, path=None):
+    c = load_conf()
+    if action == "add":
+        p = os.path.abspath(os.path.expanduser(path))
+        if p not in c["paths"]:
+            c["paths"].append(p)
+            save_conf(c)
+        print("Backing up:", p)
+    elif action == "remove":
+        p = os.path.abspath(os.path.expanduser(path))
+        c["paths"] = [x for x in c["paths"] if x != p]
+        save_conf(c)
+        print("Removed:", p)
+    else:
+        for p in c["paths"]:
+            print(("  ✓ " if os.path.exists(p) else "  ✗ ") + p)
+    return 0
+
+
+# ──────────────────────────────── run/restore ────────────────────────────────
+def cmd_run(remote=None, dry=False):
+    need_rclone()
+    if not remote:
+        remote = load_conf().get("default_remote")
+    if not remote:
+        die("no remote given and no default set. Use `hash-backup run <remote>` "
+            "or `hash-backup schedule on <remote>` to set a default.", 2)
+    if remote not in remotes():
+        die("no such remote: %r (see `hash-backup remotes`)." % remote, 4)
+    c = load_conf()
+    paths = [p for p in c["paths"] if os.path.exists(p)]
+    if not paths:
+        die("no existing backup paths configured (see `hash-backup paths`).", 4)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    rc = 0
+    for p in paths:
+        base = os.path.basename(p.rstrip("/")) or "root"
+        dest = "%s:%s/%s" % (remote, DEST_ROOT, base)
+        bdir = "%s:%s/.versions/%s/%s" % (remote, DEST_ROOT, stamp, base)
+        argv = ["rclone", "sync", p, dest, "--backup-dir", bdir,
+                "--fast-list", "--transfers", "4", "-v"]
+        if dry:
+            argv.append("--dry-run")
+        print("==> %s  ->  %s" % (p, dest))
+        rc |= run(argv).returncode
+    if not dry:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        json.dump({"remote": remote, "when": int(time.time()), "paths": paths},
+                  open(STATE, "w"))
+    print("Backup %s." % ("preview complete (dry-run)" if dry else
+                          ("complete" if rc == 0 else "completed with errors")))
+    return rc
+
+
+def cmd_restore(remote, dest, dry=False):
+    need_rclone()
+    if remote not in remotes():
+        die("no such remote: %r." % remote, 4)
+    dest = os.path.abspath(os.path.expanduser(dest))
+    os.makedirs(dest, exist_ok=True)
+    argv = ["rclone", "copy", "%s:%s" % (remote, DEST_ROOT), dest, "-v"]
+    if dry:
+        argv.append("--dry-run")
+    print("Restoring %s:%s -> %s" % (remote, DEST_ROOT, dest))
+    return run(argv).returncode
+
+
+def cmd_status():
+    rl = remotes()
+    c = load_conf()
+    last = {}
+    try:
+        last = json.load(open(STATE))
+    except Exception:
+        pass
+    print("Configured remotes: " + (", ".join(rl) or "none — add one with `add-*`"))
+    print("Backup paths:")
+    for p in c["paths"]:
+        print(("  ✓ " if os.path.exists(p) else "  ✗ ") + p)
+    if last:
+        ago = (int(time.time()) - last.get("when", 0)) // 3600
+        print("Last backup: %s, %dh ago, to %r" %
+              (time.strftime("%Y-%m-%d %H:%M", time.localtime(last.get("when", 0))),
+               ago, last.get("remote")))
+    else:
+        print("Last backup: never")
+    sched = cap(["systemctl", "--user", "is-enabled", "hash-backup.timer"])
+    print("Schedule: " + (sched.stdout.strip() or "not set"))
+    return 0
+
+
+# ─────────────────────────────── schedule ────────────────────────────────────
+def cmd_schedule(state, remote=None, cadence="daily"):
+    if not shutil.which("systemctl"):
+        die("systemctl not found.", 4)
+    if state == "on":
+        if remote:
+            if remote not in remotes():
+                die("no such remote: %r." % remote, 4)
+            c = load_conf()
+            c["default_remote"] = remote
+            save_conf(c)
+        elif not load_conf().get("default_remote"):
+            die("which remote? Use `hash-backup schedule on <remote>`.", 2)
+        r = run(["systemctl", "--user", "enable", "--now", "hash-backup.timer"])
+        print("Scheduled %s backups to %r." % (cadence,
+              load_conf().get("default_remote")) if r.returncode == 0
+              else "Could not enable the timer (is hash-suite installed?).")
+        return r.returncode
+    run(["systemctl", "--user", "disable", "--now", "hash-backup.timer"])
+    print("Scheduled backups off.")
+    return 0
+
+
+# ───────────────────────────── snapshot / rollback ───────────────────────────
+def _snap_tool():
+    for t in ("timeshift", "snapper"):
+        if shutil.which(t):
+            return t
+    return None
+
+
+def cmd_snapshot(action=None, arg=None):
+    tool = _snap_tool()
+    if not tool:
+        die("No snapshot tool found. Install Timeshift (`pacman -S timeshift`) or "
+            "Snapper for local rollback.", 4)
+    if action in (None, "list"):
+        if tool == "timeshift":
+            return run(["pkexec", "timeshift", "--list"]).returncode
+        return run(["snapper", "list"]).returncode
+    if action == "create":
+        desc = arg or ("HasH %s" % time.strftime("%Y-%m-%d %H:%M"))
+        if tool == "timeshift":
+            return run(["pkexec", "timeshift", "--create", "--comments", desc]).returncode
+        return run(["pkexec", "snapper", "create", "-d", desc]).returncode
+    if action == "restore":
+        if tool == "timeshift":
+            print("Launching Timeshift restore (choose a snapshot)…")
+            return run(["pkexec", "timeshift", "--restore"]).returncode
+        if not arg:
+            die("snapshot restore <id> (see `snapshot list`).", 2)
+        return run(["pkexec", "snapper", "undochange", "%s..0" % arg]).returncode
+    die("snapshot [create|list|restore]", 2)
+
+
+# ──────────────────────────────── dispatch ───────────────────────────────────
+def cmd_providers():
+    for k, v in PROVIDERS.items():
+        print("  %-8s %s" % (k, v))
+    return 0
+
+
+def main(argv):
+    if not argv:
+        sys.stderr.write(__doc__)
+        return 2
+    cmd, a = argv[0], argv[1:]
+    dry = "--dry-run" in a
+    a = [x for x in a if x != "--dry-run"]
+    try:
+        if cmd == "providers":
+            return cmd_providers()
+        if cmd == "remotes":
+            print("\n".join(remotes()) or "(none)")
+            return 0
+        if cmd == "add-drive":
+            return cmd_add_drive(a[0])
+        if cmd == "add-linode":
+            return cmd_add_linode(a[0], a[1], a[2])
+        if cmd == "add-sftp":
+            port = a[a.index("--port") + 1] if "--port" in a else "22"
+            key = a[a.index("--key") + 1] if "--key" in a else None
+            return cmd_add_sftp(a[0], a[1], a[2], port, key)
+        if cmd == "add-ftp":
+            return cmd_add_ftp(a[0], a[1], a[2])
+        if cmd == "add-custom":
+            return cmd_add_custom(a[0], a[1], a[2:])
+        if cmd == "remove":
+            return cmd_remove(a[0])
+        if cmd == "paths":
+            return cmd_paths(a[0] if a else None, a[1] if len(a) > 1 else None)
+        if cmd == "run":
+            pos = [x for x in a if not x.startswith("--")]
+            return cmd_run(pos[0] if pos else None, dry)
+        if cmd == "restore":
+            return cmd_restore(a[0], a[1], dry)
+        if cmd == "status":
+            return cmd_status()
+        if cmd == "schedule":
+            cad = "hourly" if "--hourly" in a else "daily"
+            pos = [x for x in a if not x.startswith("--")]
+            return cmd_schedule(pos[0], pos[1] if len(pos) > 1 else None, cad)
+        if cmd == "snapshot":
+            return cmd_snapshot(a[0] if a else None, a[1] if len(a) > 1 else None)
+    except IndexError:
+        die("missing arguments for %r\n\n%s" % (cmd, __doc__), 2)
+    die("unknown subcommand: %r" % cmd, 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

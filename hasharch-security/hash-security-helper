@@ -53,6 +53,9 @@ Subcommands (all argv, no shell):
   howdy-config  <key> <value>  set an allow-listed Howdy key (certainty/dark_threshold)
   faillock-reset <user>        clear the faillock counter (`faillock --reset`)
 
+  epd-baseline                 record the system EPD baseline (root: hash-epd baseline)
+  epd-quarantine <path>        isolate a NON-package file (refuses pacman-owned/critical)
+
   methods: password | pin | totp | fingerprint | face   (face = Howdy, IR-only)
   Face unlock is HARDENED: HasH only ever enrolls/drives an INFRARED camera, so a
   printed photo can't unlock you; pam_howdy is `sufficient` above the password
@@ -681,6 +684,64 @@ def cmd_howdy_config(key, value):
     return 0
 
 
+# ───────────────── Endpoint Protection & Detection (hash-epd) ─────────────────
+# Privileged EPD actions. `epd-baseline` records the system-wide trusted baseline
+# (root, so it can read root-only files + write /var/lib/hash/epd). `epd-quarantine`
+# isolates a suspicious file — but ONLY a file that is NOT owned by any pacman
+# package (malware drops non-package files; quarantining a real system binary
+# could brick the box, so package-owned paths are REFUSED — investigate/reinstall
+# those instead).
+EPD_QUARANTINE = "/var/lib/hash/epd/quarantine"
+
+
+def _hash_epd_bin():
+    for p in ("/usr/bin/hash-epd", "/usr/local/bin/hash-epd",
+              os.path.expanduser("~%s/.local/bin/hash-epd"
+                                 % os.environ.get("SUDO_USER", "root"))):
+        if os.path.exists(p):
+            return p
+    return shutil.which("hash-epd")
+
+
+def cmd_epd_baseline():
+    epd = _hash_epd_bin()
+    if not epd:
+        die("hash-epd not found.", 4)
+    print("Recording the system EPD baseline (root)…")
+    return _run_stream([epd, "baseline"])
+
+
+def cmd_epd_quarantine(path):
+    if not path or not path.startswith("/"):
+        die("quarantine needs an absolute path.", 2)
+    real = os.path.realpath(path)
+    if not os.path.isfile(real):
+        die("not a regular file: %s" % real, 4)
+    # REFUSE package-owned files — never quarantine a real OS binary.
+    if shutil.which("pacman"):
+        owner = subprocess.run(["pacman", "-Qo", real],
+                               capture_output=True, text=True)
+        if owner.returncode == 0:
+            die("REFUSING to quarantine %s — it is owned by a pacman package "
+                "(%s). Investigate or reinstall it; don't quarantine system "
+                "files." % (real, owner.stdout.strip().split(" is owned by ")[-1]
+                            or "a package"), 6)
+    # Refuse a hard denylist of catastrophic paths even if not package-owned.
+    if real in ("/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/boot") or \
+       real.startswith(("/boot/", "/dev/", "/proc/", "/sys/")):
+        die("REFUSING to quarantine a critical path: %s" % real, 6)
+    os.makedirs(EPD_QUARANTINE, exist_ok=True)
+    os.chmod(EPD_QUARANTINE, 0o700)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(EPD_QUARANTINE, "%s-%s" % (stamp, os.path.basename(real)))
+    shutil.move(real, dest)
+    os.chmod(dest, 0o600)               # strip exec — neutralise it
+    with open(os.path.join(EPD_QUARANTINE, "manifest.log"), "a") as f:
+        f.write("%s\torigin=%s\tquarantined=%s\n" % (stamp, real, dest))
+    print("Quarantined %s -> %s (exec stripped)." % (real, dest))
+    return 0
+
+
 # ═════════════ Microsoft Entra ID / Azure AD (himmelblau) wiring ══════════════
 # A self-contained subsystem: write the tenant config, register the NSS source,
 # wire pam_himmelblau into the editable surfaces (NEVER the TTY), and enable the
@@ -1083,6 +1144,10 @@ def main(argv):
             return cmd_howdy_config(a[0], a[1])
         if cmd == "faillock-reset":
             return cmd_faillock_reset(a[0])
+        if cmd == "epd-baseline":
+            return cmd_epd_baseline()
+        if cmd == "epd-quarantine":
+            return cmd_epd_quarantine(a[0])
         if cmd == "azure":
             return cmd_azure(a)
     except IndexError:

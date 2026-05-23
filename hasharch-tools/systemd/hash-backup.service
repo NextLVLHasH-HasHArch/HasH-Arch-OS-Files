@@ -1,0 +1,11 @@
+[Unit]
+Description=HasH backup to your configured cloud/server (rclone)
+Documentation=man:hash-backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hash-backup run
+Nice=10
+IOSchedulingClass=idle

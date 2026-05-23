@@ -2514,9 +2514,8 @@ def gui(start_key="overview", shot=None):
     class NetworkPage(BasePage):
         def __init__(self, win):
             super().__init__(win, "Network",
-                             "Wi-Fi, Bluetooth, live connections, SSH keys & "
-                             "packet inspection")
-            self._conns = []
+                             "Wi-Fi, Bluetooth & SSH keys  ·  connection monitoring "
+                             "moved to Security")
 
         def build_body(self, v):
             # Wi-Fi block
@@ -2554,31 +2553,9 @@ def gui(start_key="overview", shot=None):
             bc.addLayout(self.btList)
             v.addWidget(self.btCard)
 
-            # ── Connections — per-app network monitor (netstat-style) ──
-            self.section(v, "Connections")
-            self.connCard, cc = self.card()
-            ctop = QHBoxLayout()
-            self.connSearch = QLineEdit()
-            self.connSearch.setPlaceholderText("Filter by app, port or address…")
-            self.connSearch.setClearButtonEnabled(True)
-            self.connSearch.textChanged.connect(lambda _t: self._render_conns())
-            ctop.addWidget(self.connSearch, 1)
-            self.connAll = QCheckBox("All processes (admin)")
-            self.connAll.setToolTip("Run ss via pkexec to see every process's "
-                                    "sockets, not only yours")
-            self.connAll.toggled.connect(lambda _b: self._refresh_conns())
-            ctop.addWidget(self.connAll)
-            cbtn = QPushButton("Refresh")
-            cbtn.clicked.connect(self._refresh_conns)
-            ctop.addWidget(cbtn)
-            cc.addLayout(ctop)
-            self.connCount = QLabel("")
-            self.connCount.setObjectName("muted")
-            cc.addWidget(self.connCount)
-            self.connList = QVBoxLayout()
-            self.connList.setSpacing(6)
-            cc.addLayout(self.connList)
-            v.addWidget(self.connCard)
+            # NOTE: the per-app Connections monitor + Deep Packet Inspection have
+            # MOVED to the Security page (the system security + monitoring hub).
+            # Network keeps connectivity (Wi-Fi/Bluetooth) + SSH keys.
 
             # ── SSH keys (create + copy public key for RunPod / servers) ──
             self.section(v, "SSH Keys")
@@ -2597,35 +2574,8 @@ def gui(start_key="overview", shot=None):
             sshc.addLayout(self.sshList)
             v.addWidget(self.sshCard)
 
-            # ── Deep Packet Inspection (Wireshark + mitmweb/Fiddler-style) ──
-            self.section(v, "Deep Packet Inspection")
-            self.dpiCard, dc = self.card()
-            dc.addWidget(self._lbl(
-                "Capture & inspect traffic. Wireshark = full packet capture; "
-                "mitmweb = HTTP/S intercept proxy (Fiddler-style) on 127.0.0.1:8080 "
-                "with a web UI.", True))
-            drow = QHBoxLayout()
-            drow.setSpacing(10)
-            wb = QPushButton("Packet capture — Wireshark")
-            wb.setObjectName("primary")
-            wb.setEnabled(have("wireshark"))
-            wb.clicked.connect(self._launch_wireshark)
-            drow.addWidget(wb)
-            mb = QPushButton("HTTP/S intercept — mitmweb")
-            mb.setEnabled(have("mitmweb"))
-            mb.clicked.connect(self._launch_mitm)
-            drow.addWidget(mb)
-            drow.addStretch(1)
-            dc.addLayout(drow)
-            self.dpiNote = QLabel("")
-            self.dpiNote.setObjectName("muted")
-            self.dpiNote.setWordWrap(True)
-            dc.addWidget(self.dpiNote)
-            v.addWidget(self.dpiCard)
-
             self.refresh()
             self._refresh_ssh()
-            self._refresh_conns()
 
         def _clear(self, lay):
             while lay.count():
@@ -2780,80 +2730,6 @@ def gui(start_key="overview", shot=None):
                 bt_set(on)
                 QTimer.singleShot(900, self.refresh)
 
-        # ── Connections — per-app network monitor ──
-        def _refresh_conns(self):
-            if not have("ss"):
-                self.connCount.setText("ss not found (iproute2 required)")
-                return
-            argv = (["pkexec", "ss", "-tunaupH"] if self.connAll.isChecked()
-                    else ["ss", "-tunaupH"])
-            self.win.status("Reading connections…")
-            QApplication.processEvents()
-            try:
-                out = subprocess.run(argv, capture_output=True, text=True,
-                                     timeout=25).stdout
-            except Exception:
-                out = ""
-            self.win.status("")
-            self._conns = self._parse_ss(out)
-            self._render_conns()
-
-        @staticmethod
-        def _parse_ss(text):
-            import re
-            rx = re.compile(r'\("([^"]+)",pid=(\d+)')
-            rows = []
-            for line in text.splitlines():
-                t = line.split()
-                if len(t) < 6:
-                    continue
-                m = rx.search(" ".join(t[6:]))
-                rows.append({"proto": t[0], "state": t[1], "local": t[4],
-                             "peer": t[5], "app": m.group(1) if m else "—",
-                             "pid": m.group(2) if m else ""})
-            return rows
-
-        def _render_conns(self):
-            self._clear(self.connList)
-            term = self.connSearch.text().lower().strip()
-            cap, shown, matched = 200, 0, 0
-            for c in sorted(self._conns, key=lambda x: (x["app"].lower(), x["proto"])):
-                hay = (c["app"] + " " + c["local"] + " " + c["peer"] + " "
-                       + c["proto"]).lower()
-                if term and term not in hay:
-                    continue
-                matched += 1
-                if shown >= cap:
-                    continue
-                self.connList.addWidget(self._conn_row(c))
-                shown += 1
-            if matched == 0:
-                self.connList.addWidget(self._note(
-                    "No active connections." if not term else "No matches."))
-            total = len(self._conns)
-            self.connCount.setText(("%d connections" % total) if not term
-                                   else ("Showing %d of %d" % (min(matched, cap), total)))
-
-        def _conn_row(self, c):
-            est = c["state"] in ("ESTAB", "ESTABLISHED")
-            f, h = self._row_frame(est)
-            ic = QLabel()
-            ic.setPixmap(QIcon.fromTheme("network-server").pixmap(QSize(22, 22)))
-            h.addWidget(ic)
-            col = QVBoxLayout()
-            col.setSpacing(1)
-            nm = QLabel(c["app"] + ("  ·  pid %s" % c["pid"] if c["pid"] else ""))
-            nm.setObjectName("rowname")
-            col.addWidget(nm)
-            sub = QLabel("%s   %s → %s" % (c["proto"], c["local"], c["peer"]))
-            sub.setObjectName("rowsub")
-            col.addWidget(sub)
-            h.addLayout(col, 1)
-            st = QLabel(c["state"])
-            st.setObjectName("pill" if est else "rowsub")
-            h.addWidget(st)
-            return f
-
         # ── SSH keys (create + copy public key for RunPod / servers) ──
         def _refresh_ssh(self):
             import glob
@@ -2961,29 +2837,6 @@ def gui(start_key="overview", shot=None):
                     pass
             else:
                 self.win.status("ssh-keygen failed: " + (r.stderr or "")[:80])
-
-        # ── Deep packet inspection ──
-        def _launch_wireshark(self):
-            try:
-                subprocess.Popen(["wireshark"], stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                self.dpiNote.setText("Wireshark launched — pick an interface to "
-                                     "capture (you're in the 'wireshark' group).")
-            except Exception as e:
-                self.dpiNote.setText("Could not launch Wireshark: %s" % e)
-
-        def _launch_mitm(self):
-            try:
-                subprocess.Popen(["mitmweb"], stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                subprocess.Popen(["xdg-open", "http://127.0.0.1:8081"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.dpiNote.setText(
-                    "mitmweb started — proxy 127.0.0.1:8080, web UI 127.0.0.1:8081. "
-                    "Point your browser/system proxy at it and install the cert "
-                    "(visit mitm.it) to decrypt HTTPS.")
-            except Exception as e:
-                self.dpiNote.setText("Could not launch mitmweb: %s" % e)
 
     # ────────────────────────────── Appearance page ──────────────────────────
     class AppearancePage(BasePage):
@@ -3731,39 +3584,288 @@ def gui(start_key="overview", shot=None):
                 pass
             QTimer.singleShot(800, self.refresh)
 
-    class SecurityPane(ToolPaneBase):
+    class SecurityPane(CliPageMixin, ToolPaneBase):
+        """The system security + MONITORING hub. Endpoint Protection & Detection
+        (EPD), the live connections/ports monitor and deep-packet inspection live
+        HERE now (relocated from Network), alongside a jump to the full Security
+        Center for sign-in / PAM. Security is the one place for system security
+        and monitoring."""
         TOOL = "hash-security"
         LAUNCH_LABEL = "Open Security Center"
+        SEV_ICON = {"critical": "security-low", "high": "dialog-warning",
+                    "medium": "dialog-information", "low": "dialog-information",
+                    "info": "dialog-information"}
 
         def __init__(self, win):
             super().__init__(win, "Security",
-                             "Login / lock / sudo authentication (HasH Security)")
+                             "Endpoint protection, monitoring & sign-in — the "
+                             "system security hub")
+            self._conns = []
 
-        def populate(self):
+        def build_body(self, v):
+            # ── Endpoint Protection & Detection ──
+            self.section(v, "Endpoint Protection & Detection")
+            ecard, ec = self.card()
+            ec.addWidget(self._lbl(
+                "Local threat detection — watches processes, SUID binaries, "
+                "persistence (autostart / services / cron) and critical files "
+                "(passwd, sudoers, the login stacks) for tampering. Fully local; "
+                "nothing leaves this machine.", True))
+            erow = QHBoxLayout()
+            self.epdStatus = QLabel("Checking…")
+            self.epdStatus.setObjectName("muted")
+            self.epdStatus.setWordWrap(True)
+            erow.addWidget(self.epdStatus, 1)
+            baseBtn = QPushButton("Set baseline")
+            baseBtn.clicked.connect(self._epd_baseline)
+            scanBtn = QPushButton("Scan now")
+            scanBtn.setObjectName("primary")
+            scanBtn.clicked.connect(self._epd_scan)
+            erow.addWidget(baseBtn)
+            erow.addWidget(scanBtn)
+            ec.addLayout(erow)
+            self.epdList = QVBoxLayout()
+            self.epdList.setSpacing(6)
+            ec.addLayout(self.epdList)
+            v.addWidget(ecard)
+
+            # ── Connections & ports — per-app monitor (relocated from Network) ──
+            self.section(v, "Connections & ports")
+            ccard, cc = self.card()
+            ctop = QHBoxLayout()
+            self.connSearch = QLineEdit()
+            self.connSearch.setPlaceholderText("Filter by app, port or address…")
+            self.connSearch.setClearButtonEnabled(True)
+            self.connSearch.textChanged.connect(lambda _t: self._render_conns())
+            ctop.addWidget(self.connSearch, 1)
+            self.connAll = QCheckBox("All processes (admin)")
+            self.connAll.setToolTip("Run ss via pkexec to see every process's "
+                                    "sockets, not only yours")
+            self.connAll.toggled.connect(lambda _b: self._refresh_conns())
+            ctop.addWidget(self.connAll)
+            cbtn = QPushButton("Refresh")
+            cbtn.clicked.connect(self._refresh_conns)
+            ctop.addWidget(cbtn)
+            cc.addLayout(ctop)
+            self.connCount = QLabel("")
+            self.connCount.setObjectName("muted")
+            cc.addWidget(self.connCount)
+            self.connList = QVBoxLayout()
+            self.connList.setSpacing(6)
+            cc.addLayout(self.connList)
+            v.addWidget(ccard)
+
+            # ── Deep Packet Inspection (relocated from Network) ──
+            self.section(v, "Deep Packet Inspection")
+            dcard, dc = self.card()
+            dc.addWidget(self._lbl(
+                "Capture & inspect traffic. Wireshark = full packet capture; "
+                "mitmweb = HTTP/S intercept proxy (Fiddler-style) on 127.0.0.1:8080 "
+                "with a web UI.", True))
+            drow = QHBoxLayout()
+            drow.setSpacing(10)
+            wb = QPushButton("Packet capture — Wireshark")
+            wb.setObjectName("primary")
+            wb.setEnabled(have("wireshark"))
+            wb.clicked.connect(self._launch_wireshark)
+            drow.addWidget(wb)
+            mb = QPushButton("HTTP/S intercept — mitmweb")
+            mb.setEnabled(have("mitmweb"))
+            mb.clicked.connect(self._launch_mitm)
+            drow.addWidget(mb)
+            drow.addStretch(1)
+            dc.addLayout(drow)
+            self.dpiNote = QLabel("")
+            self.dpiNote.setObjectName("muted")
+            self.dpiNote.setWordWrap(True)
+            dc.addWidget(self.dpiNote)
+            v.addWidget(dcard)
+
+            # ── Sign-in & privileges (the full Security Center) ──
+            self.section(v, "Sign-in & privileges")
+            scard, sc = self.card()
+            self.signinLbl = QLabel("Password, PIN, TOTP, fingerprint and IR face "
+                                    "unlock — your password is always a fallback.")
+            self.signinLbl.setObjectName("muted")
+            self.signinLbl.setWordWrap(True)
+            sc.addWidget(self.signinLbl)
+            ob = QPushButton(self.LAUNCH_LABEL)
+            ob.setObjectName("primary")
+            ob.clicked.connect(self._open_full)
+            ob.setEnabled(tool_path(self.TOOL) is not None)
+            sc.addWidget(ob, 0, Qt.AlignmentFlag.AlignLeft)
+            v.addWidget(scard)
+
+            self.add_cli_card(v)
+            QTimer.singleShot(0, self.refresh)
+
+        def refresh(self):
+            self._epd_refresh_status()
+            self._refresh_conns()
+
+        def _clearlay(self, lay):
+            while lay.count():
+                it = lay.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        # ── EPD ──
+        def _epd_refresh_status(self):
+            r = _run(["hash-epd", "status", "--json"])
             try:
-                state = self.mod.gather_state()
-            except Exception as e:
-                self.listBox.addWidget(self._note("Could not read state: %s" % e))
+                st = json.loads(r.stdout)
+            except Exception:
+                st = {}
+            if not have("hash-epd"):
+                self.epdStatus.setText("hash-epd not installed.")
+            elif not st.get("baseline"):
+                self.epdStatus.setText("No baseline yet — set one so future "
+                                       "tampering can be detected.")
+            else:
+                age = st.get("baseline_age_days")
+                self.epdStatus.setText("Baseline sealed%s. Scan to check for drift."
+                                       % ("" if age is None else " (%d days ago)" % age))
+
+        def _epd_scan(self):
+            res = self.run_user(["hash-epd", "scan", "--json"], timeout=90)
+            self._clearlay(self.epdList)
+            try:
+                data = json.loads(res.stdout)
+                events = data.get("events", [])
+            except Exception:
+                self.epdList.addWidget(self._note("Scan failed or returned no data."))
                 return
-            # one row per method showing its status chip + which surfaces use it
-            surfaces = state.get("surfaces", {})
-            for mkey, mlabel in self.mod.METHODS:
-                clabel, _kind = self.mod.method_chip(mkey, state)
-                on_surfaces = [sl for skey, sl in self.mod.SURFACES
-                               if mkey in surfaces.get(skey, {}).get("enabled", [])]
-                sub = "Status: %s" % clabel
-                if on_surfaces:
-                    sub += "   ·   active on: " + ", ".join(on_surfaces)
-                icon = {"password": "dialog-password", "pin": "dialpad",
-                        "totp": "smartphone",
-                        "fingerprint": "fingerprint"}.get(mkey, "security-high")
-                pill = QLabel(clabel)
-                pill.setObjectName("pill")
-                self.listBox.addWidget(self._row(icon, mlabel, sub, [pill]))
-            self.listBox.addWidget(self._note(
-                "Toggle methods per-surface and enrol TOTP / face / fingerprint "
-                "in the full Security Center (privileged PAM edits run via "
-                "pkexec there)."))
+            threats = [e for e in events if e.get("severity") in ("critical", "high")]
+            if not events:
+                self.epdList.addWidget(self._note("No findings — system matches the "
+                                                  "trusted baseline."))
+            for e in events[:60]:
+                self.epdList.addWidget(self._epd_event_row(e))
+            self.win.status("EPD scan: %d finding(s), %d need attention."
+                            % (len(events), len(threats)))
+
+        def _epd_event_row(self, e):
+            sev = e.get("severity", "info")
+            widgets = []
+            pill = QLabel(sev.upper())
+            pill.setObjectName("pill" if sev in ("critical", "high") else "rowsub")
+            widgets.append(pill)
+            if e.get("action") == "quarantine" and e.get("path"):
+                qb = QPushButton("Quarantine")
+                qb.setObjectName("danger")
+                qb.clicked.connect(lambda _=False, p=e["path"]: self._epd_quarantine(p))
+                widgets.append(qb)
+            sub = e.get("detail", "")
+            if e.get("path"):
+                sub += "\n%s" % e["path"]
+            return self._row(self.SEV_ICON.get(sev, "security-high"),
+                             e.get("title", "Finding"), sub, widgets)
+
+        def _epd_baseline(self):
+            helper = tool_path("hash-security-helper")
+            if not helper:
+                self.win.status("hash-security-helper not found.")
+                return
+            self.run_priv([helper, "epd-baseline"], timeout=120)
+            QTimer.singleShot(200, self._epd_refresh_status)
+
+        def _epd_quarantine(self, path):
+            helper = tool_path("hash-security-helper")
+            if not helper:
+                self.win.status("hash-security-helper not found.")
+                return
+            if QMessageBox.question(
+                    self.win, "Quarantine file",
+                    "Move this file to the EPD quarantine (exec stripped)?\n\n%s\n\n"
+                    "Package-owned system files are refused automatically." % path
+                    ) != QMessageBox.StandardButton.Yes:
+                return
+            self.run_priv([helper, "epd-quarantine", path], timeout=30)
+            QTimer.singleShot(200, self._epd_scan)
+
+        # ── Connections monitor (relocated from Network) ──
+        def _refresh_conns(self):
+            if not have("ss"):
+                self.connCount.setText("ss not found (iproute2 required)")
+                return
+            argv = (["pkexec", "ss", "-tunaupH"] if self.connAll.isChecked()
+                    else ["ss", "-tunaupH"])
+            self.win.status("Reading connections…")
+            QApplication.processEvents()
+            try:
+                out = subprocess.run(argv, capture_output=True, text=True,
+                                     timeout=25).stdout
+            except Exception:
+                out = ""
+            self.win.status("")
+            self._conns = self._parse_ss(out)
+            self._render_conns()
+
+        @staticmethod
+        def _parse_ss(text):
+            import re
+            rx = re.compile(r'\("([^"]+)",pid=(\d+)')
+            rows = []
+            for line in text.splitlines():
+                t = line.split()
+                if len(t) < 6:
+                    continue
+                m = rx.search(" ".join(t[6:]))
+                rows.append({"proto": t[0], "state": t[1], "local": t[4],
+                             "peer": t[5], "app": m.group(1) if m else "—",
+                             "pid": m.group(2) if m else ""})
+            return rows
+
+        def _render_conns(self):
+            self._clearlay(self.connList)
+            term = self.connSearch.text().lower().strip()
+            cap, shown, matched = 200, 0, 0
+            for c in sorted(self._conns, key=lambda x: (x["app"].lower(), x["proto"])):
+                hay = (c["app"] + " " + c["local"] + " " + c["peer"] + " "
+                       + c["proto"]).lower()
+                if term and term not in hay:
+                    continue
+                matched += 1
+                if shown >= cap:
+                    continue
+                est = c["state"] in ("ESTAB", "ESTABLISHED")
+                pill = QLabel(c["state"])
+                pill.setObjectName("pill" if est else "rowsub")
+                self.connList.addWidget(self._row(
+                    "network-server",
+                    c["app"] + ("  ·  pid %s" % c["pid"] if c["pid"] else ""),
+                    "%s   %s → %s" % (c["proto"], c["local"], c["peer"]), [pill]))
+                shown += 1
+            if matched == 0:
+                self.connList.addWidget(self._note(
+                    "No active connections." if not term else "No matches."))
+            total = len(self._conns)
+            self.connCount.setText(("%d connections" % total) if not term
+                                   else ("Showing %d of %d" % (min(matched, cap), total)))
+
+        # ── Deep packet inspection (relocated from Network) ──
+        def _launch_wireshark(self):
+            try:
+                subprocess.Popen(["wireshark"], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                self.dpiNote.setText("Wireshark launched — pick an interface to "
+                                     "capture (you're in the 'wireshark' group).")
+            except Exception as e:
+                self.dpiNote.setText("Could not launch Wireshark: %s" % e)
+
+        def _launch_mitm(self):
+            try:
+                subprocess.Popen(["mitmweb"], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                subprocess.Popen(["xdg-open", "http://127.0.0.1:8081"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.dpiNote.setText(
+                    "mitmweb started — proxy 127.0.0.1:8080, web UI 127.0.0.1:8081. "
+                    "Point your browser/system proxy at it and install the cert "
+                    "(visit mitm.it) to decrypt HTTPS.")
+            except Exception as e:
+                self.dpiNote.setText("Could not launch mitmweb: %s" % e)
 
     class AppsPane(ToolPaneBase):
         TOOL = "hash-uninstaller"
