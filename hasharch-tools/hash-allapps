@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""HasH-Arch "All Apps" generator.
+
+Scans every installed .desktop entry (system, user, flatpak — including the
+NoDisplay-hidden BlackArch tools) and groups them by category for the launcher's
+"All Apps" tab. Regular apps go under standard freedesktop categories; BlackArch
+tools keep their functional subcategories (Scanners, Web Application, …).
+
+Output: ~/.local/share/com.hash.kickoff/allapps.json
+  { "groups": [ { "name", "icon", "items": [ {name,icon,exec,bin,terminal,comment,file} ] } ] }
+Same shape as blackarch.json so the Places/All-Apps page reads it unchanged.
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+
+HOME = os.path.expanduser("~")
+DIRS = ["/usr/share/applications", "/usr/local/share/applications",
+        os.path.join(HOME, ".local/share/applications"),
+        "/var/lib/flatpak/exports/share/applications",
+        os.path.join(HOME, ".local/share/flatpak/exports/share/applications")]
+OUT_DIR = os.path.join(HOME, ".local/share/com.hash.kickoff")
+OUT = os.path.join(OUT_DIR, "allapps.json")
+FIELD = re.compile(r"%[uUfFickdDnNvm]")
+
+# standard freedesktop category -> (friendly group, icon), in assignment priority
+STD = [
+    ("Development", "Development", "applications-development"),
+    ("Game", "Games", "applications-games"),
+    ("Graphics", "Graphics", "applications-graphics"),
+    ("AudioVideo", "Multimedia", "applications-multimedia"),
+    ("Audio", "Multimedia", "applications-multimedia"),
+    ("Video", "Multimedia", "applications-multimedia"),
+    ("Office", "Office", "applications-office"),
+    ("Network", "Internet", "applications-internet"),
+    ("Education", "Education", "applications-education"),
+    ("Science", "Science", "applications-science"),
+    ("Settings", "Settings", "preferences-system"),
+    ("System", "System", "applications-system"),
+    ("Utility", "Utilities", "applications-utilities"),
+]
+GROUP_ICON = {g: i for _, g, i in STD}
+GROUP_ICON.update({"Security": "security-high", "Other": "applications-other"})
+GROUP_ORDER = ["Internet", "Multimedia", "Development", "Graphics", "Office",
+               "Games", "System", "Utilities", "Settings", "Education", "Science"]
+
+# BlackArch functional subcategories (matches hash-blackarch.sh)
+SUBCAT = re.compile(r"X-BlackArch-([A-Za-z]+)")
+BA_NICE = {
+    "Webapp": "Web Application", "Scanner": "Scanners", "Recon": "Recon",
+    "Networking": "Networking", "Sniffer": "Sniffers", "Spoof": "Spoofing",
+    "Proxy": "Proxies", "Fuzzer": "Fuzzers", "Exploitation": "Exploitation",
+    "Cracker": "Crackers", "Crypto": "Crypto", "Wireless": "Wireless",
+    "Forensic": "Forensics", "Automation": "Automation", "Defensive": "Defensive",
+    "Backdoor": "Backdoors", "Tunnel": "Tunnels", "Fingerprint": "Fingerprinting",
+    "Reversing": "Reversing", "Disassembler": "Disassemblers", "Debugger": "Debuggers",
+    "Windows": "Windows", "Bluetooth": "Bluetooth", "Voip": "VoIP", "Social": "Social",
+    "Honeypot": "Honeypots", "Misc": "Security", "Anti": "Anti-Forensic",
+}
+BA_ICON = {
+    "Web Application": "applications-internet", "Scanners": "preferences-system-network",
+    "Recon": "edit-find", "Networking": "network-workgroup", "Sniffers": "network-wired",
+    "Spoofing": "view-conversation-balloon", "Proxies": "preferences-system-network-proxy",
+    "Fuzzers": "tools-wizard", "Exploitation": "security-low", "Crackers": "dialog-password",
+    "Crypto": "document-encrypt", "Wireless": "network-wireless", "Forensics": "edit-find-project",
+    "Anti-Forensic": "edit-clear-history", "Automation": "system-run", "Defensive": "security-high",
+    "Backdoors": "view-hidden", "Tunnels": "network-vpn", "Fingerprinting": "fingerprint",
+    "Reversing": "debug-step-into", "Disassemblers": "application-x-executable",
+    "Debuggers": "tools-report-bug", "Windows": "distributor-logo-windows",
+    "Bluetooth": "network-bluetooth", "VoIP": "call-start", "Social": "system-users",
+    "Honeypots": "server-database",
+}
+ALIAS = {"metasploit": "msfconsole"}
+
+
+def parse(path):
+    f = {}
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            ine = False
+            for ln in fh:
+                ln = ln.rstrip("\n")
+                if ln.startswith("["):
+                    ine = ln.strip() == "[Desktop Entry]"
+                    continue
+                if ine and "=" in ln:
+                    k, v = ln.split("=", 1)
+                    f.setdefault(k.strip(), v.strip())
+    except OSError:
+        return None
+    return f
+
+
+def pkg_bins(pkg):
+    r = subprocess.run(["pacman", "-Qlq", pkg], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return [f for f in r.stdout.splitlines()
+            if f.startswith("/usr/bin/") and os.path.isfile(f) and os.access(f, os.X_OK)]
+
+
+def resolve_bin(name, current):
+    if current and current.startswith("/") and os.path.exists(current):
+        return current
+    cand = ALIAS.get(name, name)
+    for p in ("/usr/bin/" + cand, "/usr/sbin/" + cand):
+        if os.path.exists(p):
+            return p
+    w = shutil.which(cand)
+    if w:
+        return w
+    nm = re.sub(r"[^a-z0-9]", "", name.lower())
+    for pkg in (cand, name):
+        bins = pkg_bins(pkg)
+        if bins is None:
+            continue
+        for b in bins:
+            if os.path.basename(b) == name:
+                return b
+        for b in bins:
+            if nm and nm in re.sub(r"[^a-z0-9]", "", os.path.basename(b).lower()):
+                return b
+        return bins[0] if bins else ""
+    return current if current and current.startswith("/") else ""
+
+
+def std_group(cats):
+    parts = set(cats.split(";"))
+    for key, group, _ in STD:
+        if key in parts:
+            return group
+    return "Other"
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    groups = {}     # name -> {icon, items, _seen(set of basenames)}
+    seen_names = {}  # group -> set of lowercased app names (dedupe within group)
+
+    def add(group, icon, item):
+        g = groups.setdefault(group, {"icon": icon, "items": [], "_names": set()})
+        key = item["name"].lower()
+        if key in g["_names"]:
+            return
+        g["_names"].add(key)
+        g["items"].append(item)
+
+    for d in DIRS:
+        for path in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+            f = parse(path)
+            if not f:
+                continue
+            if f.get("Type", "Application") != "Application":
+                continue
+            name = f.get("Name")
+            if not name or not f.get("Exec"):
+                continue
+            cats = f.get("Categories", "")
+            is_ba = "X-BlackArch" in cats
+            # skip intentionally hidden non-app helpers, but keep BlackArch tools
+            if not is_ba and f.get("NoDisplay", "").lower() == "true":
+                continue
+            raw_exec = f.get("Exec", "")
+            exec_ = FIELD.sub("", raw_exec).strip()
+            terminal = f.get("Terminal", "").lower() == "true"
+            # for BlackArch console tools, pull the real binary out of `sh -c 'BIN;$SHELL'`
+            mexe = re.search(r"sh -c ['\"](.+?);\s*\$SHELL['\"]", raw_exec)
+            raw_bin = (mexe.group(1).strip() if mexe else exec_.split(" ")[0] if exec_ else "")
+            binary = resolve_bin(name, raw_bin) if (terminal or is_ba) else ""
+            item = {
+                "name": name,
+                "icon": f.get("Icon", "application-x-executable"),
+                "exec": exec_,
+                "bin": binary,
+                "terminal": terminal,
+                "comment": f.get("Comment", ""),
+                "file": path,
+            }
+            if is_ba:
+                subs = SUBCAT.findall(cats)
+                nice = None
+                for s in subs:
+                    if s in BA_NICE and BA_NICE[s] != "Security":
+                        nice = BA_NICE[s]
+                        break
+                if not nice:
+                    nice = next((BA_NICE[s] for s in subs if s in BA_NICE), "Security")
+                add(nice, BA_ICON.get(nice, "security-high"), item)
+            else:
+                grp = std_group(cats)
+                add(grp, GROUP_ICON.get(grp, "applications-other"), item)
+
+    # order: standard groups first (preferred order), then the rest alphabetically
+    ordered = []
+    used = set()
+    for g in GROUP_ORDER:
+        if g in groups:
+            used.add(g)
+            ordered.append(g)
+    for g in sorted(groups):
+        if g not in used:
+            ordered.append(g)
+
+    out = {"groups": []}
+    total = 0
+    for g in ordered:
+        items = sorted(groups[g]["items"], key=lambda x: x["name"].lower())
+        total += len(items)
+        out["groups"].append({"name": g, "icon": groups[g]["icon"], "items": items})
+
+    with open(OUT, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, indent=1)
+    print("all-apps: %d apps in %d categories -> %s" % (total, len(out["groups"]), OUT))
+
+
+if __name__ == "__main__":
+    main()

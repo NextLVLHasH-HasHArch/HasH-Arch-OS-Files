@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch OBS global.ini to re-assert minimize-to-tray
+
+[Path]
+PathChanged=%h/.config/obs-studio/global.ini
+Unit=hash-obs-tray.service
+
+[Install]
+WantedBy=default.target

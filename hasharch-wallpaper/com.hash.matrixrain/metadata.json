@@ -1,0 +1,16 @@
+{
+    "KPackageStructure": "Plasma/Wallpaper",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "hash@nextlvlsync.co.uk",
+                "Name": "HasH"
+            }
+        ],
+        "Category": "",
+        "Description": "Live animated weather, or Matrix-style code rain",
+        "Id": "com.hash.matrixrain",
+        "License": "GPLv2+",
+        "Name": "Weather & Code Rain"
+    }
+}

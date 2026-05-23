@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=HasH Watch Dogs
+Description=HasH-Arch silent boot animation (Watch Dogs)
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/hash-watchdogs
+ScriptFile=/usr/share/plymouth/themes/hash-watchdogs/hash-watchdogs.script

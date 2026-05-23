@@ -1,0 +1,2497 @@
+#!/usr/bin/env python3
+"""HasH-Arch Software Center  (hash-store)
+
+A graphical package manager for HasH-Arch — browse a Discover-style app catalog,
+search, install, update and remove software, and add your own repositories,
+all without touching the terminal.
+
+Sources : official repos (pacman) + AUR (yay) + flatpak (removal). App catalog
+          is built from AppStream metadata (the same data KDE Discover uses).
+Privilege: transactions run through `yay` with a GRAPHICAL password prompt
+          (sudo -A + SUDO_ASKPASS=ksshaskpass); editing repositories writes
+          /etc/pacman.conf via pkexec (polkit). No terminal, ever.
+
+Usage:
+    hash-store                 launch the GUI (Discover catalog)
+    hash-store --updates       launch on the Updates page
+    hash-store --sources       launch on the Sources/Repositories page
+    hash-store backend <cmd>   headless JSON: updates|search <t>|installed|info <p>|catalog|storefront|repos
+    hash-store _writeconf <f>  (internal, run via pkexec) install <f> as /etc/pacman.conf
+"""
+import gzip
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+
+SCRIPT = os.path.realpath(__file__)
+ASKPASS = "/usr/bin/ksshaskpass" if os.path.exists("/usr/bin/ksshaskpass") else ""
+HAS_YAY = bool(shutil.which("yay"))
+HAS_FLATPAK = bool(shutil.which("flatpak"))
+PACCONF = "/etc/pacman.conf"
+
+SWCAT_XML = "/usr/share/swcatalog/xml"
+SWCAT_ICONS = "/usr/share/swcatalog/icons"
+ORIGIN = {"core": "archlinux-arch-core", "extra": "archlinux-arch-extra",
+          "multilib": "archlinux-arch-multilib"}
+# (AppStream category, friendly label) shown in the Discover category picker
+CATEGORIES = [("All", "All apps"), ("Game", "Games"), ("AudioVideo", "Multimedia"),
+              ("Development", "Development"), ("Graphics", "Graphics"),
+              ("Network", "Internet"), ("Office", "Office"), ("System", "System"),
+              ("Utility", "Utilities"), ("Education", "Education"), ("Science", "Science")]
+
+
+def run(cmd, timeout=90):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = str(e)
+        return _R()
+
+
+# ───────────────────────────── read-only backend ─────────────────────────────
+def get_updates():
+    repo = []
+    for ln in run(["checkupdates"]).stdout.splitlines():
+        p = ln.split()
+        if len(p) >= 4 and p[2] == "->":
+            repo.append({"name": p[0], "old": p[1], "new": p[3], "src": "repo"})
+    aur = []
+    if HAS_YAY:
+        for ln in run(["yay", "-Qua"], timeout=60).stdout.splitlines():
+            p = ln.split()
+            if len(p) >= 4 and p[2] == "->":
+                aur.append({"name": p[0], "old": p[1], "new": p[3], "src": "aur"})
+    return {"repo": repo, "aur": aur}
+
+
+def search_repos(term):
+    out = []
+    if not term.strip():
+        return out
+    lines = run(["pacman", "-Ss", term]).stdout.splitlines()
+    i = 0
+    while i < len(lines):
+        head = lines[i]
+        if head and not head.startswith(" ") and "/" in head.split(" ")[0]:
+            try:
+                repopart, rest = head.split("/", 1)
+                toks = rest.split()
+                name, ver = toks[0], (toks[1] if len(toks) > 1 else "")
+            except Exception:
+                i += 1
+                continue
+            desc = ""
+            if i + 1 < len(lines) and lines[i + 1].startswith(" "):
+                desc = lines[i + 1].strip()
+                i += 1
+            out.append({"name": name, "repo": repopart, "version": ver,
+                        "summary": desc, "installed": "[installed" in head, "src": "repo"})
+        i += 1
+    return out
+
+
+def search_aur(term):
+    out = []
+    if not (HAS_YAY and term.strip()):
+        return out
+    lines = run(["yay", "-Ssa", term], timeout=60).stdout.splitlines()
+    i = 0
+    while i < len(lines):
+        head = lines[i]
+        if head.startswith("aur/"):
+            toks = head[4:].split()
+            name, ver = toks[0], (toks[1] if len(toks) > 1 else "")
+            desc = ""
+            if i + 1 < len(lines) and lines[i + 1].startswith(" "):
+                desc = lines[i + 1].strip()
+                i += 1
+            out.append({"name": name, "repo": "aur", "version": ver,
+                        "summary": desc, "installed": "(Installed)" in head, "src": "aur"})
+        i += 1
+    return out
+
+
+def list_installed():
+    out = []
+    foreign = set(run(["pacman", "-Qmq"]).stdout.split())
+    for ln in run(["pacman", "-Qe"]).stdout.splitlines():
+        p = ln.split()
+        if p:
+            out.append({"name": p[0], "version": p[1] if len(p) > 1 else "",
+                        "installed": True, "src": "aur" if p[0] in foreign else "repo"})
+    if HAS_FLATPAK:
+        for ln in run(["flatpak", "list", "--app",
+                       "--columns=application,name,version"]).stdout.splitlines():
+            c = ln.split("\t")
+            if c and c[0]:
+                out.append({"name": (c[1] if len(c) > 1 and c[1] else c[0]),
+                            "appid": c[0], "version": c[2] if len(c) > 2 else "",
+                            "installed": True, "src": "flatpak"})
+    return out
+
+
+def pkg_info(name, src="repo"):
+    if src == "flatpak" and HAS_FLATPAK:
+        return {"raw": run(["flatpak", "info", name]).stdout.strip()}
+    r = run(["pacman", "-Qi", name])
+    if r.returncode != 0 or not r.stdout.strip():
+        r = run(["pacman", "-Si", name])
+    info = {}
+    for ln in r.stdout.splitlines():
+        if " : " in ln:
+            k, v = ln.split(" : ", 1)
+            info[k.strip()] = v.strip()
+    return info
+
+
+def _icon_path(origin, fname):
+    for sz in ("64x64", "128x128", "48x48"):
+        p = os.path.join(SWCAT_ICONS, origin, sz, fname)
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+# Locale selection for AppStream's translated text (<name>/<summary>/<description>).
+# We must always show the user's language, preferring English (incl. the
+# unlabelled upstream "C" source) over any random foreign-language variant.
+#
+# Detect the user's locale from the environment with correct POSIX precedence:
+#   LC_ALL > LC_MESSAGES > LANG  (e.g. "en_GB.UTF-8" -> "en_GB", lang "en").
+_XMLLANG = "{http://www.w3.org/XML/1998/namespace}lang"
+# Sentinel for AppStream elements with NO xml:lang attribute.  In AppStream /
+# MetaInfo the unlabelled text is the upstream C / English source string, so we
+# treat it as English and rank it just below the explicit "en" variants.
+_NOLANG = "\0nolang"
+
+
+def _detect_locale():
+    raw = (os.environ.get("LC_ALL")
+           or os.environ.get("LC_MESSAGES")
+           or os.environ.get("LANG")
+           or "en_US")
+    # strip codeset/modifier: "en_GB.UTF-8@euro" -> "en_GB"
+    loc = raw.split(".")[0].split("@")[0].strip()
+    if not loc or loc in ("C", "POSIX"):
+        loc = "en_US"
+    return loc
+
+
+def _norm_lang(lang):
+    """Normalise a locale/xml:lang to lower-case underscore form for matching.
+
+    AppStream xml:lang uses BCP-47 hyphens ("en-GB", "pt-BR", "zh-Hans-CN")
+    while POSIX env locales use underscores ("en_GB").  Normalising both to
+    "en_gb" / "pt_br" lets us compare them directly.
+    """
+    return lang.replace("-", "_").lower()
+
+
+_loc = _detect_locale()
+_lang = _loc.split("_")[0]
+_loc_n = _norm_lang(_loc)          # e.g. "en_gb"
+_lang_n = _loc_n.split("_")[0]     # e.g. "en"
+
+
+def _lang_rank(lang):
+    """Rank a candidate's xml:lang (None == _NOLANG sentinel here).
+
+    Lower is better.  Order: exact locale, language-only, en_US, any other
+    en_*, then the unlabelled C/English source, then everything else.  This
+    guarantees an English (or no-lang upstream) string always beats a foreign
+    translation when no exact/language match exists.  Comparisons are done on
+    the normalised (hyphen->underscore, lower-case) form so BCP-47 "en-GB"
+    matches a POSIX "en_GB" locale.
+    """
+    if lang == _NOLANG:                    # 4. unlabelled upstream C/English
+        return 4
+    n = _norm_lang(lang)
+    if n == _loc_n:                        # 1. exact locale, e.g. en_gb
+        return 0
+    if n == _lang_n:                       # 2. language only, e.g. en
+        return 1
+    if n == "en_us":                       # 3a. en_US
+        return 2
+    if n == "en" or n.startswith("en_"):   # 3b. any other en_*
+        return 3
+    return 99                              # 5. unrelated foreign language
+
+
+def _best_lang(langs):
+    """Pick the best xml:lang key from an iterable (None -> _NOLANG sentinel).
+
+    Returns the chosen key (possibly _NOLANG), or None if `langs` is empty.
+    Stable: ties keep first-seen order.
+    """
+    best = None
+    best_rank = None
+    for i, raw in enumerate(langs):
+        lang = _NOLANG if raw is None else raw
+        r = _lang_rank(lang)
+        if best is None or r < best_rank:
+            best, best_rank = lang, r
+    return best
+
+
+def _localized(comp, tag):
+    """Best-locale text for a (possibly translated) AppStream field."""
+    by_lang = {}        # lang-key (incl. _NOLANG) -> first text seen
+    order = []
+    for el in comp.findall(tag):
+        lang = _NOLANG if el.get(_XMLLANG) is None else el.get(_XMLLANG)
+        if lang not in by_lang:
+            by_lang[lang] = el.text
+            order.append(lang)
+    if not order:
+        return None
+    return by_lang[_best_lang(order)]
+
+
+_catalog = None
+
+
+def get_catalog():
+    """AppStream desktop apps: [{name, pkg, summary, cats, icon, src}] (cached)."""
+    global _catalog
+    if _catalog is not None:
+        return _catalog
+    seen, apps = set(), []
+    for gz in sorted(glob.glob(os.path.join(SWCAT_XML, "*.xml.gz"))):
+        repo = os.path.basename(gz).split(".")[0]
+        origin = ORIGIN.get(repo, "")
+        try:
+            with gzip.open(gz, "rt", encoding="utf-8", errors="ignore") as f:
+                root = ET.fromstring(f.read())
+        except Exception:
+            continue
+        for comp in root.findall("component"):
+            if comp.get("type") != "desktop-application":
+                continue
+            pkg = comp.findtext("pkgname")
+            name = _localized(comp, "name")
+            if not pkg or not name or pkg in seen:
+                continue
+            seen.add(pkg)
+            icon = ""
+            for i in comp.findall("icon"):
+                if i.get("type") == "cached":
+                    icon = _icon_path(origin, i.text)
+                    if icon:
+                        break
+            apps.append({"name": name, "pkg": pkg, "name_lc": name.lower(),
+                         "summary": _localized(comp, "summary") or "",
+                         "cats": [c.text for c in comp.findall("categories/category")],
+                         "icon": icon, "src": "repo"})
+    apps.sort(key=lambda a: a["name_lc"])
+    _catalog = apps
+    return apps
+
+
+def _desc_to_text(el):
+    """Flatten an AppStream <description> element into plain paragraphs.
+
+    AppStream descriptions are rich (<p>/<ul>/<ol>/<li>) and often carry
+    per-element translations via xml:lang. We pick the best locale (user's
+    language, then English, then the untranslated default) so we never show a
+    random foreign language when a matching one is present, then render to
+    plain text so a QLabel can display it without a full HTML widget.
+    """
+    if el is None:
+        return ""
+    # Which langs are present? Choose ONE preferred lang for the whole block,
+    # ranking the unlabelled upstream (C/English) text just below explicit en.
+    present = []
+    for child in el:
+        present.append(child.get(_XMLLANG))
+    chosen = _best_lang(present)          # _NOLANG sentinel, a lang, or None
+
+    parts = []
+    for child in el:
+        clang = _NOLANG if child.get(_XMLLANG) is None else child.get(_XMLLANG)
+        if clang != chosen:
+            continue
+        tag = child.tag.split("}")[-1]
+        if tag == "p":
+            txt = "".join(child.itertext()).strip()
+            if txt:
+                parts.append(txt)
+        elif tag in ("ul", "ol"):
+            for li in child:
+                if li.tag.split("}")[-1] == "li":
+                    txt = "".join(li.itertext()).strip()
+                    if txt:
+                        parts.append("  •  " + txt)
+    return "\n\n".join(parts)
+
+
+def _best_description(comp):
+    """Pick the best-locale <description> element from a component.
+
+    AppStream catalogs emit ONE <description> element per language as siblings
+    (each with its own <p>/<ul>/<li> children), e.g. <description xml:lang="ru">
+    ... </description> next to an unlabelled (C/English) <description>.  The old
+    code used comp.find("description") which returns the FIRST sibling in
+    document order — a foreign language (Bulgarian/Russian/...) — regardless of
+    the user's locale.  Here we rank the siblings by xml:lang and return the
+    best, treating the unlabelled one as the C/English source.  (Some catalogs
+    instead put per-<p> xml:lang inside a single <description>; _desc_to_text
+    still handles that case after we pick the element.)
+    """
+    descs = comp.findall("description")
+    if not descs:
+        return None
+    langs = [d.get(_XMLLANG) for d in descs]
+    chosen = _best_lang(langs)
+    for d in descs:
+        dlang = _NOLANG if d.get(_XMLLANG) is None else d.get(_XMLLANG)
+        if dlang == chosen:
+            return d
+    return descs[0]
+
+
+_details_cache = {}
+
+
+def appstream_details(pkg):
+    """Rich AppStream data for one package (cached) for the App Detail page.
+
+    Returns {description, license, url, screenshots:[urls]} parsed straight
+    from the swcatalog XML. Screenshots prefer a thumbnail image, falling back
+    to the full-size 'source' image. Returns empty fields when the package has
+    no AppStream component (e.g. most AUR/CLI packages) so callers degrade
+    gracefully (no screenshots -> hide the strip).
+    """
+    if pkg in _details_cache:
+        return _details_cache[pkg]
+    out = {"description": "", "license": "", "url": "", "screenshots": []}
+    for gz in sorted(glob.glob(os.path.join(SWCAT_XML, "*.xml.gz"))):
+        try:
+            with gzip.open(gz, "rt", encoding="utf-8", errors="ignore") as f:
+                root = ET.fromstring(f.read())
+        except Exception:
+            continue
+        comp = None
+        for c in root.findall("component"):
+            if c.get("type") == "desktop-application" and c.findtext("pkgname") == pkg:
+                comp = c
+                break
+        if comp is None:
+            continue
+        out["description"] = _desc_to_text(_best_description(comp))
+        out["license"] = (comp.findtext("project_license") or "").strip()
+        for u in comp.findall("url"):
+            if u.get("type") == "homepage" and u.text:
+                out["url"] = u.text.strip()
+                break
+        ss = comp.find("screenshots")
+        if ss is not None:
+            for shot in ss.findall("screenshot"):
+                imgs = shot.findall("image")
+                if not imgs:
+                    continue
+                # prefer a moderately-sized thumbnail; else the source image
+                thumb = None
+                source = None
+                best_thumb_w = -1
+                for img in imgs:
+                    t = img.get("type")
+                    url = (img.text or "").strip()
+                    if not url:
+                        continue
+                    if t == "source":
+                        source = url
+                    elif t == "thumbnail":
+                        try:
+                            w = int(img.get("width") or 0)
+                        except ValueError:
+                            w = 0
+                        # aim for ~750px wide thumbnails when offered
+                        if w >= 500 and (best_thumb_w < 0 or w < best_thumb_w):
+                            best_thumb_w = w
+                            thumb = url
+                        elif best_thumb_w < 0:
+                            thumb = url
+                pick = thumb or source
+                if pick:
+                    out["screenshots"].append(pick)
+        break
+    _details_cache[pkg] = out
+    return out
+
+
+def installed_set():
+    return set(run(["pacman", "-Qq"]).stdout.split())
+
+
+# ───────────────────────── AUR RPC (popularity data) ─────────────────────────
+# Real "top downloaded / trending" data comes from the AUR RPC v5 metadata
+# (Popularity / NumVotes). We hit it with the stdlib only (no new dependency)
+# and always degrade gracefully — every caller falls back to a curated list if
+# the network is unavailable so the storefront never looks empty/broken.
+AUR_RPC = "https://aur.archlinux.org/rpc/v5"
+
+# Curated "Editor's Picks" — great, broadly-loved apps. Also the offline
+# fallback for every storefront shelf. Filtered to ones actually available.
+EDITORS_PICKS = ["firefox", "vlc", "gimp", "blender", "krita", "obs-studio",
+                 "libreoffice-fresh", "code", "steam", "discord", "thunderbird",
+                 "inkscape", "audacity", "kdenlive", "neovim", "telegram-desktop",
+                 "spotify", "chromium", "qbittorrent", "mpv"]
+
+# Seed terms used to discover popular/trending AUR packages via search.
+_POPULAR_SEEDS = ["firefox", "chrome", "code", "discord", "spotify", "steam",
+                  "vlc", "obs", "git", "editor", "browser", "player", "video",
+                  "game", "office", "image", "terminal", "music"]
+
+
+def _aur_get(endpoint, params):
+    """GET an AUR RPC endpoint -> parsed JSON dict (or {} on any failure)."""
+    url = AUR_RPC + endpoint + "?" + urllib.parse.urlencode(params, doseq=True)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "hash-store/1"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            return json.loads(r.read().decode("utf-8", "ignore"))
+    except Exception:
+        return {}
+
+
+def aur_search(term):
+    """AUR RPC search by name-desc -> list of result dicts (or [])."""
+    data = _aur_get("/search", {"by": "name-desc", "arg": term})
+    if isinstance(data, dict) and data.get("type") == "search":
+        return data.get("results", []) or []
+    return []
+
+
+def aur_info(names):
+    """AUR RPC info for explicit package names -> list of result dicts."""
+    if not names:
+        return []
+    data = _aur_get("/info", {"arg[]": list(names)})
+    if isinstance(data, dict):
+        return data.get("results", []) or []
+    return []
+
+
+def _aur_to_item(r):
+    """Normalise an AUR RPC result into the catalog item shape used by the UI."""
+    return {"name": r.get("Name", ""), "pkg": r.get("Name", ""),
+            "name_lc": r.get("Name", "").lower(),
+            "summary": (r.get("Description") or "") or "",
+            "cats": [], "icon": "", "src": "aur",
+            "version": r.get("Version", ""),
+            "popularity": float(r.get("Popularity") or 0.0),
+            "votes": int(r.get("NumVotes") or 0),
+            "last_modified": int(r.get("LastModified") or 0)}
+
+
+def _pop_pool():
+    """Gather a pool of AUR packages (via several seed searches) for ranking."""
+    pool, seen = [], set()
+    for seed in _POPULAR_SEEDS:
+        for r in aur_search(seed):
+            n = r.get("Name", "")
+            if n and n not in seen:
+                seen.add(n)
+                pool.append(r)
+    return pool
+
+
+def storefront_data():
+    """Build the Discover storefront shelves.
+
+    Returns {hero, top, trending, picks}. "top"/"trending" use real AUR
+    popularity (Popularity / recent NumVotes); on any network failure every
+    shelf degrades to the curated Editor's Picks so the page is never empty.
+    """
+    cat = get_catalog()
+    by_pkg = {a["pkg"]: a for a in cat}
+    inst = installed_set()
+
+    def from_repo(pkg):
+        """Prefer the rich AppStream catalog entry (real icon) when present."""
+        a = by_pkg.get(pkg)
+        if a:
+            a = dict(a)
+            a["installed"] = pkg in inst
+            return a
+        return None
+
+    # ---- Editor's Picks: curated, filtered to what's actually installable ----
+    picks = []
+    for pkg in EDITORS_PICKS:
+        a = from_repo(pkg)
+        if a:
+            picks.append(a)
+    # fill any gap from the broad catalog so the shelf is never tiny
+    if len(picks) < 8:
+        have = {p["pkg"] for p in picks}
+        for a in cat:
+            if a["pkg"] not in have:
+                b = dict(a)
+                b["installed"] = a["pkg"] in inst
+                picks.append(b)
+            if len(picks) >= 12:
+                break
+
+    # ---- Top Downloaded / Trending: real AUR popularity, else fall back ----
+    pool = _pop_pool()
+    top, trending = [], []
+    if pool:
+        items = [_aur_to_item(r) for r in pool]
+        for it in items:
+            it["installed"] = it["pkg"] in inst
+            # use the AppStream icon if this AUR name is also a repo app
+            rep = by_pkg.get(it["pkg"])
+            if rep and rep.get("icon"):
+                it["icon"] = rep["icon"]
+        by_pop = sorted(items, key=lambda x: x["popularity"], reverse=True)
+        top = by_pop[:14]
+        by_trend = sorted(items, key=lambda x: (x["last_modified"], x["votes"]),
+                          reverse=True)
+        # trending = recently-updated with real traction, distinct from "top"
+        top_names = {x["pkg"] for x in top}
+        trending = [x for x in by_trend if x["votes"] >= 5][:20]
+        trending = [x for x in trending if x["pkg"] not in top_names][:14] or by_trend[:14]
+    else:
+        top = list(picks)
+        trending = list(reversed(picks))
+
+    hero = picks[0] if picks else (top[0] if top else None)
+    return {"hero": hero, "top": top, "trending": trending, "picks": picks}
+
+
+# ──────────────────────────── repositories (sources) ─────────────────────────
+def read_repos(text=None):
+    """Parse pacman.conf repos -> [{name, enabled, server, include}]."""
+    if text is None:
+        try:
+            text = open(PACCONF).read()
+        except Exception:
+            text = ""
+    repos, cur = [], None
+    for ln in text.splitlines():
+        s = ln.strip()
+        m = re.match(r"^(#?)\s*\[([^\]]+)\]\s*$", s)
+        if m:
+            if m.group(2) == "options":
+                cur = None
+                continue
+            cur = {"name": m.group(2), "enabled": m.group(1) == "", "server": "", "include": ""}
+            repos.append(cur)
+            continue
+        if cur is not None:
+            m2 = re.match(r"^#?\s*(Server|Include)\s*=\s*(.+)$", s)
+            if m2:
+                cur["server" if m2.group(1) == "Server" else "include"] = m2.group(2).strip()
+    # drop pacman.conf's documentation-example placeholder block
+    return [r for r in repos if r["name"] != "repo-name"
+            and r["server"] != "ServerName" and r["include"] != "IncludePath"]
+
+
+def conf_add(text, name, kind, value, siglevel):
+    block = "\n[%s]\n" % name
+    if siglevel:
+        block += "SigLevel = %s\n" % siglevel
+    block += "%s = %s\n" % ("Server" if kind == "server" else "Include", value)
+    return text.rstrip("\n") + "\n" + block
+
+
+def _edit_block(text, name, mode):
+    """mode: 'enable' | 'disable' | 'remove' applied to repo [name]'s block."""
+    lines = text.split("\n")
+    hdr = re.compile(r"^(\s*)#?\s*\[%s\]\s*$" % re.escape(name))
+    body = re.compile(r"^(\s*)#?\s*(Server|Include|SigLevel)\s*=")
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        if hdr.match(ln):
+            ind = re.match(r"^(\s*)", ln).group(1)
+            if mode == "enable":
+                out.append("%s[%s]" % (ind, name))
+            elif mode == "disable":
+                out.append("%s#[%s]" % (ind, name))
+            i += 1
+            while i < n and lines[i].strip() != "" and not re.match(r"^\s*#?\s*\[", lines[i]):
+                b = lines[i]
+                if body.match(b):
+                    bind = re.match(r"^(\s*)", b).group(1)
+                    content = re.sub(r"^\s*#?\s*", "", b)
+                    if mode == "enable":
+                        out.append(bind + content)
+                    elif mode == "disable":
+                        out.append(bind + "#" + content)
+                    # remove -> drop the line
+                elif mode != "remove":
+                    out.append(b)
+                i += 1
+        else:
+            out.append(ln)
+            i += 1
+    return "\n".join(out)
+
+
+def writeconf(src):
+    """(root, via pkexec) back up & install <src> as /etc/pacman.conf, then -Sy."""
+    if not os.path.exists(src):
+        sys.stderr.write("source not found\n")
+        return 2
+    txt = open(src).read()
+    if "[options]" not in txt or "[core]" not in txt:
+        sys.stderr.write("refusing: does not look like a valid pacman.conf\n")
+        return 3
+    bak = "/etc/pacman.conf.hashbak-%d" % int(time.time())
+    shutil.copy2(PACCONF, bak)
+    shutil.copy2(src, PACCONF)
+    print("Backed up old config to %s" % bak)
+    print("Refreshing package databases…\n")
+    r = subprocess.run(["pacman", "-Sy"])
+    return 0 if r.returncode == 0 else r.returncode
+
+
+# ───────────────────────── transaction command builders ──────────────────────
+def tx_env():
+    e = dict(os.environ)
+    if ASKPASS:
+        e["SUDO_ASKPASS"] = ASKPASS
+    return e
+
+
+def cmd_install(it):
+    if it.get("src") == "flatpak":
+        return ["flatpak", "install", "-y", it["name"]]
+    return ["yay", "-S", "--noconfirm", "--sudoflags", "-A", it.get("pkg", it["name"])]
+
+
+def cmd_remove(it):
+    if it.get("src") == "flatpak":
+        return ["flatpak", "uninstall", "-y", it.get("appid", it["name"])]
+    return ["yay", "-Rns", "--noconfirm", "--sudoflags", "-A", it.get("pkg", it["name"])]
+
+
+def cmd_update_all():
+    return ["yay", "-Syu", "--noconfirm", "--sudoflags", "-A"]
+
+
+# ─────────────────────────────── headless CLI ────────────────────────────────
+def cli(a):
+    if not a:
+        print(__doc__)
+        return 0
+    c = a[0]
+    if c == "updates":
+        print(json.dumps(get_updates(), indent=2))
+    elif c == "search":
+        print(json.dumps(search_repos(a[1] if len(a) > 1 else ""), indent=2))
+    elif c == "installed":
+        print(json.dumps(list_installed(), indent=2))
+    elif c == "info":
+        print(json.dumps(pkg_info(a[1], a[2] if len(a) > 2 else "repo"), indent=2))
+    elif c == "catalog":
+        cat = get_catalog()
+        print(json.dumps({"count": len(cat), "sample": cat[:3]}, indent=2))
+    elif c == "storefront":
+        sf = storefront_data()
+        print(json.dumps({k: (len(v) if isinstance(v, list) else bool(v))
+                          for k, v in sf.items()}, indent=2))
+    elif c == "repos":
+        print(json.dumps(read_repos(), indent=2))
+    else:
+        print("unknown:", c, file=sys.stderr)
+        return 2
+    return 0
+
+
+# ════════════════════════════════════ GUI ════════════════════════════════════
+def gui(start_page=0, shot=None, shot_app=None):
+    from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QProcess, QSize, QRectF,
+                              QProcessEnvironment, QTimer, QPropertyAnimation,
+                              QEasingCurve)
+    from PyQt6.QtGui import (QPainter, QColor, QPainterPath, QIcon, QCursor,
+                             QFont, QFontMetrics, QKeySequence, QShortcut,
+                             QPixmap, QImage)
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QLabel, QPushButton, QLineEdit, QListWidget,
+        QListWidgetItem, QTextEdit, QStackedWidget, QHBoxLayout, QVBoxLayout,
+        QFrame, QCheckBox, QComboBox, QScrollArea, QStyledItemDelegate, QStyle,
+        QGraphicsOpacityEffect)
+
+    ACCENT, DANGER = "#56c5d8", "#e06c75"
+    ROLE_SUM = Qt.ItemDataRole.UserRole + 1
+    ROLE_INST = Qt.ItemDataRole.UserRole + 2
+
+    def btn_qss(a=ACCENT):
+        return f"""
+            QPushButton{{ background:rgba(255,255,255,0.07); color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.10); border-radius:9px;
+                padding:7px 16px; font-size:13px; }}
+            QPushButton:hover{{ background:rgba(255,255,255,0.13); }}
+            QPushButton#primary{{ background:{a}; color:#06222a; font-weight:600; border:none; }}
+            QPushButton#primary:hover{{ background:#6fd6e7; }}
+            QPushButton#danger{{ background:{DANGER}; color:#2a0a0c; font-weight:600; border:none; }}
+            QPushButton:disabled{{ color:#7f8a8d; background:rgba(255,255,255,0.05); }}
+        """
+
+    def qenv(d):
+        qe = QProcessEnvironment()
+        for k, v in d.items():
+            qe.insert(k, v)
+        return qe
+
+    class PkgDelegate(QStyledItemDelegate):
+        """App-store style row: icon + bold name + dim summary + installed tick."""
+        def sizeHint(self, opt, idx):
+            return QSize(0, 62)
+
+        def paint(self, p, opt, idx):
+            p.save()
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = opt.rect.adjusted(4, 3, -4, -3)
+            sel = bool(opt.state & QStyle.StateFlag.State_Selected)
+            hov = bool(opt.state & QStyle.StateFlag.State_MouseOver)
+            if sel:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(ACCENT))
+                p.drawRoundedRect(QRectF(r), 11, 11)
+                ncol, scol = QColor("#06222a"), QColor(6, 34, 42, 200)
+            else:
+                if hov:
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QColor(255, 255, 255, 16))
+                    p.drawRoundedRect(QRectF(r), 11, 11)
+                ncol, scol = QColor("#f3f7f8"), QColor("#94a3a6")
+            isz = 44
+            iy = r.top() + (r.height() - isz) // 2
+            icon = idx.data(Qt.ItemDataRole.DecorationRole)
+            if isinstance(icon, QIcon) and not icon.isNull():
+                icon.paint(p, r.left() + 10, iy, isz, isz)
+            tx = r.left() + 10 + isz + 14
+            tw = r.right() - tx - 30
+            inst = idx.data(ROLE_INST)
+            fn = QFont()
+            fn.setPixelSize(15)
+            fn.setBold(True)
+            p.setFont(fn)
+            p.setPen(ncol)
+            nm = QFontMetrics(fn).elidedText(idx.data(Qt.ItemDataRole.DisplayRole) or "",
+                                             Qt.TextElideMode.ElideRight, tw)
+            p.drawText(tx, r.top() + 11, tw, 20, int(Qt.AlignmentFlag.AlignLeft), nm)
+            summ = idx.data(ROLE_SUM)
+            if summ:
+                fs = QFont()
+                fs.setPixelSize(12)
+                p.setFont(fs)
+                p.setPen(scol)
+                sm = QFontMetrics(fs).elidedText(summ, Qt.TextElideMode.ElideRight, tw)
+                p.drawText(tx, r.top() + 32, tw, 18, int(Qt.AlignmentFlag.AlignLeft), sm)
+            if inst:
+                p.setPen(ncol if sel else QColor(ACCENT))
+                fc = QFont()
+                fc.setPixelSize(16)
+                fc.setBold(True)
+                p.setFont(fc)
+                p.drawText(r.right() - 26, r.top(), 22, r.height(),
+                           int(Qt.AlignmentFlag.AlignCenter), "✓")
+            p.restore()
+
+    class Worker(QThread):
+        done = pyqtSignal(object)
+
+        def __init__(self, fn, *a):
+            super().__init__()
+            self.fn, self.a = fn, a
+
+        def run(self):
+            try:
+                self.done.emit(self.fn(*self.a))
+            except Exception as e:
+                self.done.emit({"_error": str(e)})
+
+    _shot_cache = {}                     # url -> raw image bytes
+
+    class ImgWorker(QThread):
+        """Download one screenshot URL off the UI thread, emit (url, bytes).
+
+        Emits empty bytes on any failure so the view can drop that slot
+        without ever showing a broken page. Bytes are cached so revisiting an
+        app re-uses them. We pass bytes (not a QPixmap) across the thread
+        boundary because QPixmap must be created on the GUI thread."""
+        loaded = pyqtSignal(str, object)
+
+        def __init__(self, url):
+            super().__init__()
+            self.url = url
+
+        def run(self):
+            if self.url in _shot_cache:
+                self.loaded.emit(self.url, _shot_cache[self.url])
+                return
+            data = b""
+            try:
+                req = urllib.request.Request(
+                    self.url, headers={"User-Agent": "hash-store/1"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    data = r.read()
+            except Exception:
+                data = b""
+            _shot_cache[self.url] = data
+            self.loaded.emit(self.url, data)
+
+    class Transaction(QWidget):
+        finishedOk = pyqtSignal(bool)
+
+        def __init__(self, parent, title, argv, env):
+            super().__init__(parent, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setObjectName("txwin")
+            self.resize(660, 460)
+            v = QVBoxLayout(self)
+            v.setContentsMargins(18, 16, 18, 16)
+            t = QLabel(title)
+            t.setObjectName("txtitle")
+            self.log = QTextEdit(readOnly=True)
+            self.log.setObjectName("txlog")
+            self.btn = QPushButton("Please wait…")
+            self.btn.setEnabled(False)
+            self.btn.setObjectName("primary")
+            self.btn.clicked.connect(self.close)
+            v.addWidget(t)
+            v.addWidget(self.log, 1)
+            v.addWidget(self.btn)
+            self.setStyleSheet("""
+                #txwin{ background:#14161d; border:1px solid rgba(255,255,255,0.12);
+                        border-radius:16px; }
+                #txtitle{ color:#fff; font-size:15px; font-weight:600; }
+                #txlog{ background:#0b0d12; color:#cfe9ee; border:1px solid #222;
+                        border-radius:10px; font-family:monospace; font-size:12px; }
+            """ + btn_qss())
+            self.p = QProcess(self)
+            self.p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            self.p.setProcessEnvironment(qenv(env))
+            self.p.readyReadStandardOutput.connect(self._read)
+            self.p.finished.connect(self._fin)
+            self._append("$ " + " ".join(argv) + "\n\n")
+            self.p.start(argv[0], argv[1:])
+
+        def _read(self):
+            self._append(bytes(self.p.readAllStandardOutput()).decode(errors="ignore"))
+
+        def _append(self, s):
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+            self.log.insertPlainText(s)
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+
+        def _fin(self, code, _st):
+            ok = code == 0
+            self._append("\n" + ("✓ Done." if ok else "✗ Failed (exit %d)." % code) + "\n")
+            self.btn.setText("Close")
+            self.btn.setEnabled(True)
+            self.finishedOk.emit(ok)
+
+        def keyPressEvent(self, e):
+            # Esc dismisses the transaction window once it's finished.
+            if e.key() == Qt.Key.Key_Escape and self.btn.isEnabled():
+                self.close()
+            else:
+                super().keyPressEvent(e)
+
+    class TitleBar(QWidget):
+        def __init__(self, win):
+            super().__init__(win)
+            self.win, self._off = win, None
+            self.setFixedHeight(46)
+            h = QHBoxLayout(self)
+            h.setContentsMargins(18, 0, 12, 0)
+            ttl = QLabel("  HasH Software Center")
+            ttl.setObjectName("apptitle")
+            mn, cl = QPushButton("—"), QPushButton("✕")
+            for b in (mn, cl):
+                b.setFixedSize(30, 30)
+                b.setObjectName("winbtn")
+            mn.clicked.connect(win.showMinimized)
+            cl.clicked.connect(win.close)
+            h.addWidget(ttl)
+            h.addStretch(1)
+            h.addWidget(mn)
+            h.addWidget(cl)
+
+        def mousePressEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self._off = e.globalPosition().toPoint() - self.win.frameGeometry().topLeft()
+
+        def mouseMoveEvent(self, e):
+            if self._off is not None and (e.buttons() & Qt.MouseButton.LeftButton):
+                self.win.move(e.globalPosition().toPoint() - self._off)
+
+        def mouseReleaseEvent(self, e):
+            self._off = None
+
+    # icon helper (cache QIcons by path/stock)
+    _icache = {}
+
+    def make_icon(item):
+        ic = item.get("icon", "")
+        key = ic or item.get("src", "repo")
+        if key in _icache:
+            return _icache[key]
+        if ic and os.path.exists(ic):
+            q = QIcon(ic)
+        else:
+            q = QIcon.fromTheme({"aur": "system-software-install",
+                                 "flatpak": "flatpak"}.get(item.get("src"),
+                                                           "package-x-generic"))
+        _icache[key] = q
+        return q
+
+    # ───────────────────────── storefront widgets ────────────────────────
+    def _metric_text(it):
+        """Small metric badge text for a card (popularity / votes when known)."""
+        pop = it.get("popularity")
+        votes = it.get("votes")
+        if votes:
+            return "★ %d" % votes
+        if pop:
+            return "▲ %.0f" % (pop * 10)
+        if it.get("installed"):
+            return "Installed"
+        return ""
+
+    class AppCard(QFrame):
+        """A rounded, hoverable app tile: icon + name + summary + metric badge.
+
+        Clicking opens the existing detail flow; the Install button reuses the
+        existing transaction flow. Built to match the dark/accent chrome.
+        """
+        def __init__(self, page, item):
+            super().__init__()
+            self.page, self.item = page, item
+            self.setObjectName("appcard")
+            self.setFixedSize(212, 138)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            v = QVBoxLayout(self)
+            v.setContentsMargins(14, 12, 14, 12)
+            v.setSpacing(7)
+
+            top = QHBoxLayout()
+            top.setSpacing(10)
+            ic = QLabel()
+            ic.setFixedSize(44, 44)
+            ic.setPixmap(make_icon(item).pixmap(QSize(44, 44)))
+            top.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+            badge = _metric_text(item)
+            top.addStretch(1)
+            if badge:
+                bl = QLabel(badge)
+                bl.setObjectName("cardbadge")
+                top.addWidget(bl, 0, Qt.AlignmentFlag.AlignTop)
+            v.addLayout(top)
+
+            nm = QLabel(item.get("name", item.get("pkg", "")))
+            nm.setObjectName("cardname")
+            fm = QFontMetrics(nm.font())
+            nm.setText(fm.elidedText(item.get("name", item.get("pkg", "")),
+                                     Qt.TextElideMode.ElideRight, 182))
+            v.addWidget(nm)
+
+            sm = QLabel(item.get("summary", "") or "")
+            sm.setObjectName("cardsumm")
+            sm.setWordWrap(True)
+            sm.setMaximumHeight(34)
+            v.addWidget(sm, 1)
+            self.setStyleSheet(card_qss())
+
+        def enterEvent(self, e):
+            self.setProperty("hover", True)
+            self.setStyleSheet(card_qss())
+            super().enterEvent(e)
+
+        def leaveEvent(self, e):
+            self.setProperty("hover", False)
+            self.setStyleSheet(card_qss())
+            super().leaveEvent(e)
+
+        def mouseReleaseEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.page.open_item(self.item)
+            super().mouseReleaseEvent(e)
+
+    class CatChip(QFrame):
+        """A clickable category chip that drives the existing category filter."""
+        def __init__(self, page, key, label):
+            super().__init__()
+            self.page, self.key = page, key
+            self.setObjectName("catchip")
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setFixedHeight(40)
+            h = QHBoxLayout(self)
+            h.setContentsMargins(16, 0, 16, 0)
+            lab = QLabel(label)
+            lab.setObjectName("chiplbl")
+            h.addWidget(lab)
+            self.setStyleSheet(card_qss())
+
+        def mouseReleaseEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.page.open_category(self.key)
+            super().mouseReleaseEvent(e)
+
+    class Shelf(QWidget):
+        """A titled horizontal row of cards with its own scroll area."""
+        def __init__(self, title):
+            super().__init__()
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(8)
+            t = QLabel(title)
+            t.setObjectName("shelftitle")
+            v.addWidget(t)
+            self.scroll = QScrollArea()
+            self.scroll.setObjectName("shelfscroll")
+            self.scroll.setWidgetResizable(True)
+            self.scroll.setFixedHeight(162)
+            self.scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.scroll.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.row = QWidget()
+            self.rl = QHBoxLayout(self.row)
+            self.rl.setContentsMargins(2, 2, 2, 8)
+            self.rl.setSpacing(12)
+            self.scroll.setWidget(self.row)
+            v.addWidget(self.scroll)
+
+        def set_cards(self, cards):
+            while self.rl.count():
+                w = self.rl.takeAt(0).widget()
+                if w:
+                    w.deleteLater()
+            for c in cards:
+                self.rl.addWidget(c)
+            self.rl.addStretch(1)
+
+    class HeroBanner(QFrame):
+        """Large rounded spotlight banner: icon + name + tagline + Install/Open."""
+        def __init__(self, page):
+            super().__init__()
+            self.page, self.item = page, None
+            self.setObjectName("hero")
+            self.setFixedHeight(168)
+            h = QHBoxLayout(self)
+            h.setContentsMargins(28, 22, 28, 22)
+            h.setSpacing(22)
+            self.icon = QLabel()
+            self.icon.setFixedSize(96, 96)
+            self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            h.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignVCenter)
+            tcol = QVBoxLayout()
+            tcol.setSpacing(6)
+            self.kicker = QLabel("FEATURED")
+            self.kicker.setObjectName("herokicker")
+            self.name = QLabel("")
+            self.name.setObjectName("heroname")
+            self.tag = QLabel("")
+            self.tag.setObjectName("herotag")
+            self.tag.setWordWrap(True)
+            tcol.addStretch(1)
+            tcol.addWidget(self.kicker)
+            tcol.addWidget(self.name)
+            tcol.addWidget(self.tag)
+            tcol.addStretch(1)
+            h.addLayout(tcol, 1)
+            self.btn = QPushButton("Install")
+            self.btn.setObjectName("primary")
+            self.btn.setMinimumWidth(120)
+            self.btn.setMinimumHeight(40)
+            self.btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn.clicked.connect(self._act)
+            self.btn.setStyleSheet(btn_qss())
+            h.addWidget(self.btn, 0, Qt.AlignmentFlag.AlignVCenter)
+            self.setStyleSheet(hero_qss())
+
+        def set_item(self, it):
+            self.item = it
+            if not it:
+                self.hide()
+                return
+            self.show()
+            self.icon.setPixmap(make_icon(it).pixmap(QSize(96, 96)))
+            self.name.setText(it.get("name", it.get("pkg", "")))
+            self.tag.setText(it.get("summary", "") or "A great app for HasH-Arch.")
+            self.btn.setText("Open" if it.get("installed") else "Install")
+
+        def mouseReleaseEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton and self.item:
+                self.page.open_item(self.item)
+            super().mouseReleaseEvent(e)
+
+        def _act(self):
+            if self.item:
+                self.page.open_item(self.item)
+
+    def card_qss():
+        return f"""
+            QFrame#appcard{{ background:#0e1117;
+                border:1px solid rgba(255,255,255,0.07); border-radius:14px; }}
+            QFrame#appcard[hover="true"]{{ background:#141a22;
+                border:1px solid {ACCENT}; }}
+            QLabel#cardname{{ color:#f3f7f8; font-size:14px; font-weight:700; }}
+            QLabel#cardsumm{{ color:#94a3a6; font-size:11px; }}
+            QLabel#cardbadge{{ color:{ACCENT}; font-size:11px; font-weight:700;
+                background:rgba(86,197,216,0.12); border-radius:8px;
+                padding:2px 8px; }}
+            QFrame#catchip{{ background:#0e1117;
+                border:1px solid rgba(255,255,255,0.08); border-radius:12px; }}
+            QFrame#catchip:hover{{ background:#141a22; border:1px solid {ACCENT}; }}
+            QLabel#chiplbl{{ color:#dfe9eb; font-size:13px; font-weight:600; }}
+        """
+
+    def hero_qss():
+        return f"""
+            QFrame#hero{{ border-radius:18px; border:1px solid rgba(86,197,216,0.30);
+                background:qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 #15323b, stop:0.6 #122029, stop:1 #0e1117); }}
+            QLabel#herokicker{{ color:{ACCENT}; font-size:11px; font-weight:800;
+                letter-spacing:2px; }}
+            QLabel#heroname{{ color:#fff; font-size:26px; font-weight:800; }}
+            QLabel#herotag{{ color:#bcd3d8; font-size:14px; }}
+        """ + btn_qss()
+
+    class PageHeader(QWidget):
+        """Consistent per-page header: [← Back]  Title  …… (actions slot)."""
+        def __init__(self, title):
+            super().__init__()
+            self.setObjectName("pagehead")
+            h = QHBoxLayout(self)
+            h.setContentsMargins(2, 0, 2, 0)
+            h.setSpacing(10)
+            self.back = QPushButton("←  Back")
+            self.back.setObjectName("backbtn")
+            self.back.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.title = QLabel(title)
+            self.title.setObjectName("pagetitle")
+            self.actions = QHBoxLayout()
+            self.actions.setSpacing(8)
+            h.addWidget(self.back, 0)
+            h.addWidget(self.title, 0)
+            h.addStretch(1)
+            h.addLayout(self.actions)
+
+        def add_action(self, w):
+            self.actions.addWidget(w)
+
+        def set_can_back(self, can):
+            self.back.setEnabled(can)
+
+    class PageRouter(QWidget):
+        """Keyed, addressable page container with history + fade transitions.
+
+        Replaces the opaque QStackedWidget index switching with first-class
+        navigation: pages are registered by string key, navigate(key) records
+        history so back() works, and `navigated` keeps chrome (sidebar, header)
+        in sync.
+        """
+        navigated = pyqtSignal(str)
+
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            self.stack = QStackedWidget()
+            v.addWidget(self.stack)
+            self._keys = {}          # key -> widget
+            self._index = {}         # key -> stack index
+            self._history = []       # navigation history (keys)
+            self._anim = None
+
+        def add_page(self, key, widget):
+            self._index[key] = self.stack.addWidget(widget)
+            self._keys[key] = widget
+
+        def widget(self, key):
+            return self._keys.get(key)
+
+        def current_key(self):
+            return self._history[-1] if self._history else None
+
+        def can_back(self):
+            return len(self._history) > 1
+
+        def navigate(self, key, record=True):
+            if key not in self._index:
+                return
+            if record:
+                if self._history and self._history[-1] == key:
+                    record = False
+                else:
+                    self._history.append(key)
+            self.stack.setCurrentIndex(self._index[key])
+            self._fade(self._keys[key])
+            self.navigated.emit(key)
+
+        def back(self):
+            if not self.can_back():
+                return False
+            self._history.pop()
+            key = self._history[-1]
+            self.stack.setCurrentIndex(self._index[key])
+            self._fade(self._keys[key])
+            self.navigated.emit(key)
+            return True
+
+        def _fade(self, w):
+            eff = QGraphicsOpacityEffect(w)
+            w.setGraphicsEffect(eff)
+            self._anim = QPropertyAnimation(eff, b"opacity", self)
+            self._anim.setDuration(180)
+            self._anim.setStartValue(0.0)
+            self._anim.setEndValue(1.0)
+            self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._anim.finished.connect(lambda: w.setGraphicsEffect(None))
+            self._anim.start()
+
+    class Page(QWidget):
+        """Discover catalog / Updates / Installed."""
+        TITLES = {"discover": "Discover", "updates": "Updates",
+                  "installed": "Installed"}
+
+        def __init__(self, win, mode):
+            super().__init__()
+            self.win, self.mode = win, mode
+            self.items, self._all, self._catmap = [], [], {}
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(10)
+
+            self.header = PageHeader(self.TITLES.get(mode, mode.title()))
+            if mode == "discover":
+                self.header.back.clicked.connect(self._discover_back)
+            else:
+                self.header.back.clicked.connect(win.go_back)
+            outer.addWidget(self.header)
+
+            top = QHBoxLayout()
+            if mode == "discover":
+                self.search = QLineEdit()
+                self.search.setPlaceholderText("Search apps…")
+                self.search.textChanged.connect(self._typed)
+                self.allpkg = QCheckBox("All packages + AUR")
+                self.allpkg.stateChanged.connect(self._typed)
+                top.addWidget(self.search, 1)
+                top.addWidget(self.allpkg)
+                self._deb = QTimer(self)
+                self._deb.setSingleShot(True)
+                self._deb.setInterval(380)
+                self._deb.timeout.connect(self._run_pkg_search)
+            elif mode == "installed":
+                self.search = QLineEdit()
+                self.search.setPlaceholderText("Filter installed software…")
+                self.search.textChanged.connect(self.refilter)
+                top.addWidget(self.search, 1)
+            else:  # updates
+                self.count = QLabel("Checking for updates…")
+                self.count.setObjectName("countlbl")
+                ref = QPushButton("Refresh")
+                ref.clicked.connect(self.reload)
+                upd = QPushButton("Update Everything")
+                upd.setObjectName("primary")
+                upd.clicked.connect(self.update_all)
+                self.header.add_action(ref)
+                self.header.add_action(upd)
+                top.addWidget(self.count, 1)
+            outer.addLayout(top)
+
+            split = QHBoxLayout()
+            split.setSpacing(12)
+            if mode == "discover":
+                # pamac-style category list down the left of the catalog
+                self.catList = QListWidget()
+                self.catList.setObjectName("catlist")
+                self.catList.setFixedWidth(168)
+                for key, label in CATEGORIES:
+                    ci = QListWidgetItem(label)
+                    ci.setData(Qt.ItemDataRole.UserRole, key)
+                    self.catList.addItem(ci)
+                self.catList.setCurrentRow(0)
+                self.catList.currentRowChanged.connect(self.refilter)
+                split.addWidget(self.catList, 0)
+            self.list = QListWidget()
+            self.list.setObjectName("pkglist")
+            self.list.setItemDelegate(PkgDelegate(self.list))
+            self.list.setMouseTracking(True)
+            self.list.setUniformItemSizes(True)
+            self.list.setSpacing(0)
+            self.list.currentRowChanged.connect(self.on_select)
+            # Clicking a browse/installed row opens the full App Detail page
+            # (updates rows stay inline — they're just version bumps).
+            if mode in ("discover", "installed"):
+                self.list.itemClicked.connect(self._row_clicked)
+            split.addWidget(self.list, 3)
+
+            self.detail = QFrame()
+            self.detail.setObjectName("detail")
+            dv = QVBoxLayout(self.detail)
+            dv.setContentsMargins(22, 22, 22, 22)
+            dv.setSpacing(12)
+            hdr = QHBoxLayout()
+            hdr.setSpacing(15)
+            self.dIcon = QLabel()
+            self.dIcon.setFixedSize(72, 72)
+            self.dIcon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            htext = QVBoxLayout()
+            htext.setSpacing(3)
+            self.dName = QLabel("")
+            self.dName.setObjectName("dname")
+            self.dName.setWordWrap(True)
+            self.dMeta = QLabel("")
+            self.dMeta.setObjectName("dmeta")
+            htext.addStretch(1)
+            htext.addWidget(self.dName)
+            htext.addWidget(self.dMeta)
+            htext.addStretch(1)
+            hdr.addWidget(self.dIcon, 0, Qt.AlignmentFlag.AlignTop)
+            hdr.addLayout(htext, 1)
+            dv.addLayout(hdr)
+            sep = QFrame()
+            sep.setObjectName("sep")
+            sep.setFixedHeight(1)
+            dv.addWidget(sep)
+            self.dDesc = QLabel("Select an app to see details.")
+            self.dDesc.setObjectName("ddesc")
+            self.dDesc.setWordWrap(True)
+            self.dDesc.setAlignment(Qt.AlignmentFlag.AlignTop)
+            self.dDesc.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            dv.addWidget(self.dDesc, 1)
+            self.action = QPushButton("")
+            self.action.clicked.connect(self.do_action)
+            self.action.setMinimumHeight(42)
+            self.action.hide()
+            dv.addWidget(self.action)
+            split.addWidget(self.detail, 4)
+
+            if mode == "discover":
+                # The Discover page is a STOREFRONT by default (hero + shelves);
+                # the classic master-detail browse view appears as soon as the
+                # user searches or picks a category. A stack swaps between them.
+                self.browse = QWidget()
+                self.browse.setLayout(split)
+                self.store = self._build_storefront()
+                self.disc_stack = QStackedWidget()
+                self.disc_stack.addWidget(self.store)    # index 0 = storefront
+                self.disc_stack.addWidget(self.browse)   # index 1 = browse
+                outer.addWidget(self.disc_stack, 1)
+            else:
+                outer.addLayout(split, 1)
+
+        def _build_storefront(self):
+            """Scrollable landing: featured hero + Top/Trending/Picks shelves
+            + clickable category chips. Populated by _populate_storefront()."""
+            sc = QScrollArea()
+            sc.setObjectName("scroll")
+            sc.setWidgetResizable(True)
+            sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            inner = QWidget()
+            iv = QVBoxLayout(inner)
+            iv.setContentsMargins(2, 2, 8, 8)
+            iv.setSpacing(20)
+
+            self.hero = HeroBanner(self)
+            iv.addWidget(self.hero)
+
+            self.sf_top = Shelf("Top Downloaded")
+            self.sf_trend = Shelf("Trending")
+            self.sf_picks = Shelf("Editor's Picks")
+            iv.addWidget(self.sf_top)
+            iv.addWidget(self.sf_trend)
+            iv.addWidget(self.sf_picks)
+
+            # Categories shelf — clickable chips that drive the category filter.
+            cat_t = QLabel("Browse by Category")
+            cat_t.setObjectName("shelftitle")
+            iv.addWidget(cat_t)
+            chips = QWidget()
+            from PyQt6.QtWidgets import QGridLayout
+            gl = QGridLayout(chips)
+            gl.setContentsMargins(2, 0, 2, 0)
+            gl.setHorizontalSpacing(12)
+            gl.setVerticalSpacing(12)
+            col = row = 0
+            for key, label in CATEGORIES:
+                if key == "All":
+                    continue
+                gl.addWidget(CatChip(self, key, label), row, col)
+                col += 1
+                if col >= 4:
+                    col = 0
+                    row += 1
+            iv.addWidget(chips)
+            iv.addStretch(1)
+            sc.setWidget(inner)
+            self._sf_loaded = False
+            return sc
+
+        def open_item(self, it):
+            """Open the full App Detail PAGE for a card/hero/list row.
+
+            Hands off to the router-registered 'app' page, which loads the
+            long description + screenshots and offers Install/Remove/Open. The
+            page's Back button returns here (storefront or browse) via router
+            history.
+            """
+            self.win.open_app(it)
+
+        def go_storefront(self):
+            """Reset Discover to the storefront landing (clear search/category)."""
+            self.search.blockSignals(True)
+            self.search.clear()
+            self.search.blockSignals(False)
+            self.catList.blockSignals(True)
+            self.catList.setCurrentRow(0)        # "All"
+            self.catList.blockSignals(False)
+            self.refilter()                      # re-render + _sync_disc_view -> home
+            self.header.set_can_back(self.win.router.can_back())
+
+        def _discover_back(self):
+            """Back on Discover: if browsing, return to the storefront; else
+            defer to the router's history back (out of Discover)."""
+            if getattr(self, "disc_stack", None) and \
+                    self.disc_stack.currentIndex() == 1:
+                self.go_storefront()
+            else:
+                self.win.go_back()
+
+        def open_category(self, key):
+            """Storefront category chip -> select that category + browse view."""
+            self.search.blockSignals(True)
+            self.search.clear()
+            self.search.blockSignals(False)
+            for i in range(self.catList.count()):
+                if self.catList.item(i).data(Qt.ItemDataRole.UserRole) == key:
+                    self.catList.setCurrentRow(i)
+                    break
+            self.disc_stack.setCurrentIndex(1)
+            self.refilter()
+
+        def _populate_storefront(self, sf):
+            """Fill hero + shelves from storefront_data() (called off-thread)."""
+            if isinstance(sf, dict) and "_error" in sf:
+                return
+            self.hero.set_item(sf.get("hero"))
+
+            def cards(items):
+                return [AppCard(self, it) for it in (items or [])]
+            self.sf_top.set_cards(cards(sf.get("top")))
+            self.sf_trend.set_cards(cards(sf.get("trending")))
+            self.sf_picks.set_cards(cards(sf.get("picks")))
+            self._sf_loaded = True
+
+        def focus_default(self):
+            """Sensible initial keyboard focus when this page is shown."""
+            if self.mode in ("discover", "installed"):
+                self.search.setFocus()
+            else:
+                self.list.setFocus()
+
+        # ---- loading ----
+        def reload(self):
+            self.list.clear()
+            self.items = []
+            if self.mode == "updates":
+                self.count.setText("Checking for updates…")
+                self._w = Worker(get_updates)
+                self._w.done.connect(self._got_updates)
+                self._w.start()
+            elif self.mode == "installed":
+                self.list.addItem("Loading…")
+                self._w = Worker(list_installed)
+                self._w.done.connect(self._got_list)
+                self._w.start()
+            elif self.mode == "discover":
+                self.list.addItem("Loading app catalog…")
+                self._w = Worker(self._load_catalog)
+                self._w.done.connect(self._got_catalog)
+                self._w.start()
+                # build the fancy storefront shelves once, off the UI thread
+                if not getattr(self, "_sf_loaded", False) \
+                        and not getattr(self, "_sfw", None):
+                    self._sfw = Worker(storefront_data)
+                    self._sfw.done.connect(self._populate_storefront)
+                    self._sfw.start()
+
+        def _load_catalog(self):
+            cat = get_catalog()
+            inst = installed_set()
+            for a in cat:
+                a["installed"] = a["pkg"] in inst
+            return cat
+
+        def _got_catalog(self, data):
+            if isinstance(data, dict) and "_error" in data:
+                self.list.clear()
+                self.list.addItem("Error: " + data["_error"])
+                return
+            self._all = data
+            self.refilter()
+
+        def _got_updates(self, data):
+            self.list.clear()
+            self.items = []
+            if isinstance(data, dict) and "_error" in data:
+                self.count.setText("Error: " + data["_error"])
+                return
+            rows = data.get("repo", []) + data.get("aur", [])
+            self.count.setText("%d update%s available" % (len(rows), "" if len(rows) == 1 else "s"))
+            for it in rows:
+                self.items.append(it)
+                tag = "AUR" if it["src"] == "aur" else "repo"
+                qi = QListWidgetItem(it["name"])
+                qi.setData(Qt.ItemDataRole.DecorationRole, make_icon(it))
+                qi.setData(ROLE_SUM, "%s  →  %s    ·    %s" % (it["old"], it["new"], tag))
+                self.list.addItem(qi)
+            if not rows:
+                self.list.addItem("Your system is up to date ✓")
+
+        def _got_list(self, data):
+            if isinstance(data, dict) and "_error" in data:
+                self.list.clear()
+                self.list.addItem("Error: " + data["_error"])
+                return
+            self._all = data
+            self.refilter()
+
+        # ---- filtering / rendering ----
+        def _at_home(self):
+            """Discover with no search text and the 'All' category selected ->
+            show the storefront landing rather than the browse list."""
+            if self.mode != "discover":
+                return False
+            ci = self.catList.currentItem()
+            key = ci.data(Qt.ItemDataRole.UserRole) if ci else "All"
+            return key == "All" and not self.search.text().strip()
+
+        def _sync_disc_view(self):
+            """Swap the Discover stack between storefront (home) and browse.
+
+            In the browse view the Back button always returns to the storefront,
+            so enable it even when the router itself has no history."""
+            if self.mode != "discover":
+                return
+            browsing = not self._at_home()
+            self.disc_stack.setCurrentIndex(1 if browsing else 0)
+            self.header.set_can_back(browsing or self.win.router.can_back())
+
+        def _typed(self, *_):
+            if self.mode != "discover":
+                return
+            self._sync_disc_view()
+            if self.allpkg.isChecked() and self.search.text().strip():
+                self._deb.start()
+            else:
+                self._deb.stop()
+                self.refilter()
+
+        def _run_pkg_search(self):
+            term = self.search.text().strip()
+            if not term:
+                return
+
+            def q():
+                res = search_repos(term) + search_aur(term)
+                return res
+            self._sw = Worker(q)
+            self._sw.done.connect(self._merge_pkg_search)
+            self._sw.start()
+
+        def _merge_pkg_search(self, res):
+            if isinstance(res, dict):
+                return
+            have = {x["name"] for x in self._filtered()}
+            extra = [r for r in res if r["name"] not in have]
+            self._render(self._filtered() + extra)
+
+        def _filtered(self):
+            if self.mode == "discover":
+                ci = self.catList.currentItem()
+                key = ci.data(Qt.ItemDataRole.UserRole) if ci else "All"
+                t = self.search.text().lower().strip()
+                out = []
+                for a in self._all:
+                    if key != "All" and key not in a["cats"]:
+                        continue
+                    if t and t not in a["name_lc"] and t not in a["summary"].lower() and t not in a["pkg"]:
+                        continue
+                    out.append(a)
+                return out
+            if self.mode == "installed":
+                t = self.search.text().lower().strip()
+                return [x for x in self._all if not t or t in x["name"].lower()]
+            return self._all
+
+        def refilter(self, *_):
+            self._render(self._filtered())
+            self._sync_disc_view()
+
+        def _render(self, data):
+            self.list.clear()
+            self.items = []
+            for it in data:
+                self.items.append(it)
+                qi = QListWidgetItem(it["name"])
+                qi.setData(Qt.ItemDataRole.DecorationRole, make_icon(it))
+                if self.mode == "discover":
+                    qi.setData(ROLE_SUM, it.get("summary", ""))
+                elif it.get("version"):
+                    src = {"aur": "AUR", "flatpak": "Flatpak"}.get(it.get("src"))
+                    qi.setData(ROLE_SUM, it["version"] + ("  ·  " + src if src else ""))
+                qi.setData(ROLE_INST, bool(it.get("installed")))
+                self.list.addItem(qi)
+            if not data:
+                self.list.addItem("No results.")
+            if self.mode == "discover":
+                self.win.status("%d apps" % len(data))
+
+        def _row_clicked(self, qi):
+            """Browse/installed list row click -> open the full App Detail page."""
+            row = self.list.row(qi)
+            if 0 <= row < len(self.items):
+                self.win.open_app(self.items[row])
+
+        # ---- details + actions ----
+        def on_select(self, row):
+            if row < 0 or row >= len(self.items):
+                self.action.hide()
+                self.dIcon.clear()
+                self.dName.setText("")
+                self.dMeta.setText("")
+                self.dDesc.setText("Select an app to see details.")
+                return
+            it = self.items[row]
+            self.dIcon.setPixmap(make_icon(it).pixmap(QSize(72, 72)))
+            self.dName.setText(it["name"])
+            srcname = {"aur": "AUR", "flatpak": "Flatpak"}.get(it.get("src"), "Official repo")
+            self.dMeta.setText(srcname + (" · " + it["version"] if it.get("version") else ""))
+            self.dDesc.setText(it.get("summary", "") or "Loading…")
+            self._iw = Worker(pkg_info, it.get("pkg", it["name"]), it.get("src", "repo"))
+            self._iw.done.connect(lambda info, x=it: self._show_info(info, x))
+            self._iw.start()
+            if self.mode == "updates":
+                self.action.hide()
+                return
+            installed = it.get("installed")
+            self.action.setText("Remove" if (self.mode == "installed" or installed) else "Install")
+            self.action.setObjectName("danger" if (self.mode == "installed" or installed) else "primary")
+            self.action.setStyleSheet(btn_qss())
+            self.action.show()
+
+        def _show_info(self, info, it):
+            if "_error" in info:
+                return
+            if "raw" in info:
+                self.dDesc.setText(info["raw"][:1400])
+                return
+            desc = info.get("Description", it.get("summary", ""))
+            extra = []
+            for k in ("Version", "Installed Size", "Download Size", "URL", "Depends On"):
+                v = info.get(k)
+                if v and v != "None":
+                    extra.append("%s: %s" % (k, v if len(v) < 90 else v[:90] + "…"))
+            self.dDesc.setText(desc + ("\n\n" + "\n".join(extra) if extra else ""))
+
+        def _after(self, ok):
+            if self.mode in ("updates", "installed"):
+                self.reload()
+            elif self.mode == "discover":
+                self.reload()
+
+        def do_action(self):
+            row = self.list.currentRow()
+            if row < 0 or row >= len(self.items):
+                return
+            it = self.items[row]
+            if self.action.text() == "Remove":
+                self.win.run_txn("Removing %s" % it["name"], cmd_remove(it), self._after)
+            else:
+                self.win.run_txn("Installing %s" % it["name"], cmd_install(it), self._after)
+
+        def update_all(self):
+            self.win.run_txn("Updating your system", cmd_update_all(), lambda ok: self.reload())
+
+    class ShotThumb(QFrame):
+        """A rounded, fixed-height screenshot slot.
+
+        Starts as a dim 'Loading…' placeholder; set_pixmap() drops in the real
+        image scaled to fit. Slots that fail to load are hidden by the page so
+        broken images never appear."""
+        H = 240
+
+        def __init__(self):
+            super().__init__()
+            self.setObjectName("shotthumb")
+            self.setFixedHeight(self.H)
+            self.setMinimumWidth(160)
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            self.lbl = QLabel("Loading…")
+            self.lbl.setObjectName("shotimg")
+            self.lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            v.addWidget(self.lbl)
+            self.setStyleSheet(
+                "QFrame#shotthumb{ background:#0b0d12;"
+                " border:1px solid rgba(255,255,255,0.08); border-radius:12px; }"
+                " QLabel#shotimg{ color:#5c686b; font-size:12px; }")
+
+        def set_pixmap(self, pm):
+            scaled = pm.scaledToHeight(
+                self.H - 2, Qt.TransformationMode.SmoothTransformation)
+            self.lbl.setPixmap(scaled)
+            self.setFixedWidth(scaled.width() + 2)
+
+    class Chip(QFrame):
+        """A small read-only category/metadata chip."""
+        def __init__(self, text):
+            super().__init__()
+            self.setObjectName("metachip")
+            h = QHBoxLayout(self)
+            h.setContentsMargins(11, 4, 11, 4)
+            lab = QLabel(text)
+            lab.setObjectName("metachiplbl")
+            h.addWidget(lab)
+            self.setStyleSheet(
+                f"QFrame#metachip{{ background:rgba(86,197,216,0.10);"
+                f" border:1px solid rgba(86,197,216,0.25); border-radius:11px; }}"
+                f" QLabel#metachiplbl{{ color:{ACCENT}; font-size:12px;"
+                f" font-weight:600; }}")
+
+    class AppDetailPage(QWidget):
+        """Full-page app view: header (icon/name/source/version + action button),
+        horizontal screenshot strip, long description, and a metadata grid
+        (version, size, license, popularity/votes) + category chips.
+
+        Registered in the PageRouter under key 'app'. Populated by show_app(it),
+        which loads the long description + screenshots asynchronously so the page
+        appears instantly and fills in as data arrives. Degrades gracefully: no
+        screenshots -> the strip is hidden and the big icon stands in."""
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self.item = None
+            self._iw = None
+            self._dw = None
+            self._shot_workers = []
+            self._shot_slots = {}        # url -> ShotThumb
+
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(10)
+            self.header = PageHeader("")
+            self.header.back.clicked.connect(win.go_back)
+            self.action = QPushButton("")
+            self.action.setObjectName("primary")
+            self.action.setMinimumHeight(40)
+            self.action.setMinimumWidth(130)
+            self.action.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.action.clicked.connect(self.do_action)
+            self.action.setStyleSheet(btn_qss())
+            self.header.add_action(self.action)
+            outer.addWidget(self.header)
+
+            sc = QScrollArea()
+            sc.setObjectName("scroll")
+            sc.setWidgetResizable(True)
+            sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            inner = QWidget()
+            iv = QVBoxLayout(inner)
+            iv.setContentsMargins(4, 2, 12, 12)
+            iv.setSpacing(18)
+
+            # ---- hero header: big icon + name/dev/version ----
+            top = QHBoxLayout()
+            top.setSpacing(20)
+            self.bigIcon = QLabel()
+            self.bigIcon.setFixedSize(104, 104)
+            self.bigIcon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            top.addWidget(self.bigIcon, 0, Qt.AlignmentFlag.AlignTop)
+            tcol = QVBoxLayout()
+            tcol.setSpacing(5)
+            self.name = QLabel("")
+            self.name.setObjectName("adname")
+            self.name.setWordWrap(True)
+            self.source = QLabel("")
+            self.source.setObjectName("adsource")
+            self.summary = QLabel("")
+            self.summary.setObjectName("adsummary")
+            self.summary.setWordWrap(True)
+            tcol.addWidget(self.name)
+            tcol.addWidget(self.source)
+            tcol.addWidget(self.summary)
+            top.addLayout(tcol, 1)
+            iv.addLayout(top)
+
+            # ---- screenshots strip ----
+            self.shotTitle = QLabel("Screenshots")
+            self.shotTitle.setObjectName("shelftitle")
+            iv.addWidget(self.shotTitle)
+            self.shotScroll = QScrollArea()
+            self.shotScroll.setObjectName("shelfscroll")
+            self.shotScroll.setWidgetResizable(True)
+            self.shotScroll.setFixedHeight(ShotThumb.H + 18)
+            self.shotScroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.shotScroll.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.shotRow = QWidget()
+            self.shotL = QHBoxLayout(self.shotRow)
+            self.shotL.setContentsMargins(2, 2, 2, 8)
+            self.shotL.setSpacing(12)
+            self.shotScroll.setWidget(self.shotRow)
+            iv.addWidget(self.shotScroll)
+
+            # ---- description ----
+            self.descTitle = QLabel("About")
+            self.descTitle.setObjectName("shelftitle")
+            iv.addWidget(self.descTitle)
+            self.desc = QLabel("")
+            self.desc.setObjectName("addesc")
+            self.desc.setWordWrap(True)
+            self.desc.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            iv.addWidget(self.desc)
+
+            # ---- metadata chips (version / size / license / votes) ----
+            self.metaRow = QWidget()
+            self.metaL = QHBoxLayout(self.metaRow)
+            self.metaL.setContentsMargins(0, 0, 0, 0)
+            self.metaL.setSpacing(8)
+            iv.addWidget(self.metaRow)
+
+            # ---- category chips ----
+            self.catRow = QWidget()
+            self.catL = QHBoxLayout(self.catRow)
+            self.catL.setContentsMargins(0, 0, 0, 0)
+            self.catL.setSpacing(8)
+            iv.addWidget(self.catRow)
+
+            iv.addStretch(1)
+            sc.setWidget(inner)
+            outer.addWidget(sc, 1)
+            self.setStyleSheet(detail_page_qss())
+
+        def focus_default(self):
+            self.action.setFocus()
+
+        def _clear_layout(self, lay):
+            while lay.count():
+                w = lay.takeAt(0).widget()
+                if w:
+                    w.deleteLater()
+
+        def show_app(self, it):
+            """Populate the page for `it` and kick off async description +
+            screenshot loads. Safe to call repeatedly (re-uses cached data)."""
+            self.item = dict(it)
+            name = it.get("name", it.get("pkg", ""))
+            self.header.title.setText(name)
+            self.header.set_can_back(self.win.router.can_back())
+            self.bigIcon.setPixmap(make_icon(it).pixmap(QSize(104, 104)))
+            self.name.setText(name)
+            srcname = {"aur": "AUR", "flatpak": "Flatpak"}.get(
+                it.get("src"), "Official repository")
+            ver = it.get("version", "")
+            self.source.setText(srcname + ("  ·  v" + ver if ver else ""))
+            self.summary.setText(it.get("summary", "") or "")
+            self.desc.setText("Loading description…")
+            self._refresh_action()
+
+            # reset screenshot strip to a single placeholder while we load
+            self._clear_layout(self.shotL)
+            self._shot_slots = {}
+            self.shotTitle.show()
+            self.shotScroll.show()
+            self._shot_msg = ShotThumb()
+            self.shotL.addWidget(self._shot_msg)
+            self.shotL.addStretch(1)
+
+            self._clear_layout(self.metaL)
+            self._clear_layout(self.catL)
+            for c in it.get("cats", []) or []:
+                self.catL.addWidget(Chip(c))
+            self.catL.addStretch(1)
+
+            # async: pacman/AUR info (size/license/version) for the meta row
+            self._iw = Worker(pkg_info, it.get("pkg", it["name"]),
+                              it.get("src", "repo"))
+            self._iw.done.connect(self._got_info)
+            self._iw.start()
+            # async: AppStream rich data (long description + screenshot URLs)
+            self._dw = Worker(appstream_details, it.get("pkg", it["name"]))
+            self._dw.done.connect(self._got_details)
+            self._dw.start()
+
+        def _refresh_action(self):
+            it = self.item or {}
+            installed = bool(it.get("installed"))
+            if installed:
+                self.action.setText("Remove")
+                self.action.setObjectName("danger")
+            else:
+                self.action.setText("Install")
+                self.action.setObjectName("primary")
+            self.action.setStyleSheet(btn_qss())
+
+        def _got_info(self, info):
+            if not isinstance(info, dict) or "_error" in info:
+                return
+            it = self.item or {}
+            chips = []
+            ver = info.get("Version") or it.get("version")
+            if ver:
+                chips.append("v" + ver)
+                self.source.setText(self.source.text().split("·")[0].rstrip()
+                                    + "  ·  v" + ver)
+            for label, key in (("Size", "Installed Size"),
+                               ("Download", "Download Size"),
+                               ("License", "License")):
+                v = info.get(key)
+                if v and v != "None":
+                    chips.append("%s: %s" % (label, v))
+            if it.get("votes"):
+                chips.append("★ %d votes" % it["votes"])
+            if it.get("popularity"):
+                chips.append("▲ %.1f popularity" % it["popularity"])
+            self._clear_layout(self.metaL)
+            for c in chips:
+                self.metaL.addWidget(Chip(c))
+            self.metaL.addStretch(1)
+            # if AppStream gave no long description, fall back to pacman's
+            if self.desc.text() in ("Loading description…", ""):
+                d = info.get("Description") or it.get("summary") or ""
+                if d:
+                    self.desc.setText(d)
+
+        def _got_details(self, det):
+            if not isinstance(det, dict) or "_error" in det:
+                det = {}
+            it = self.item or {}
+            long_desc = det.get("description") or ""
+            if long_desc:
+                self.desc.setText(long_desc)
+            elif self.desc.text() == "Loading description…":
+                self.desc.setText(it.get("summary", "")
+                                  or "No description available.")
+            if det.get("license"):
+                self.metaL.insertWidget(0, Chip("License: " + det["license"]))
+            shots = det.get("screenshots") or []
+            self._load_shots(shots)
+
+        def _load_shots(self, urls):
+            self._clear_layout(self.shotL)
+            self._shot_slots = {}
+            if not urls:
+                # graceful degradation: no screenshots -> hide the strip, the
+                # big app icon already stands in at the top of the page.
+                self.shotTitle.hide()
+                self.shotScroll.hide()
+                return
+            self.shotTitle.show()
+            self.shotScroll.show()
+            self._shot_workers = []
+            for url in urls[:8]:
+                slot = ShotThumb()
+                self._shot_slots[url] = slot
+                self.shotL.addWidget(slot)
+                w = ImgWorker(url)
+                w.loaded.connect(self._shot_ready)
+                self._shot_workers.append(w)
+                w.start()
+            self.shotL.addStretch(1)
+
+        def _shot_ready(self, url, data):
+            slot = self._shot_slots.get(url)
+            if slot is None:
+                return
+            pm = QPixmap()
+            if data:
+                img = QImage.fromData(data)
+                if not img.isNull():
+                    pm = QPixmap.fromImage(img)
+            if pm.isNull():
+                # this screenshot failed -> drop the slot so no broken image
+                slot.hide()
+                slot.deleteLater()
+                self._shot_slots.pop(url, None)
+                if not any(s.isVisible() for s in self._shot_slots.values()) \
+                        and not self._shot_slots:
+                    self.shotTitle.hide()
+                    self.shotScroll.hide()
+                return
+            slot.set_pixmap(pm)
+
+        def do_action(self):
+            it = self.item
+            if not it:
+                return
+            if self.action.text() == "Remove":
+                self.win.run_txn("Removing %s" % it["name"],
+                                 cmd_remove(it), self._after)
+            else:
+                self.win.run_txn("Installing %s" % it["name"],
+                                 cmd_install(it), self._after)
+
+        def _after(self, ok):
+            if ok and self.item:
+                # flip installed state + refresh the action button in place
+                self.item["installed"] = not self.item.get("installed")
+                self._refresh_action()
+                self.win.refresh_lists()
+
+    class SourcesPage(QWidget):
+        """Add / enable / disable / remove repositories (catalogs)."""
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self.working = None
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(10)
+
+            self.header = PageHeader("Software Sources")
+            self.header.back.clicked.connect(win.go_back)
+            self.status = QLabel("")
+            self.status.setObjectName("dmeta")
+            self.applyBtn = QPushButton("Apply Changes")
+            self.applyBtn.setObjectName("primary")
+            self.applyBtn.clicked.connect(self.apply)
+            self.applyBtn.setEnabled(False)
+            self.header.add_action(self.status)
+            self.header.add_action(self.applyBtn)
+            v.addWidget(self.header)
+
+            self.repoBox = QVBoxLayout()
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            sc.setObjectName("scroll")
+            inner = QWidget()
+            inner.setLayout(self.repoBox)
+            sc.setWidget(inner)
+            v.addWidget(sc, 1)
+
+            # add-repo form
+            form = QFrame()
+            form.setObjectName("detail")
+            fl = QVBoxLayout(form)
+            fl.setContentsMargins(14, 12, 14, 12)
+            fl.addWidget(QLabel("Add a repository (catalog)"))
+            r1 = QHBoxLayout()
+            self.fName = QLineEdit()
+            self.fName.setPlaceholderText("Name  e.g. chaotic-aur")
+            self.fKind = QComboBox()
+            self.fKind.addItem("Server URL", "server")
+            self.fKind.addItem("Include file", "include")
+            r1.addWidget(self.fName, 1)
+            r1.addWidget(self.fKind)
+            fl.addLayout(r1)
+            r2 = QHBoxLayout()
+            self.fValue = QLineEdit()
+            self.fValue.setPlaceholderText("https://…/$repo/os/$arch   or   /etc/pacman.d/…-mirrorlist")
+            self.fSig = QComboBox()
+            for s in ["Default", "Optional TrustAll (unsigned)", "Never (unsigned)"]:
+                self.fSig.addItem(s)
+            r2.addWidget(self.fValue, 1)
+            r2.addWidget(self.fSig)
+            fl.addLayout(r2)
+            addBtn = QPushButton("Add repository")
+            addBtn.setObjectName("primary")
+            addBtn.clicked.connect(self.add_repo)
+            fl.addWidget(addBtn)
+            note = QLabel("Tip: signed third-party repos also need their key imported "
+                          "(pacman-key). Unsigned repos: pick a TrustAll/Never SigLevel.")
+            note.setObjectName("ddesc")
+            note.setWordWrap(True)
+            fl.addWidget(note)
+            v.addWidget(form)
+
+        def focus_default(self):
+            self.fName.setFocus()
+
+        def reload(self):
+            try:
+                self.working = open(PACCONF).read()
+            except Exception:
+                self.working = ""
+            self.applyBtn.setEnabled(False)
+            self.status.setText("")
+            self._render()
+
+        def _dirty(self):
+            self.applyBtn.setEnabled(True)
+            self.status.setText("Unsaved changes")
+
+        def _render(self):
+            while self.repoBox.count():
+                w = self.repoBox.takeAt(0).widget()
+                if w:
+                    w.deleteLater()
+            for r in read_repos(self.working):
+                self.repoBox.addWidget(self._row(r))
+            self.repoBox.addStretch(1)
+
+        def _row(self, r):
+            row = QFrame()
+            row.setObjectName("reporow")
+            h = QHBoxLayout(row)
+            h.setContentsMargins(12, 8, 12, 8)
+            chk = QCheckBox()
+            chk.setChecked(r["enabled"])
+            protected = r["name"] in ("core", "extra", "multilib")
+            chk.setEnabled(not protected)
+            chk.stateChanged.connect(lambda st, n=r["name"]: self._toggle(n, st))
+            lbl = QLabel("<b>%s</b><br><span style='color:#8aa'>%s</span>"
+                         % (r["name"], (r["server"] or r["include"] or "")[:80]))
+            rm = QPushButton("Remove")
+            rm.setObjectName("danger" if not protected else "")
+            rm.setEnabled(not protected)
+            rm.clicked.connect(lambda _, n=r["name"]: self._remove(n))
+            h.addWidget(chk)
+            h.addWidget(lbl, 1)
+            h.addWidget(rm)
+            row.setStyleSheet("#reporow{ background:#0e1117; border:1px solid rgba(255,255,255,0.08);"
+                              "border-radius:10px; } QLabel{ color:#dfe9eb; }" + btn_qss())
+            return row
+
+        def _toggle(self, name, state):
+            from PyQt6.QtCore import Qt as _Qt
+            enable = state == _Qt.CheckState.Checked.value
+            self.working = _edit_block(self.working, name, "enable" if enable else "disable")
+            self._dirty()
+
+        def _remove(self, name):
+            self.working = _edit_block(self.working, name, "remove")
+            self._dirty()
+            self._render()
+
+        def add_repo(self):
+            name = self.fName.text().strip()
+            value = self.fValue.text().strip()
+            if not name or not value:
+                self.status.setText("Name and value are required")
+                return
+            sig = {"Default": "", "Optional TrustAll (unsigned)": "Optional TrustAll",
+                   "Never (unsigned)": "Never"}.get(self.fSig.currentText(), "")
+            self.working = conf_add(self.working, name, self.fKind.currentData(), value, sig)
+            self.fName.clear()
+            self.fValue.clear()
+            self._dirty()
+            self._render()
+
+        def apply(self):
+            tmp = "/tmp/pacman.conf.hash-%d" % os.getpid()
+            with open(tmp, "w") as f:
+                f.write(self.working)
+            self.win.run_txn("Saving repositories & refreshing databases",
+                             ["pkexec", SCRIPT, "_writeconf", tmp], self._applied)
+
+        def _applied(self, ok):
+            if ok:
+                self.reload()
+
+    class Store(QWidget):
+        def __init__(self):
+            super().__init__(None, Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setWindowTitle("HasH Software Center")
+            scr = (QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()).geometry()
+            W = max(900, int(scr.height() * 0.92))
+            H = max(580, int(scr.height() * 0.70))
+            self.resize(W, H)
+            self.move(scr.center().x() - W // 2, scr.center().y() - H // 2)
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(1, 1, 1, 1)
+            root.setSpacing(0)
+            root.addWidget(TitleBar(self))
+
+            body = QHBoxLayout()
+            body.setContentsMargins(14, 4, 14, 14)
+            body.setSpacing(14)
+
+            side = QVBoxLayout()
+            side.setSpacing(6)
+            self.nav = {}                    # key -> sidebar button
+            self.router = PageRouter()
+            self.router.navigated.connect(self._on_navigated)
+            specs = [("discover", "Discover", "system-software-install"),
+                     ("updates", "Updates", "system-software-update"),
+                     ("installed", "Installed", "applications-other"),
+                     ("sources", "Sources", "folder-remote")]
+            self._order = [s[0] for s in specs]
+            for key, label, icon in specs:
+                b = QPushButton("  " + label)
+                b.setCheckable(True)
+                b.setObjectName("nav")
+                b.setIcon(QIcon.fromTheme(icon))
+                b.setIconSize(QSize(20, 20))
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(lambda _, k=key: self.go(k))
+                side.addWidget(b)
+                self.nav[key] = b
+                pg = SourcesPage(self) if key == "sources" else Page(self, key)
+                self.router.add_page(key, pg)
+            # The App Detail page has no sidebar entry; you reach it by clicking
+            # an app and leave it via the header Back button / Escape.
+            self.appPage = AppDetailPage(self)
+            self.router.add_page("app", self.appPage)
+            side.addStretch(1)
+            self.statusLbl = QLabel("")
+            self.statusLbl.setObjectName("brand")
+            side.addWidget(self.statusLbl)
+            # explicit, always-visible exit control so the user is never stuck
+            exitb = QPushButton("  ⏻  Exit")
+            exitb.setObjectName("exitbtn")
+            exitb.setIcon(QIcon.fromTheme("application-exit"))
+            exitb.setIconSize(QSize(18, 18))
+            exitb.setCursor(Qt.CursorShape.PointingHandCursor)
+            exitb.clicked.connect(self.close)
+            side.addWidget(exitb)
+            brand = QLabel("HasH-Arch")
+            brand.setObjectName("brand")
+            side.addWidget(brand)
+            sw = QWidget()
+            sw.setObjectName("sidebar")
+            sw.setLayout(side)
+            sw.setFixedWidth(184)
+            body.addWidget(sw)
+            body.addWidget(self.router, 1)
+            root.addLayout(body, 1)
+            self.setStyleSheet(app_qss())
+
+            # Esc = step out / go back / close (never stuck)
+            QShortcut(QKeySequence(Qt.Key.Key_Escape), self,
+                      activated=self.on_escape)
+
+            start_key = self._order[start_page] if 0 <= start_page < len(self._order) \
+                else "discover"
+            self.go(start_key)
+
+        def status(self, txt):
+            self.statusLbl.setText(txt)
+
+        def go(self, key):
+            self.router.navigate(key)
+
+        def open_app(self, it):
+            """Populate + navigate to the App Detail page (records history so
+            Back returns to wherever the click came from)."""
+            self.appPage.show_app(it)
+            self.router.navigate("app")
+
+        def refresh_lists(self):
+            """After an install/remove from the App Detail page, refresh the
+            catalog/installed pages so their installed-ticks stay correct."""
+            for key in ("discover", "installed"):
+                pg = self.router.widget(key)
+                if pg is not None and getattr(pg, "items", None):
+                    pg.reload()
+
+        def go_back(self):
+            self.router.back()
+
+        def on_escape(self):
+            # if a search field has focus, drop focus to the list first
+            fw = QApplication.focusWidget()
+            if isinstance(fw, QLineEdit) and fw.text():
+                fw.clear()
+                return
+            # on Discover, Esc from the browse view returns to the storefront
+            pg = self.router.widget(self.router.current_key())
+            if getattr(pg, "mode", None) == "discover" and \
+                    getattr(pg, "disc_stack", None) and \
+                    pg.disc_stack.currentIndex() == 1:
+                pg.go_storefront()
+                return
+            if self.router.can_back():
+                self.router.back()
+            else:
+                self.close()
+
+        def _on_navigated(self, key):
+            for k, b in self.nav.items():
+                b.setChecked(k == key)
+            pg = self.router.widget(key)
+            if pg is None:
+                return
+            if hasattr(pg, "header"):
+                pg.header.set_can_back(self.router.can_back())
+            if isinstance(pg, SourcesPage):
+                if pg.working is None:
+                    pg.reload()
+            elif isinstance(pg, AppDetailPage):
+                pass            # already populated by open_app(); nothing to load
+            elif not getattr(pg, "items", None):
+                pg.reload()
+            # keep the Discover Back button correct for its storefront/browse state
+            if getattr(pg, "mode", None) == "discover" and \
+                    hasattr(pg, "_sync_disc_view"):
+                pg._sync_disc_view()
+            if hasattr(pg, "focus_default"):
+                QTimer.singleShot(0, pg.focus_default)
+
+        def run_txn(self, title, argv, on_done):
+            self._tx = Transaction(self, title, argv, tx_env())
+            self._tx.finishedOk.connect(on_done)
+            g = self.geometry()
+            self._tx.move(g.center().x() - 330, g.center().y() - 230)
+            self._tx.show()
+
+        def paintEvent(self, _e):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1, 20, 20)
+            p.fillPath(path, QColor(0x12, 0x14, 0x1a))
+            p.setPen(QColor(255, 255, 255, 30))
+            p.drawPath(path)
+
+    def detail_page_qss():
+        return f"""
+            QLabel#adname{{ color:#fff; font-size:28px; font-weight:800; }}
+            QLabel#adsource{{ color:{ACCENT}; font-size:13px; font-weight:600; }}
+            QLabel#adsummary{{ color:#bcd3d8; font-size:15px; }}
+            QLabel#addesc{{ color:#aeb9bc; font-size:13px; line-height:150%; }}
+        """ + btn_qss()
+
+    def app_qss():
+        return f"""
+            #sidebar{{ background:rgba(255,255,255,0.03); border-radius:14px; }}
+            #apptitle{{ color:#fff; font-size:15px; font-weight:700; }}
+            QPushButton#winbtn{{ background:transparent; color:#9fb0b4; border:none;
+                border-radius:8px; font-size:14px; }}
+            QPushButton#winbtn:hover{{ background:rgba(255,255,255,0.12); color:#fff; }}
+            QPushButton#nav{{ text-align:left; background:transparent; color:#c6d2d5;
+                border:none; border-radius:10px; padding:10px 12px; font-size:14px; }}
+            QPushButton#nav:hover{{ background:rgba(255,255,255,0.07); }}
+            QPushButton#nav:checked{{ background:{ACCENT}; color:#06222a; font-weight:700; }}
+            QPushButton#exitbtn{{ text-align:left; background:rgba(224,108,117,0.10);
+                color:#e6a3a9; border:1px solid rgba(224,108,117,0.25);
+                border-radius:10px; padding:9px 12px; font-size:13px; font-weight:600; }}
+            QPushButton#exitbtn:hover{{ background:{DANGER}; color:#2a0a0c;
+                border:1px solid {DANGER}; }}
+            #pagehead{{ background:transparent; }}
+            #pagetitle{{ color:#fff; font-size:20px; font-weight:800; }}
+            QPushButton#backbtn{{ background:rgba(255,255,255,0.06); color:#cfe9ee;
+                border:1px solid rgba(255,255,255,0.12); border-radius:10px;
+                padding:7px 14px; font-size:13px; font-weight:600; }}
+            QPushButton#backbtn:hover{{ background:rgba(255,255,255,0.14); color:#fff; }}
+            QPushButton#backbtn:disabled{{ color:#5c686b;
+                background:rgba(255,255,255,0.03);
+                border:1px solid rgba(255,255,255,0.05); }}
+            #brand{{ color:rgba(255,255,255,0.30); font-size:11px;
+                qproperty-alignment:'AlignCenter'; padding:4px; }}
+            QLineEdit,QComboBox{{ background:#0e1117; color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.12); border-radius:10px;
+                padding:7px 11px; font-size:13px; }}
+            QLineEdit:focus,QComboBox:focus{{ border:1px solid {ACCENT}; }}
+            QComboBox QAbstractItemView{{ background:#14161d; color:#e8eef0;
+                selection-background-color:{ACCENT}; selection-color:#06222a; }}
+            QCheckBox{{ color:#c6d2d5; font-size:12px; }}
+            #countlbl{{ color:#fff; font-size:16px; font-weight:700; }}
+            QListWidget#pkglist{{ background:#0d1016; color:#dfe9eb;
+                border:1px solid rgba(255,255,255,0.07); border-radius:14px;
+                padding:6px; outline:none; }}
+            QListWidget#pkglist::item{{ padding:0; border:none; }}
+            #detail{{ background:#0d1016; border:1px solid rgba(255,255,255,0.07);
+                border-radius:14px; }}
+            #detail QLabel{{ color:#dfe9eb; }}
+            #sep{{ background:rgba(255,255,255,0.08); border:none; }}
+            #dname{{ color:#fff; font-size:22px; font-weight:800; }}
+            #dmeta{{ color:{ACCENT}; font-size:12px; font-weight:600; }}
+            #ddesc{{ color:#aeb9bc; font-size:13px; line-height:140%; }}
+            #detail QPushButton{{ font-size:14px; font-weight:600; border-radius:11px; }}
+            QScrollArea#scroll{{ background:transparent; border:none; }}
+            QScrollArea#scroll > QWidget > QWidget{{ background:transparent; }}
+            QListWidget#catlist{{ background:#0d1016; color:#cfd9db;
+                border:1px solid rgba(255,255,255,0.07); border-radius:14px;
+                padding:6px; outline:none; font-size:13px; }}
+            QListWidget#catlist::item{{ padding:8px 10px; border-radius:9px; }}
+            QListWidget#catlist::item:hover{{ background:rgba(255,255,255,0.06); }}
+            QListWidget#catlist::item:selected{{ background:{ACCENT};
+                color:#06222a; font-weight:700; }}
+            QLabel#shelftitle{{ color:#fff; font-size:17px; font-weight:800;
+                padding-left:2px; }}
+            QScrollArea#shelfscroll{{ background:transparent; border:none; }}
+            QScrollArea#shelfscroll > QWidget > QWidget{{ background:transparent; }}
+            QScrollBar:vertical{{ background:transparent; width:10px; }}
+            QScrollBar::handle:vertical{{ background:rgba(255,255,255,0.18);
+                border-radius:5px; min-height:30px; }}
+            QScrollBar:horizontal{{ background:transparent; height:9px; }}
+            QScrollBar::handle:horizontal{{ background:rgba(255,255,255,0.16);
+                border-radius:4px; min-width:40px; }}
+            QScrollBar::add-line,QScrollBar::sub-line{{ height:0; width:0; }}
+        """ + btn_qss()
+
+    # QFrame is referenced in SourcesPage form; ensure imported name available
+    from PyQt6.QtWidgets import QFrame  # noqa: F811
+
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("HasH Software Center")
+    w = Store()
+    w.show()
+    if shot:
+        def _grab():
+            if shot_app:
+                # drive a real navigation into the App Detail page to prove it
+                cat = get_catalog()
+                it = next((dict(a) for a in cat if a["pkg"] == shot_app), None)
+                if it is None:
+                    it = {"name": shot_app, "pkg": shot_app, "src": "repo",
+                          "summary": "", "cats": []}
+                w.open_app(it)
+                # give async screenshots time to download + render
+                QTimer.singleShot(7000,
+                                  lambda: (w.grab().save(shot), os._exit(0)))
+                return
+            pg = w.router.stack.currentWidget()
+            try:
+                if hasattr(pg, "list") and pg.list.count():
+                    pg.list.setCurrentRow(0)
+            except Exception:
+                pass
+            QTimer.singleShot(600, lambda: (w.grab().save(shot), os._exit(0)))
+        QTimer.singleShot(3500, _grab)
+    return app.exec()
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] == "backend":
+        return cli(a[1:])
+    if a and a[0] == "_writeconf":
+        return writeconf(a[1] if len(a) > 1 else "")
+    start = 0
+    if "--updates" in a:
+        start = 1
+    elif "--installed" in a:
+        start = 2
+    elif "--sources" in a:
+        start = 3
+    shot = None
+    if "--shot" in a:
+        i = a.index("--shot")
+        shot = a[i + 1] if i + 1 < len(a) else "/tmp/hash-store-shot.png"
+    shot_app = None
+    if "--shot-app" in a:
+        i = a.index("--shot-app")
+        shot_app = a[i + 1] if i + 1 < len(a) else None
+    return gui(start, shot, shot_app)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

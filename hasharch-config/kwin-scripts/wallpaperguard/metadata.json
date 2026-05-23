@@ -1,0 +1,13 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Id": "wallpaperguard",
+        "Name": "Wallpaper Fullscreen Guard",
+        "Description": "Pauses the animated wallpaper while a fullscreen app is active",
+        "Authors": [ { "Name": "hash" } ],
+        "License": "GPLv2+",
+        "EnabledByDefault": true
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

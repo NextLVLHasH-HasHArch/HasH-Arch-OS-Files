@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=HasH Disks
+GenericName=Disk & Mount Manager
+Comment=Mount drives, inspect health, format & partition, relabel, mount network shares
+Exec=hash-disks
+Icon=hash-disks
+Terminal=false
+Categories=Settings;System;
+Keywords=disk;drive;mount;fstab;usb;partition;ntfs;udisks;storage;format;smart;health;samba;nfs;
+StartupNotify=true

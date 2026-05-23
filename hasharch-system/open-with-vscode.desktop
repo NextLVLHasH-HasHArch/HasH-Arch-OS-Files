@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Open with VS Code
+Icon=visual-studio-code
+MimeType=inode/directory;
+Actions=openFolderVSCode;
+X-KDE-Priority=TopLevel
+NoDisplay=true
+
+[Desktop Action openFolderVSCode]
+Name=Open with VS Code
+Icon=visual-studio-code
+Exec=/usr/bin/code "%f"

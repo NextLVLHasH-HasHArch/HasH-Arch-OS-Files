@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""HasH-Arch Universal Uninstaller.
+
+Pick an installed program (pacman / flatpak / manual) and remove it, after
+mapping its files — including programs NOT managed by a package manager. Uses
+kdialog for UI and pkexec for privileged removals. Files owned by *other*
+pacman packages are never deleted (pacman -Qo guard).
+
+Subcommands (for a future GUI): list | map <id> | remove <id>
+No args  -> interactive kdialog flow.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+APP_DIRS = ["/usr/share/applications", "/usr/local/share/applications",
+            os.path.join(HOME, ".local/share/applications"),
+            "/var/lib/flatpak/exports/share/applications"]
+MANUAL_PREFIXES = ["/opt", "/usr/local", os.path.join(HOME, ".local"),
+                   os.path.join(HOME, "Applications")]
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+# ---------- discovery ----------
+def list_programs():
+    progs = []
+    # pacman explicit packages
+    r = run(["pacman", "-Qeq"])
+    for p in r.stdout.split():
+        # skip the hundreds of BlackArch tool packages from the picker noise? keep them.
+        progs.append({"id": "pacman:" + p, "name": p, "source": "pacman"})
+    # flatpak apps
+    r = run(["flatpak", "list", "--app", "--columns=application,name"])
+    for ln in r.stdout.splitlines():
+        if "\t" in ln:
+            appid, name = ln.split("\t", 1)
+            progs.append({"id": "flatpak:" + appid.strip(),
+                          "name": name.strip() + " (flatpak)", "source": "flatpak"})
+    # manual / from-source apps: .desktop whose Exec binary lives outside pacman
+    seen = set()
+    for d in APP_DIRS:
+        for f in _glob_desktop(d):
+            fields = _parse_desktop(f)
+            if fields.get("NoDisplay", "").lower() == "true":
+                continue
+            exe = _exec_binary(fields.get("Exec", ""))
+            if not exe or not os.path.isabs(exe):
+                continue
+            if any(exe.startswith(p + "/") for p in MANUAL_PREFIXES) and not _pacman_owns(exe):
+                if exe in seen:
+                    continue
+                seen.add(exe)
+                progs.append({"id": "manual:" + f, "name": fields.get("Name", os.path.basename(exe)) + " (manual)",
+                              "source": "manual", "exe": exe, "desktop": f})
+    return progs
+
+
+def _glob_desktop(d):
+    import glob
+    return sorted(glob.glob(os.path.join(d, "*.desktop"))) if os.path.isdir(d) else []
+
+
+def _parse_desktop(path):
+    f = {}
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            ine = False
+            for ln in fh:
+                ln = ln.rstrip("\n")
+                if ln.startswith("["):
+                    ine = ln.strip() == "[Desktop Entry]"; continue
+                if ine and "=" in ln:
+                    k, v = ln.split("=", 1); f.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+    return f
+
+
+def _exec_binary(exec_line):
+    import re
+    exec_line = re.sub(r"%[uUfFickdDnNvm]", "", exec_line).strip()
+    parts = shlex.split(exec_line) if exec_line else []
+    return parts[0] if parts else ""
+
+
+def _pacman_owns(path):
+    return run(["pacman", "-Qoq", path]).returncode == 0
+
+
+# ---------- map files ----------
+def map_files(pid):
+    kind, ref = pid.split(":", 1)
+    if kind == "pacman":
+        files = [l for l in run(["pacman", "-Qlq", ref]).stdout.splitlines()
+                 if l and not l.endswith("/")]
+        return {"id": pid, "source": "pacman", "files": files}
+    if kind == "flatpak":
+        data = os.path.join(HOME, ".var/app", ref)
+        files = [data] if os.path.isdir(data) else []
+        return {"id": pid, "source": "flatpak", "files": files}
+    # manual: heuristic discovery around the binary + the app name
+    fields = _parse_desktop(ref)
+    exe = _exec_binary(fields.get("Exec", ""))
+    name = (fields.get("Name", "") or os.path.basename(exe)).split()[0].lower()
+    cands = set()
+    if exe:
+        cands.add(exe)
+        # if it lives in a self-contained prefix (/opt/foo, ~/Apps/foo) take the tree
+        for p in MANUAL_PREFIXES:
+            if exe.startswith(p + "/"):
+                top = os.path.join(p, exe[len(p) + 1:].split("/")[0])
+                if os.path.isdir(top) and top not in ("/usr/local",):
+                    cands.add(top)
+    cands.add(ref)  # the .desktop itself
+    # name-keyed standard locations
+    import glob
+    pats = [
+        f"{HOME}/.local/share/applications/*{name}*.desktop",
+        f"{HOME}/.local/share/{name}", f"{HOME}/.config/{name}", f"{HOME}/.cache/{name}",
+        f"{HOME}/.{name}", f"/usr/local/share/{name}", f"/usr/local/bin/{name}",
+        f"{HOME}/.local/bin/{name}", f"{HOME}/.config/autostart/*{name}*.desktop",
+        f"/usr/share/icons/hicolor/*/apps/*{name}*", f"{HOME}/.local/share/icons/hicolor/*/apps/*{name}*",
+    ]
+    for pat in pats:
+        for hit in glob.glob(pat):
+            if os.path.exists(hit) and not _pacman_owns(hit):
+                cands.add(hit)
+    return {"id": pid, "source": "manual", "files": sorted(cands)}
+
+
+# ---------- remove ----------
+def remove(pid, files):
+    kind, ref = pid.split(":", 1)
+    if kind == "pacman":
+        return run(["pkexec", "pacman", "-Rns", "--noconfirm", ref])
+    if kind == "flatpak":
+        return run(["flatpak", "uninstall", "-y", ref])
+    # manual: delete mapped files (root paths via pkexec)
+    user_files = [f for f in files if f.startswith(HOME)]
+    sys_files = [f for f in files if not f.startswith(HOME)]
+    for f in user_files:
+        run(["rm", "-rf", f])
+    if sys_files:
+        return run(["pkexec", "rm", "-rf", *sys_files])
+    return subprocess.CompletedProcess([], 0, "", "")
+
+
+# ---------- kdialog UI ----------
+def kdialog(*args):
+    return run(["kdialog", *args])
+
+
+def interactive():
+    progs = list_programs()
+    progs.sort(key=lambda p: p["name"].lower())
+    menu = []
+    for i, p in enumerate(progs):
+        menu += [str(i), p["name"]]
+    sel = kdialog("--title", "HasH Uninstaller", "--menu",
+                  "Choose a program to uninstall:", *menu)
+    if sel.returncode != 0 or not sel.stdout.strip():
+        return
+    p = progs[int(sel.stdout.strip())]
+    m = map_files(p["id"])
+    files = m["files"]
+    summary = "Source: %s\nName: %s\n\n%d item(s) to remove:\n\n%s" % (
+        p["source"], p["name"], len(files), "\n".join(files[:200]) or "(package manager will resolve)")
+    # show the file map + confirm
+    tmp = "/tmp/hash-uninstall-map.txt"
+    with open(tmp, "w") as fh:
+        fh.write(summary)
+    ok = kdialog("--title", "Review files — %s" % p["name"],
+                 "--yesno", summary if len(summary) < 1500 else
+                 "Source: %s\nName: %s\n%d items.\n\nProceed to uninstall?\n(full list: %s)"
+                 % (p["source"], p["name"], len(files), tmp))
+    if ok.returncode != 0:
+        return
+    res = remove(p["id"], files)
+    if res.returncode == 0:
+        kdialog("--title", "Done", "--msgbox", "Uninstalled: %s" % p["name"])
+    else:
+        kdialog("--title", "Failed", "--error",
+                "Could not fully remove %s\n\n%s" % (p["name"], (res.stderr or "")[:1000]))
+
+
+def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "list":
+        print(json.dumps(list_programs(), indent=2))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "map":
+        print(json.dumps(map_files(sys.argv[2]), indent=2))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "remove":
+        r = remove(sys.argv[2], map_files(sys.argv[2])["files"])
+        sys.exit(r.returncode)
+    else:
+        interactive()
+
+
+if __name__ == "__main__":
+    main()

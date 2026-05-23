@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Service
+Name=HasH Search
+Comment=Search the web & news from HasH Runner
+Icon=hash-search
+X-KDE-ServiceTypes=Plasma/Runner
+X-Plasma-API=DBus
+X-Plasma-DBusRunner-Service=com.hash.search
+X-Plasma-DBusRunner-Path=/com/hash/search
+X-Plasma-Runner-Unique=true
+TryExec=hash-search-runner

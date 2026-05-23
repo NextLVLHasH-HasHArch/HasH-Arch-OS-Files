@@ -1,0 +1,8 @@
+[General]
+ColorScheme=HasH
+
+[Icons]
+Theme=HasH-Icons
+
+[KDE]
+widgetStyle=kvantum-dark

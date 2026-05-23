@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#C50ED2"/>
+      <stop offset="1" stop-color="#71F79F"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#23232f"/>
+      <stop offset="1" stop-color="#13131b"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="30" fill="url(#bg)" stroke="url(#brand)" stroke-width="2.5"/>
+  <!-- soft glow underlay (separate blurred copy, kept off the crisp glyph) -->
+  <g stroke="url(#brand)" stroke-width="13" stroke-linecap="round" opacity="0.35"
+     filter="url(#blur)">
+    <line x1="55" y1="34" x2="47" y2="94"/>
+    <line x1="83" y1="34" x2="75" y2="94"/>
+    <line x1="36" y1="55" x2="92" y2="51"/>
+    <line x1="34" y1="77" x2="90" y2="73"/>
+  </g>
+  <filter id="blur" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="3"/></filter>
+  <!-- crisp # : two slanted verticals + two horizontals, rounded caps -->
+  <g stroke="url(#brand)" stroke-width="11" stroke-linecap="round">
+    <line x1="55" y1="34" x2="47" y2="94"/>
+    <line x1="83" y1="34" x2="75" y2="94"/>
+    <line x1="36" y1="55" x2="92" y2="51"/>
+    <line x1="34" y1="77" x2="90" y2="73"/>
+  </g>
+</svg>

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=HasH Cloud Accounts (first login)
+Comment=Set up your cloud storage on first login; opens once if nothing is configured, then removes itself
+Exec=hash-cloud-accounts --autostart
+Icon=hash-accounts
+X-KDE-autostart-phase=2
+OnlyShowIn=KDE;
+NoDisplay=true

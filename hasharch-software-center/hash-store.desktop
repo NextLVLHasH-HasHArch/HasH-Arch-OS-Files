@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=HasH App Manager
+GenericName=Software Centre
+Comment=Browse, install and update HasH-Arch apps and security tools
+Exec=hash-store
+Icon=hash-store
+Terminal=false
+Categories=System;PackageManager;Settings;
+Keywords=store;software;apps;install;packages;manager;centre;center;
+StartupNotify=true

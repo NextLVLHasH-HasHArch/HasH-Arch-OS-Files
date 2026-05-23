@@ -1,0 +1,172 @@
+// HasH-Arch: Sweet-Qt6 Login.qml patched for the 2FA verification-code field.
+// Install over /usr/share/sddm/themes/Sweet-Qt6/Login.qml (back up the original first).
+// The code field reuses the same `Input` component as the password (identical
+// styling), slides in when the daemon relays a PAM prompt (sddm.promptRequested),
+// and auto-submits the code via sddm.respondToPrompt().
+import "components"
+
+import QtQuick
+import QtQuick.Layouts
+import QtQuick.Controls
+
+import org.kde.plasma.components as PlasmaComponents
+
+SessionManagementScreen {
+    id: root
+    property Item mainPasswordBox: passwordBox
+
+    property bool showUsernamePrompt: !showUserList
+
+    property string lastUserName
+    property bool loginScreenUiVisible: false
+
+    // HasH 2FA: true once the daemon relays a verification-code prompt
+    property bool twoFactorActive: false
+
+    //the y position that should be ensured visible when the on screen keyboard is visible
+    property int visibleBoundary: mapFromItem(loginButton, 0, 0).y
+    onHeightChanged: visibleBoundary = mapFromItem(loginButton, 0, 0).y + loginButton.height + units.smallSpacing
+
+    signal loginRequest(string username, string password)
+
+    onShowUsernamePromptChanged: {
+        if (!showUsernamePrompt) {
+            lastUserName = ""
+        }
+    }
+
+    function startLogin() {
+        var username = showUsernamePrompt ? userNameInput.text : userList.selectedUser
+        var password = passwordBox.text
+        loginButton.forceActiveFocus();
+        loginRequest(username, password);
+    }
+
+    Input {
+        id: userNameInput
+        Layout.fillWidth: true
+        text: lastUserName
+        visible: showUsernamePrompt && !root.twoFactorActive
+        focus: showUsernamePrompt && !lastUserName
+        Layout.topMargin: 10
+        Layout.bottomMargin: 10
+        placeholderText: i18nd("plasma_lookandfeel_org.kde.lookandfeel", "Username")
+
+        onAccepted:
+            if (root.loginScreenUiVisible) {
+                passwordBox.forceActiveFocus()
+            }
+    }
+
+    Input {
+        id: passwordBox
+        placeholderText: i18nd("plasma_lookandfeel_org.kde.lookandfeel", "Password")
+        focus: !showUsernamePrompt || lastUserName
+        echoMode: TextInput.Password
+        visible: !root.twoFactorActive
+
+        Layout.fillWidth: true
+
+        onAccepted: {
+            if (root.loginScreenUiVisible) {
+                startLogin();
+            }
+        }
+
+        Keys.onEscapePressed: {
+            mainStack.currentItem.forceActiveFocus();
+        }
+
+        Keys.onPressed: {
+            if (event.key == Qt.Key_Left && !text) {
+                userList.decrementCurrentIndex();
+                event.accepted = true
+            }
+            if (event.key == Qt.Key_Right && !text) {
+                userList.incrementCurrentIndex();
+                event.accepted = true
+            }
+        }
+
+        Connections {
+            target: sddm
+            onLoginFailed: {
+                root.twoFactorActive = false           // a failure resets back to the password
+                passwordBox.selectAll()
+                passwordBox.forceActiveFocus()
+            }
+        }
+    }
+
+    // HasH 2FA: verification-code field — same Input styling, slides in on demand,
+    // auto-submits once the full code is entered.
+    Input {
+        id: codeBox
+        Layout.fillWidth: true
+        visible: root.twoFactorActive
+        echoMode: TextInput.Password
+        placeholderText: i18nd("plasma_lookandfeel_org.kde.lookandfeel", "Verification code")
+        property int codeLen: 6
+
+        opacity: root.twoFactorActive ? 1.0 : 0.0
+        Behavior on opacity { NumberAnimation { duration: 180 } }
+        transform: Translate {
+            x: root.twoFactorActive ? 0 : 70
+            Behavior on x { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
+        }
+
+        onAccepted: if (text.length) sddm.respondToPrompt(text)
+        onTextChanged: if (text.length >= codeLen) sddm.respondToPrompt(text)   // auto-submit
+    }
+
+    PlasmaComponents.Button {
+        id: loginButton
+        text: root.twoFactorActive
+              ? i18nd("plasma_lookandfeel_org.kde.lookandfeel", "Verify")
+              : i18nd("plasma_lookandfeel_org.kde.lookandfeel", "Log In")
+        enabled: root.twoFactorActive ? codeBox.text != "" : passwordBox.text != ""
+
+        Layout.topMargin: 20
+        Layout.fillWidth: true
+
+        font.pointSize: config.fontSize
+        font.family: config.font
+        opacity: enabled ? 1.0 : 0.7
+
+        contentItem: Text {
+            text: loginButton.text
+            font: loginButton.font
+            color: "#ffffff"
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+            elide: Text.ElideRight
+        }
+
+        background: Rectangle {
+            id: buttonBackground
+            height: parent.width
+            width: height / 9
+            radius: width / 2
+            rotation: -90
+            anchors.centerIn: parent
+
+            gradient: Gradient {
+                GradientStop { position: 0.0; color: "#F9D423" }
+                GradientStop { position: 0.33; color: "#FF4E50" }
+                GradientStop { position: 1.0; color: "#8A2387" }
+            }
+        }
+
+        onClicked: root.twoFactorActive ? sddm.respondToPrompt(codeBox.text) : startLogin();
+    }
+
+    // HasH 2FA: the daemon relays an extra PAM prompt -> slide to the code field
+    Connections {
+        target: sddm
+        function onPromptRequested(message, secret) {
+            codeBox.text = ""
+            root.twoFactorActive = true
+            codeBox.forceActiveFocus()
+        }
+    }
+}

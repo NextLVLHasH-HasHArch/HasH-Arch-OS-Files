@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch application dirs and refresh the All Apps catalog
+
+[Path]
+PathModified=/usr/share/applications
+PathModified=/home/hash/.local/share/applications
+PathModified=/var/lib/flatpak/exports/share/applications
+Unit=hash-allapps.service
+
+[Install]
+WantedBy=default.target

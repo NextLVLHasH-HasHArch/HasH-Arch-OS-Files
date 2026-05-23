@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=HasH theme (first login)
+Comment=Applies the HasH look-and-feel on first login, then removes itself
+Exec=hash-apply-theme
+Icon=preferences-desktop-theme-global
+X-KDE-autostart-phase=1
+OnlyShowIn=KDE;
+NoDisplay=true

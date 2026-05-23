@@ -1,0 +1,15 @@
+[SddmGreeterTheme]
+Name=HasH
+Description=HasH login theme — Breeze-based with the HasH look (matrixrain weather wallpaper, rounded magenta fields) and 2FA verification-code support.
+Author=HasH
+Copyright=(c) 2026 HasH; based on Breeze (c) 2014 David Edmundson, KDE Visual Design Group
+License=LGPL-2.0-or-later
+Type=sddm-theme
+Version=1.0
+Screenshot=preview.png
+MainScript=Main.qml
+ConfigFile=theme.conf
+TranslationsDirectory=translations
+Theme-Id=hash
+Theme-API=2.0
+QtVersion=6

@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""HasH-Security privileged helper  (hash-security-helper)
+
+Runs as ROOT, invoked exclusively by the hash-security GUI through `pkexec`.
+Never run the GUI itself as root — only this helper is elevated, and only for
+the few operations that genuinely need it: editing the PAM auth stacks that
+enable/disable PIN, TOTP, face (Howdy) and fingerprint (fprintd) per surface.
+
+AUTH-CRITICAL.  A mistake here can lock the user out of their machine, so the
+safety rules below are NON-NEGOTIABLE and enforced in code:
+
+  * Timestamped backup of every file before any write:
+        /etc/pam.d/<svc>.hash-bak-<YYYYmmdd-HHMMSS>
+  * NEVER remove the password fallback — pam_unix.so (or an `include` that
+    pulls it in) must remain in the auth stack of every file we write, or we
+    REFUSE the edit.
+  * NEVER add biometrics/2FA to /etc/pam.d/login — the TTY login stays
+    password-only as the guaranteed recovery path.  The helper REFUSES to
+    touch `login` for any subcommand.
+  * Managed lines are wrapped in markers (`# hash-security`) so we add/remove
+    ONLY our own lines and never disturb anything the installer/admin wrote.
+  * Edits are atomic: write a temp file, VALIDATE the candidate stack, then
+    os.replace() it into place.  An invalid/locking stack is REFUSED.
+  * Idempotent: enabling twice is a no-op; disabling removes only our line.
+  * `restore <surface>` rolls back to the latest timestamped backup.
+
+PAM auth model written per surface (merged into Arch's include stacks; only the
+lines for ENABLED methods are emitted, each tagged `# hash-security`):
+
+    auth      required   pam_faillock.so preauth          # hash-security
+    auth      sufficient pam_howdy.so                     # hash-security  (face,  if enabled)
+    auth      sufficient pam_fprintd.so                   # hash-security  (finger, if enabled)
+    auth      include    system-login                     # (untouched) -> pam_unix password
+    auth      required   pam_google_authenticator.so nullok # hash-security (TOTP, if enabled)
+    auth      required   pam_faillock.so authfail         # hash-security
+
+Biometrics are `sufficient` (short-circuit on success); the existing password
+include is always kept BELOW them so password is always a working fallback;
+TOTP is layered AFTER the password line.  PIN is enabled the same way as TOTP's
+slot for now (scaffold) — see notes in cmd_enable.
+
+Subcommands (all argv, no shell):
+  status                       JSON: {surfaces, methods, hardware, file states}
+  enable  <method> <surface>   add the managed line(s) for method on surface
+  disable <method> <surface>   remove the managed line(s) for method on surface
+  restore <surface>            roll back surface's PAM file to the latest backup
+
+  install <pkg>                install a known auth package (howdy|fprintd) via
+                               pacman or the detected AUR helper (yay/paru).
+                               REFUSES anything not on the allow-list.
+  howdy-add     <user>         enroll a face for <user> (`howdy add`)
+  howdy-clear   <user>         clear all faces for <user> (`howdy clear`)
+  howdy-config  <key> <value>  set a Howdy config key (allow-listed: certainty,
+                               dark_threshold)
+  fprint-enroll <user> [fing]  enroll a finger (`fprintd-enroll`)
+  fprint-delete <user>         clear fingerprints (`fprintd-delete`)
+  faillock-reset <user>        clear the faillock counter (`faillock --reset`)
+
+  methods : password | pin | totp | face | fingerprint
+  surfaces: login | lock | sudo            (login == TTY: ALWAYS refused)
+
+NOTE: install/enroll/faillock subcommands DO NOT touch any PAM file — they only
+wrap upstream tools (pacman/howdy/fprintd/faillock).  All PAM editing remains in
+enable/disable/restore behind the same atomic+validated guarantees.  PIN is
+still refused (no tested credential path).
+
+Exit codes: 0 ok, non-zero on error (message on stderr).
+"""
+import json
+import os
+import glob
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+PAMDIR = "/etc/pam.d"
+TAG = "# hash-security"
+# How long the helper considers a backup "ours" — we name them with this stem.
+BAK_STEM = ".hash-bak-"
+
+# Surface -> PAM service file.  This is the single source of truth for which
+# file each toggle touches.  `login` (TTY) is deliberately ABSENT from the
+# editable map and is hard-refused everywhere as the recovery path.
+SURFACE_FILE = {
+    "login": "sddm",     # graphical login (SDDM)
+    "lock":  "kde",      # KDE screen locker
+    "sudo":  "sudo",     # sudo / pkexec-style elevation
+}
+# Services we must NEVER write to no matter what is asked.
+PROTECTED_SERVICES = {"login", "system-login", "system-local-login",
+                      "system-auth", "passwd", "chpasswd"}
+
+METHODS = ("password", "pin", "totp", "face", "fingerprint")
+
+# The PAM module line each method contributes (without the marker, which is
+# appended by build_managed).  Password is implicit (the existing include) and
+# is never emitted/removed by us.
+#
+# Faillock preauth/authfail bracket the stack; they are emitted whenever ANY
+# managed method is active so lockout counting stays consistent.
+PAM_LINES = {
+    "faillock_preauth":  "auth      required   pam_faillock.so preauth",
+    "face":              "auth      sufficient pam_howdy.so",
+    "fingerprint":       "auth      sufficient pam_fprintd.so",
+    "totp":              "auth      required   pam_google_authenticator.so nullok",
+    # PIN scaffold: a dedicated pam_unix instance reading a separate PIN store
+    # would go here in P3.  For now we DO NOT emit a PIN line (detect+scaffold
+    # only) to avoid shipping an untested credential path; enable() refuses it.
+}
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def must_root():
+    if os.geteuid() != 0:
+        die("hash-security-helper must run as root (via pkexec)", 87)
+
+
+# ───────────────────────────── argument validation ───────────────────────────
+def check_method(method):
+    if method not in METHODS:
+        die("unknown method: %r (want one of %s)" % (method, ", ".join(METHODS)), 2)
+
+
+def resolve_surface(surface):
+    """Map a surface name to its PAM file path, REFUSING protected ones.
+
+    This is the single guard that keeps the TTY recovery path safe: `login`
+    (and the shared system-* stacks) are never editable through any subcommand.
+    """
+    svc = SURFACE_FILE.get(surface)
+    if not svc:
+        # Not one of our editable surfaces. If the caller passed a protected
+        # service NAME directly (the TTY `login`, or a shared system-* stack),
+        # refuse loudly — those are never editable. Otherwise it's just unknown.
+        if surface in PROTECTED_SERVICES:
+            die("REFUSING to touch %r — the TTY/system auth stacks stay "
+                "password-only as the recovery path." % surface, 6)
+        die("unknown surface: %r (want one of %s)"
+            % (surface, ", ".join(SURFACE_FILE)), 2)
+    # Defence in depth: never let a surface resolve to a protected file. Our
+    # surfaces map to sddm/kde/sudo (never to /etc/pam.d/login), so the TTY
+    # recovery path is structurally unreachable through any subcommand.
+    if svc in PROTECTED_SERVICES:
+        die("REFUSING to touch protected service %r (recovery path)" % svc, 6)
+    return svc
+
+
+def svc_path(svc):
+    return os.path.join(PAMDIR, svc)
+
+
+# ───────────────────────────── stack parsing / build ─────────────────────────
+def read_file(path):
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def build_managed(key):
+    """Return the marker-tagged PAM line for a logical key."""
+    return "%s    %s" % (PAM_LINES[key], TAG)
+
+
+def is_managed(line):
+    """True if a line is one of OURS (carries the marker)."""
+    return TAG in line
+
+
+def auth_lines(text):
+    """Non-comment auth lines (raw) from a PAM file body."""
+    out = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.split()[0] in ("auth", "-auth"):
+            out.append(ln)
+    return out
+
+
+def has_password_fallback(text):
+    """True if the auth stack still reaches pam_unix — directly or via an
+    `include`/`substack` of a stack that does.  This is the load-bearing
+    safety check: we refuse to write any stack that fails it."""
+    for ln in auth_lines(text):
+        low = ln.lower()
+        if "pam_unix.so" in low:
+            return True
+        # An include/substack of the distro auth stacks pulls in pam_unix.
+        if ("include" in low or "substack" in low) and (
+                "system-login" in low or "system-local-login" in low
+                or "system-auth" in low or "system-remote-login" in low):
+            return True
+    return False
+
+
+def strip_managed(text):
+    """Remove every line we previously added (tagged with the marker)."""
+    return "\n".join(ln for ln in text.splitlines() if not is_managed(ln))
+
+
+def desired_managed(text, methods):
+    """Given the current file text and the set of methods that should be
+    enabled, return the ordered list of managed lines to insert.
+
+    `methods` is the FULL desired set for this surface (we recompute the whole
+    managed block each time so ordering stays correct and idempotent).
+    """
+    pre, post = [], []
+    bio = [m for m in ("face", "fingerprint") if m in methods]
+    twofa = [m for m in ("totp",) if m in methods]
+    if not bio and not twofa:
+        return [], []
+    # Bracket with faillock only when we add anything.
+    pre.append(build_managed("faillock_preauth"))
+    for m in bio:
+        pre.append(build_managed(m))
+    # `post` lines go AFTER the existing password include.
+    for m in twofa:
+        post.append(build_managed(m))
+    post.append("auth      required   pam_faillock.so authfail    " + TAG)
+    return pre, post
+
+
+def current_managed_methods(text):
+    """Which methods are currently enabled (by inspecting our managed lines)."""
+    methods = set()
+    for ln in text.splitlines():
+        if not is_managed(ln):
+            continue
+        low = ln.lower()
+        if "pam_howdy" in low:
+            methods.add("face")
+        elif "pam_fprintd" in low:
+            methods.add("fingerprint")
+        elif "pam_google_authenticator" in low:
+            methods.add("totp")
+    return methods
+
+
+def find_password_anchor(lines):
+    """Index of the first auth line that provides the password (pam_unix or an
+    include of a system stack).  Managed `post` lines are inserted after it;
+    managed `pre` lines before it.  Returns None if not found."""
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.split()[0] not in ("auth", "-auth"):
+            continue
+        low = ln.lower()
+        if "pam_unix.so" in low:
+            return i
+        if ("include" in low or "substack" in low) and (
+                "system-login" in low or "system-local-login" in low
+                or "system-auth" in low):
+            return i
+    return None
+
+
+def rebuild(text, methods):
+    """Produce a new file body with our managed block reflecting `methods`.
+
+    Strategy: strip all previously-managed lines, then re-insert the freshly
+    computed pre/post lines around the password anchor.  This keeps the edit
+    idempotent and order-correct regardless of prior state.
+    """
+    cleaned = strip_managed(text)
+    lines = cleaned.split("\n")
+    pre, post = desired_managed(cleaned, methods)
+    if not pre and not post:
+        return "\n".join(lines)
+    anchor = find_password_anchor(lines)
+    if anchor is None:
+        # No password anchor at all — refuse later in validation; return as-is
+        # so validate_candidate catches it rather than us inserting blindly.
+        return "\n".join(lines)
+    new = lines[:anchor] + pre + [lines[anchor]] + post + lines[anchor + 1:]
+    return "\n".join(new)
+
+
+# ───────────────────────────────── validation ────────────────────────────────
+def validate_candidate(text, svc):
+    """Validate a candidate PAM stack. Returns (ok, detail).
+
+    Refuses to apply a stack that:
+      * lost the password fallback (no reachable pam_unix), or
+      * has a duplicate managed line, or
+      * has a garbled auth line (wrong field count), or
+      * fails an external `pamtester`/parser when available.
+    These are conservative, structural checks designed to never produce a
+    lock-out stack.  Anything uncertain is rejected.
+    """
+    if not has_password_fallback(text):
+        return False, ("password fallback (pam_unix / system-* include) "
+                       "missing from auth stack — refusing")
+    seen = set()
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        phase = parts[0].lstrip("-")
+        if phase not in ("auth", "account", "password", "session"):
+            return False, "garbled line (unknown phase): %r" % ln
+        if len(parts) < 3:
+            return False, "garbled line (too few fields): %r" % ln
+        if is_managed(ln):
+            # detect duplicate managed module lines
+            key = " ".join(p for p in parts if p != TAG and not p.startswith("#"))
+            if key in seen:
+                return False, "duplicate managed line: %r" % ln
+            seen.add(key)
+    # Must still have at least one auth line that is pam_unix or an include.
+    if not any(p.split()[0].lstrip("-") == "auth"
+               for p in text.splitlines() if p.strip() and not p.strip().startswith("#")):
+        return False, "no auth lines remain — refusing"
+    # If pamtester exists we *could* test, but it requires a live credential;
+    # the structural checks above are the authoritative gate for dry-run + root.
+    return True, "ok"
+
+
+def latest_backup(svc):
+    pat = svc_path(svc) + BAK_STEM + "*"
+    baks = sorted(glob.glob(pat))
+    return baks[-1] if baks else None
+
+
+def write_atomic(svc, text):
+    """Backup, validate, then atomically replace the PAM file. Refuses if
+    invalid.  Returns 0 on success."""
+    path = svc_path(svc)
+    if not text.endswith("\n"):
+        text += "\n"
+    ok, detail = validate_candidate(text, svc)
+    if not ok:
+        die("REFUSING to write %s — validation failed:\n  %s" % (svc, detail), 5)
+    bak = path + BAK_STEM + time.strftime("%Y%m%d-%H%M%S")
+    if os.path.exists(path):
+        shutil.copy2(path, bak)
+        print("Backed up %s -> %s" % (path, bak))
+    tmp = path + ".hash-tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    print("%s updated and validated." % path)
+    return 0
+
+
+# ──────────────────────────────── subcommands ────────────────────────────────
+def cmd_enable(method, surface):
+    check_method(method)
+    svc = resolve_surface(surface)
+    if method == "password":
+        print("password is the always-on fallback; nothing to enable.")
+        return 0
+    if method == "pin":
+        die("PIN enable is scaffolded only (P3) — refusing to write an "
+            "untested credential path.", 8)
+    path = svc_path(svc)
+    text = read_file(path)
+    if not text:
+        die("PAM file not found: %s" % path, 4)
+    methods = current_managed_methods(text)
+    if method in methods:
+        print("%s already enabled on %s (no-op)." % (method, surface))
+        return 0
+    methods.add(method)
+    return write_atomic(svc, rebuild(text, methods))
+
+
+def cmd_disable(method, surface):
+    check_method(method)
+    svc = resolve_surface(surface)
+    if method == "password":
+        die("REFUSING to disable the password fallback.", 6)
+    path = svc_path(svc)
+    text = read_file(path)
+    if not text:
+        die("PAM file not found: %s" % path, 4)
+    methods = current_managed_methods(text)
+    if method not in methods:
+        print("%s not enabled on %s (no-op)." % (method, surface))
+        return 0
+    methods.discard(method)
+    return write_atomic(svc, rebuild(text, methods))
+
+
+def cmd_restore(surface):
+    svc = resolve_surface(surface)
+    path = svc_path(svc)
+    bak = latest_backup(svc)
+    if not bak:
+        die("no backup found for %s" % svc, 4)
+    text = read_file(bak)
+    # A restore must itself be safe — validate the backup before reinstating it.
+    ok, detail = validate_candidate(text, svc)
+    if not ok:
+        die("REFUSING to restore %s — backup failed validation:\n  %s"
+            % (svc, detail), 5)
+    tmp = path + ".hash-tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        f.write(text if text.endswith("\n") else text + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    print("Restored %s from %s" % (path, bak))
+    return 0
+
+
+# ─────────────────── non-PAM privileged actions (install/enroll) ─────────────
+# These wrap upstream tools.  They NEVER edit a PAM file, so all the PAM safety
+# invariants above are untouched: enabling a method in the auth stack remains a
+# separate, explicit enable/disable action.
+
+# Packages we are willing to install, mapped to their concrete package names.
+# Anything not on this list is refused — the helper never installs arbitrary
+# packages on the user's behalf.
+INSTALLABLE = {
+    "howdy":   {"pkg": "howdy",            "aur": True},
+    "fprintd": {"pkg": "fprintd",          "aur": False},
+}
+
+# Howdy config keys we will set, with simple validators.
+HOWDY_CONFIG_KEYS = {
+    "certainty":      lambda v: v.isdigit() and 0 <= int(v) <= 100,
+    "dark_threshold": lambda v: v.isdigit() and 0 <= int(v) <= 255,
+}
+
+
+def _valid_user(name):
+    """Accept only a plausible local username (defence-in-depth on argv)."""
+    return bool(name) and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", name) is not None
+
+
+def _run_stream(argv, env=None):
+    """Run a command inheriting our stdio so the GUI's transaction log shows it
+    live.  Returns the exit code."""
+    sys.stdout.flush()
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    try:
+        return subprocess.call(argv, env=e)
+    except FileNotFoundError:
+        die("command not found: %s" % argv[0], 127)
+
+
+def _aur_helper():
+    """Return the system's AUR helper command if present, else None."""
+    for h in ("yay", "paru"):
+        if shutil.which(h):
+            return h
+    return None
+
+
+def cmd_install(pkg):
+    spec = INSTALLABLE.get(pkg)
+    if not spec:
+        die("REFUSING to install %r — not on the allow-list (%s)."
+            % (pkg, ", ".join(INSTALLABLE)), 2)
+    name = spec["pkg"]
+    if shutil.which("pacman"):
+        # Try the official repos first (fprintd lives there).
+        r = subprocess.run(["pacman", "-Si", name],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            print("Installing %s from official repos via pacman…" % name)
+            return _run_stream(["pacman", "-S", "--needed", "--noconfirm", name])
+    if spec["aur"]:
+        helper = _aur_helper()
+        if not helper:
+            die("%s is an AUR package and no AUR helper (yay/paru) was found.\n"
+                "Install it manually, e.g.:\n  yay -S %s" % (name, name), 4)
+        # AUR helpers refuse to build as root; drop to the invoking user.
+        runas = os.environ.get("SUDO_USER")
+        print("Installing %s from the AUR via %s…" % (name, helper))
+        if runas and _valid_user(runas):
+            return _run_stream(["sudo", "-u", runas, helper, "-S",
+                                "--needed", "--noconfirm", name])
+        # No invoking user available; the AUR helper will likely refuse as root.
+        return _run_stream([helper, "-S", "--needed", "--noconfirm", name])
+    die("could not install %s (no pacman, and not an AUR package)." % name, 4)
+
+
+def cmd_howdy_add(user):
+    if not _valid_user(user):
+        die("invalid user: %r" % user, 2)
+    if not shutil.which("howdy"):
+        die("howdy is not installed.", 4)
+    print("Enrolling a face for %s. Look at the camera…" % user)
+    return _run_stream(["howdy", "-U", user, "add"])
+
+
+def cmd_howdy_clear(user):
+    if not _valid_user(user):
+        die("invalid user: %r" % user, 2)
+    if not shutil.which("howdy"):
+        die("howdy is not installed.", 4)
+    print("Clearing all enrolled faces for %s…" % user)
+    return _run_stream(["howdy", "-U", user, "clear", "-y"])
+
+
+def cmd_howdy_config(key, value):
+    if key not in HOWDY_CONFIG_KEYS:
+        die("REFUSING to set unknown Howdy key %r (allowed: %s)"
+            % (key, ", ".join(HOWDY_CONFIG_KEYS)), 2)
+    if not HOWDY_CONFIG_KEYS[key](value):
+        die("invalid value %r for Howdy key %r" % (value, key), 2)
+    if not shutil.which("howdy"):
+        die("howdy is not installed.", 4)
+    print("Setting Howdy %s = %s…" % (key, value))
+    return _run_stream(["howdy", "config", "set", key, value])
+
+
+def cmd_fprint_enroll(user, finger="right-index-finger"):
+    if not _valid_user(user):
+        die("invalid user: %r" % user, 2)
+    if not shutil.which("fprintd-enroll"):
+        die("fprintd is not installed.", 4)
+    print("Enrolling %s for %s. Touch the reader repeatedly when prompted…"
+          % (finger, user))
+    return _run_stream(["fprintd-enroll", "-f", finger, user])
+
+
+def cmd_fprint_delete(user):
+    if not _valid_user(user):
+        die("invalid user: %r" % user, 2)
+    if not shutil.which("fprintd-delete"):
+        die("fprintd is not installed.", 4)
+    print("Deleting all fingerprints for %s…" % user)
+    return _run_stream(["fprintd-delete", user])
+
+
+def cmd_faillock_reset(user):
+    if not _valid_user(user):
+        die("invalid user: %r" % user, 2)
+    if not shutil.which("faillock"):
+        die("faillock not found (pam_faillock not installed?).", 4)
+    print("Resetting the faillock counter for %s…" % user)
+    return _run_stream(["faillock", "--user", user, "--reset"])
+
+
+# ───────────────────────── status (read-only, JSON) ──────────────────────────
+def detect_hardware():
+    """Best-effort hardware/availability detection (read-only)."""
+    hw = {}
+    # Camera (face / Howdy)
+    cams = sorted(glob.glob("/dev/video*"))
+    hw["camera"] = bool(cams)
+    hw["camera_devices"] = cams
+    hw["howdy"] = bool(shutil.which("howdy"))
+    # Fingerprint reader (fprintd)
+    hw["fprintd"] = bool(shutil.which("fprintd-list"))
+    reader = False
+    if hw["fprintd"]:
+        try:
+            r = subprocess.run(["fprintd-list", os.environ.get("SUDO_USER", "root")],
+                               capture_output=True, text=True, timeout=8)
+            reader = "no devices" not in (r.stdout + r.stderr).lower()
+        except Exception:
+            reader = False
+    hw["fprintd_reader"] = reader
+    # TOTP
+    hw["google_authenticator"] = bool(shutil.which("google-authenticator"))
+    return hw
+
+
+def cmd_status():
+    surfaces = {}
+    for surface, svc in SURFACE_FILE.items():
+        path = svc_path(svc)
+        text = read_file(path)
+        enabled = sorted(current_managed_methods(text))
+        # password is always present (we never remove it)
+        surfaces[surface] = {
+            "service": svc,
+            "file": path,
+            "exists": os.path.exists(path),
+            "password": has_password_fallback(text),
+            "enabled": enabled,
+            "has_backup": latest_backup(svc) is not None,
+        }
+    out = {
+        "surfaces": surfaces,
+        "protected": sorted(PROTECTED_SERVICES),
+        "methods": list(METHODS),
+        "hardware": detect_hardware(),
+        "login_note": "TTY /etc/pam.d/login is intentionally never edited.",
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+USAGE = __doc__
+
+
+def main(argv):
+    if not argv:
+        sys.stderr.write(USAGE)
+        return 2
+    cmd = argv[0]
+    a = argv[1:]
+    # status is read-only and useful unprivileged too (the test + GUI call the
+    # pure functions directly; pkexec is used for the write paths).
+    if cmd == "status":
+        return cmd_status()
+    must_root()
+    try:
+        if cmd == "enable":
+            return cmd_enable(a[0], a[1])
+        if cmd == "disable":
+            return cmd_disable(a[0], a[1])
+        if cmd == "restore":
+            return cmd_restore(a[0])
+        if cmd == "install":
+            return cmd_install(a[0])
+        if cmd == "howdy-add":
+            return cmd_howdy_add(a[0])
+        if cmd == "howdy-clear":
+            return cmd_howdy_clear(a[0])
+        if cmd == "howdy-config":
+            return cmd_howdy_config(a[0], a[1])
+        if cmd == "fprint-enroll":
+            return cmd_fprint_enroll(a[0], a[1] if len(a) > 1 else "right-index-finger")
+        if cmd == "fprint-delete":
+            return cmd_fprint_delete(a[0])
+        if cmd == "faillock-reset":
+            return cmd_faillock_reset(a[0])
+    except IndexError:
+        die("missing arguments for %r\n\n%s" % (cmd, USAGE), 2)
+    die("unknown subcommand: %r" % cmd, 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

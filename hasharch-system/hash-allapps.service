@@ -1,0 +1,6 @@
+[Unit]
+Description=Regenerate HasH-Arch "All Apps" categorized catalog
+
+[Service]
+Type=oneshot
+ExecStart=/home/hash/.local/bin/hash-allapps

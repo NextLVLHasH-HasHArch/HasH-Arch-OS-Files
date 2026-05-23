@@ -1,0 +1,2 @@
+# HasH Sweet lock screen (Qt6). Mirrors the stock Plasma 6 lockscreen qmldir.
+singleton PasswordSync 1.0 PasswordSync.qml

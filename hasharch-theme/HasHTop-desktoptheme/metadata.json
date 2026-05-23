@@ -1,0 +1,19 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "hash@nextlvlsync.co.uk",
+                "Name": "HasH"
+            }
+        ],
+        "Category": "Plasma Theme",
+        "Description": "A dark and modern theme for Plasma 6",
+        "EnabledByDefault": true,
+        "Id": "HasHTop",
+        "License": "CC BY-SA 4.0",
+        "Name": "HasHTop",
+        "Version": "2.0.0",
+        "Website": "https://hashnet.co.uk"
+    },
+    "X-Plasma-API": "5.0"
+}

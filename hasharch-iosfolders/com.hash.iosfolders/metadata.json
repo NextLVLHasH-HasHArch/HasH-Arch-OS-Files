@@ -1,0 +1,13 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Id": "com.hash.iosfolders",
+        "Name": "iOS Folders",
+        "Description": "iOS-style desktop app groups that expand into a popup grid",
+        "Authors": [ { "Name": "HasH", "Email": "hash@nextlvlsync.co.uk" } ],
+        "Category": "Utilities",
+        "Icon": "applications-other",
+        "License": "GPLv2+"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

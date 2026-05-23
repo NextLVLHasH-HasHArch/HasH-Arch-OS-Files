@@ -1,0 +1,56 @@
+[0b9ce0ce-1d1b-41a7-a84e-42aeadaa5a5b]
+Description=Discover - keep border in fullscreen
+noborder=false
+noborderrule=2
+wmclass=org.kde.discover
+wmclassmatch=2
+
+[c1d2e3f4-0bs5-4b05-9e0b-0123456789ab]
+Description=OBS Studio - keep border in fullscreen
+noborder=false
+noborderrule=2
+wmclass=(?i)obs
+wmclassmatch=3
+
+[e3f4a5b6-d01f-4b05-9e0b-0123456789ad]
+Description=Dolphin - keep border in fullscreen
+noborder=false
+noborderrule=2
+wmclass=org.kde.dolphin
+wmclassmatch=2
+
+[d2e3f4a5-v1c0-4b05-9e0b-0123456789ac]
+Description=VLC - keep border in fullscreen
+noborder=false
+noborderrule=2
+wmclass=vlc
+wmclassmatch=2
+
+[0dc32a76-9777-4cb6-ab81-03b9004c2bef]
+Description=LM Studio - keep border in fullscreen
+noborder=false
+noborderrule=2
+wmclass=(?i)lm.?studio
+wmclassmatch=3
+
+[518df571-a5d7-4e60-9372-d1fad5fab2d2]
+Description=Apple Music - background app (no taskbar)
+skippager=true
+skippagerrule=2
+skipswitcher=true
+skipswitcherrule=2
+skiptaskbar=true
+skiptaskbarrule=2
+wmclass=blgdilankhbcpipclgpdndahbehalgkh
+wmclassmatch=2
+
+[85790f94-cb0b-43e2-8592-4899df3453df]
+Description=Konsole - keep border in fullscreen
+noborder=false
+noborderrule=2
+wmclass=org.kde.konsole
+wmclassmatch=2
+
+[General]
+count=7
+rules=0dc32a76-9777-4cb6-ab81-03b9004c2bef,0b9ce0ce-1d1b-41a7-a84e-42aeadaa5a5b,518df571-a5d7-4e60-9372-d1fad5fab2d2,85790f94-cb0b-43e2-8592-4899df3453df,c1d2e3f4-0bs5-4b05-9e0b-0123456789ab,d2e3f4a5-v1c0-4b05-9e0b-0123456789ac,e3f4a5b6-d01f-4b05-9e0b-0123456789ad

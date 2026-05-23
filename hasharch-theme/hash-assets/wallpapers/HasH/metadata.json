@@ -1,0 +1,8 @@
+{
+    "KPlugin": {
+        "Authors": [{ "Name": "HasH", "Email": "hash@nextlvlsync.co.uk" }],
+        "Id": "HasH",
+        "License": "GPL-3.0-or-later",
+        "Name": "HasH"
+    }
+}

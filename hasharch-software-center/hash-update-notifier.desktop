@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=HasH Update Notifier
+GenericName=Software Update Notifier
+Comment=Notifies when HasH-Arch updates are available and opens the Software Centre
+Exec=/home/hash/.local/bin/hash-update-notifier
+Icon=hash-store
+Terminal=false
+Categories=System;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel

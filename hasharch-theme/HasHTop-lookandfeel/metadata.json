@@ -1,0 +1,20 @@
+{
+    "KPackageStructure": "Plasma/LookAndFeel",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "hash@nextlvlsync.co.uk",
+                "Name": "HasH"
+            }
+        ],
+        "Category": "",
+        "Description": "HasHTop — the HasH-Arch desktop",
+        "EnabledByDefault": true,
+        "Id": "HasHTop",
+        "License": "GPL 3+",
+        "Name": "HasHTop",
+        "Version": "2.0",
+        "Website": "https://hashnet.co.uk"
+    },
+    "X-Plasma-APIVersion": "2"
+}

@@ -1,0 +1,877 @@
+#!/usr/bin/env python3
+"""HasH-Disks privileged helper  (hash-disks-helper)
+
+Runs as ROOT, invoked exclusively by the hash-disks GUI through `pkexec`.
+Never run the GUI itself as root — only this helper is elevated, and only
+for the few operations that genuinely need it (fstab edits, privileged
+mounts, the NTFS writable fix, fsck, format, partition table ops, relabel,
+power-off, network-share mounts).
+
+fstab safety is non-negotiable:
+  * timestamped backup to /etc/fstab.hash-bak-<unixtime> before any write
+  * UUID-based managed entries only
+  * `nofail` is forced on every managed entry
+  * `/`  and  `/boot`  (and /boot/efi) entries are NEVER touched
+  * the candidate fstab is VALIDATED (findmnt --verify) before it replaces
+    the real one; an invalid fstab is refused
+
+DESTRUCTIVE safety is non-negotiable:
+  * the helper INDEPENDENTLY computes the disk backing `/` (and `/boot`) and
+    REFUSES to format/partition/relabel/power-off it or any of its partitions.
+    It does NOT trust the GUI — the GUI's confirmation is in addition to this.
+
+Subcommands (all argv, no shell):
+  fstab-add    <uuid> <mountpoint> <fstype> <options>   add/replace a managed entry
+  fstab-remove <uuid>                                   remove the managed entry for UUID
+  mount        <device> <mountpoint> <fstype> <options> privileged mount (mkdir + mount)
+  unmount      <mountpoint>                             privileged unmount
+  ntfs-fix     <device> <mountpoint> <uid> <gid>        remount NTFS read/write (ntfs-3g)
+  fsck         <device>                                 non-interactive fsck (auto-yes)
+  smart        <device>                                 SMART health/attributes (smartctl)
+  format       <device> <fstype> <label> [uid] [gid]    DESTRUCTIVE: mkfs.<fstype>
+  relabel      <device> <fstype> <label>                set the filesystem label
+  part-new     <disk> <start> <end> [parttype]          DESTRUCTIVE: create a partition
+  part-del     <disk> <number>                          DESTRUCTIVE: delete a partition
+  part-table   <disk> <gpt|msdos>                       DESTRUCTIVE: new partition table
+  power-off    <disk>                                   safely power off a removable disk
+  net-mount    <cifs|nfs> <remote> <mountpoint> <opts> [credfile]  mount a network share
+
+Exit codes: 0 ok, non-zero on error (message on stderr).
+"""
+import os
+import tempfile
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+FSTAB = "/etc/fstab"
+# A managed entry is wrapped in these markers so we can find/replace/remove it
+# without disturbing anything a human (or the installer) wrote by hand.
+TAG = "# hash-disks"
+PROTECTED_MOUNTS = {"/", "/boot", "/boot/efi", "/efi"}
+
+# Filesystems we know how to create. Maps the user-facing name to a builder.
+SUPPORTED_FS = {"ntfs", "exfat", "ext4", "fat32", "vfat", "btrfs", "xfs"}
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def must_root():
+    if os.geteuid() != 0:
+        die("hash-disks-helper must run as root (via pkexec)", 87)
+
+
+# ───────────────────────────── validation helpers ────────────────────────────
+UUID_RE = re.compile(r"^[0-9A-Fa-f-]{8,40}$")
+# A label is constrained to a conservative, shell-and-fs-safe set. No spaces,
+# slashes, quotes or control chars — this is also passed to mkfs/relabel.
+LABEL_RE = re.compile(r"^[A-Za-z0-9 ._\-]{0,32}$")
+DEV_RE = re.compile(r"^/dev/[A-Za-z0-9/_-]+$")
+
+
+def valid_uuid(u):
+    return bool(UUID_RE.match(u or ""))
+
+
+def valid_device(dev):
+    """A real, existing block device path under /dev (no traversal tricks)."""
+    if not dev or not DEV_RE.match(dev):
+        return False
+    real = os.path.realpath(dev)
+    if not real.startswith("/dev/"):
+        return False
+    try:
+        import stat as _stat
+        return _stat.S_ISBLK(os.stat(real).st_mode)
+    except OSError:
+        return False
+
+
+def valid_label(label):
+    return bool(LABEL_RE.match(label or ""))
+
+
+def safe_mountpoint(mp):
+    """Reject anything that resolves to a protected mount or is not absolute."""
+    if not mp or not mp.startswith("/"):
+        return False
+    norm = os.path.normpath(mp)
+    if norm in PROTECTED_MOUNTS:
+        return False
+    return True
+
+
+def sanitize_opts(opts):
+    """Force nofail; drop empties; never allow a bare 'defaults' to swallow nofail."""
+    parts = [o.strip() for o in (opts or "").split(",") if o.strip()]
+    if not parts:
+        parts = ["defaults"]
+    if "nofail" not in parts:
+        parts.append("nofail")
+    # x-systemd.device-timeout keeps a missing disk from hanging boot for long
+    if not any(p.startswith("x-systemd.device-timeout") for p in parts):
+        parts.append("x-systemd.device-timeout=10")
+    return ",".join(parts)
+
+
+# ─────────────────────── system-disk detection (THE GUARD) ────────────────────
+def _findmnt_source(target):
+    """Return the backing source (e.g. /dev/sda2) for a mount target, or ''."""
+    r = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "--target", target],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip().splitlines()[0].strip() if r.stdout.strip() else ""
+
+
+def _whole_disk_of(part):
+    """Given a partition device (/dev/sda2, /dev/nvme0n1p1, /dev/mapper/x),
+    return its parent whole-disk device (/dev/sda, /dev/nvme0n1), or '' if it
+    cannot be resolved. Resolves dm/crypt/lvm back to the physical disk(s)."""
+    if not part:
+        return ""
+    real = os.path.realpath(part)
+    name = os.path.basename(real)
+    # Walk lsblk's tree to find the topmost 'disk' PKNAME for this device.
+    r = subprocess.run(["lsblk", "-no", "PKNAME", real],
+                       capture_output=True, text=True)
+    pk = ""
+    if r.returncode == 0:
+        for ln in r.stdout.splitlines():
+            ln = ln.strip()
+            if ln:
+                pk = ln
+                break
+    if pk:
+        return "/dev/" + pk
+    # No parent reported -> it may already be a whole disk.
+    r2 = subprocess.run(["lsblk", "-no", "TYPE", real],
+                        capture_output=True, text=True)
+    if "disk" in r2.stdout:
+        return real
+    return ""
+
+
+def system_disks():
+    """The set of WHOLE-DISK devices that must never be touched destructively:
+    the disk(s) backing /, /boot, /boot/efi. Computed independently of the GUI.
+    Resolves mapper/lvm/raid members down to the physical disks where possible."""
+    disks = set()
+    for tgt in ("/", "/boot", "/boot/efi"):
+        if not os.path.ismount(tgt) and tgt != "/":
+            # /boot may be on the root fs (no separate mount) — skip cleanly.
+            continue
+        src = _findmnt_source(tgt)
+        if not src:
+            continue
+        # src may be a mapper/UUID=… ; resolve to underlying physical disks.
+        for phys in _physical_disks_of(src):
+            disks.add(phys)
+    return disks
+
+
+def _physical_disks_of(source):
+    """Resolve a mount source (which may be /dev/mapper/…, a raid member, an
+    LVM LV, or a plain partition) to the set of physical whole disks under it.
+    Uses lsblk's inverse tree (-s) so dm/lvm/md all unwind to real disks."""
+    out = set()
+    src = source
+    if src.startswith("UUID="):
+        r = subprocess.run(["blkid", "-U", src.split("=", 1)[1]],
+                           capture_output=True, text=True)
+        src = r.stdout.strip() or src
+    real = os.path.realpath(src) if src.startswith("/dev/") else src
+    if not real.startswith("/dev/"):
+        return out
+    # lsblk -s prints this node and all its ancestors (the physical disks).
+    r = subprocess.run(["lsblk", "-s", "-no", "NAME,TYPE", real],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        for ln in r.stdout.splitlines():
+            f = ln.split()
+            if len(f) >= 2 and f[1] == "disk":
+                name = f[0].lstrip("`|-\\ ").strip()
+                out.add("/dev/" + name)
+    if not out:
+        # Fallback: parent of the partition itself.
+        wd = _whole_disk_of(real)
+        if wd:
+            out.add(wd)
+    return out
+
+
+def refuse_if_system_partition(device):
+    """Refuse a destructive op on a PARTITION if its whole disk is a system disk."""
+    if not valid_device(device):
+        die("invalid or non-existent device: %r" % device, 2)
+    wd = _whole_disk_of(device)
+    sysd = system_disks()
+    if wd and wd in sysd:
+        die("REFUSING: %s lives on the system disk %s (backs / or /boot)."
+            % (device, wd), 9)
+    # Also refuse if the device is itself currently a system mount source.
+    for tgt in ("/", "/boot", "/boot/efi"):
+        s = _findmnt_source(tgt)
+        if s and os.path.realpath(s) == os.path.realpath(device):
+            die("REFUSING: %s currently backs %s." % (device, tgt), 9)
+
+
+def refuse_if_system_disk(disk):
+    """Refuse a whole-disk destructive op (partition table) if it's a system disk."""
+    if not valid_device(disk):
+        die("invalid or non-existent device: %r" % disk, 2)
+    real = os.path.realpath(disk)
+    sysd = system_disks()
+    if real in sysd:
+        die("REFUSING: %s is the system disk (backs / or /boot)." % disk, 9)
+    # Also refuse if ANY system disk resolves to this device (defensive).
+    for sd in sysd:
+        if os.path.realpath(sd) == real:
+            die("REFUSING: %s is the system disk." % disk, 9)
+
+
+def is_mounted(device):
+    real = os.path.realpath(device)
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                src = line.split()[0]
+                if src == device or os.path.realpath(src) == real:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def refuse_if_mounted(device):
+    if is_mounted(device):
+        die("refusing: %s is mounted — unmount it first" % device, 4)
+
+
+# ─────────────────────────────── fstab plumbing ───────────────────────────────
+def read_fstab():
+    with open(FSTAB, "r") as f:
+        return f.read()
+
+
+def parse_lines(text):
+    return text.splitlines()
+
+
+def is_protected_line(line):
+    """True if this raw fstab line mounts / or /boot* — we must never edit it."""
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return False
+    fields = s.split()
+    if len(fields) < 2:
+        return False
+    return os.path.normpath(fields[1]) in PROTECTED_MOUNTS
+
+
+def build_managed(uuid, mp, fstype, opts):
+    opts = sanitize_opts(opts)
+    fstype = (fstype or "auto").strip() or "auto"
+    # dump=0, pass=2 for data disks (never 1 — that's reserved for root)
+    return "UUID=%s %s %s %s 0 2  %s" % (uuid, mp, fstype, opts, TAG)
+
+
+def build_managed_net(remote, mp, fstype, opts):
+    """A network-share managed entry. Forces nofail + _netdev so a missing
+    network never blocks boot, and the share waits for the network."""
+    parts = [o.strip() for o in (opts or "").split(",") if o.strip()]
+    if not parts:
+        parts = ["defaults"]
+    if "nofail" not in parts:
+        parts.append("nofail")
+    if "_netdev" not in parts:
+        parts.append("_netdev")
+    if not any(p.startswith("x-systemd.device-timeout") for p in parts):
+        parts.append("x-systemd.device-timeout=15")
+    return "%s %s %s %s 0 0  %s" % (remote, mp, fstype, ",".join(parts), TAG)
+
+
+def rewrite_without_uuid(lines, uuid):
+    """Drop any existing managed (or matching-UUID) line for this UUID.
+    Protected lines are passed through untouched no matter what."""
+    out = []
+    needle = "UUID=%s" % uuid
+    for ln in lines:
+        if is_protected_line(ln):
+            out.append(ln)
+            continue
+        s = ln.strip()
+        if s.startswith(needle + " ") or s.startswith(needle + "\t"):
+            continue
+        out.append(ln)
+    return out
+
+
+def rewrite_without_target(lines, mp):
+    """Drop any managed line whose mount target equals mp (for net shares,
+    which are keyed by mount point rather than UUID). Protected lines kept."""
+    out = []
+    norm = os.path.normpath(mp)
+    for ln in lines:
+        if is_protected_line(ln):
+            out.append(ln)
+            continue
+        s = ln.strip()
+        if TAG in ln and not s.startswith("#"):
+            f = s.split()
+            if len(f) >= 2 and os.path.normpath(f[1]) == norm:
+                continue
+        out.append(ln)
+    return out
+
+
+def validate_candidate(text):
+    """Validate a candidate fstab body. Returns (ok, detail)."""
+    fd, tmp = tempfile.mkstemp(prefix="hash-disks-fstab-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+        env = dict(os.environ)
+        env["LIBMOUNT_FSTAB"] = tmp
+        r = subprocess.run(["findmnt", "--verify", "--tab-file", tmp],
+                           capture_output=True, text=True, timeout=30, env=env)
+        detail = (r.stdout + r.stderr).strip()
+        m = re.search(r"(\d+)\s+parse error", detail)
+        if m and int(m.group(1)) > 0:
+            return False, detail
+        real_errors = [ln for ln in detail.splitlines()
+                       if "[E]" in ln and "unreachable" not in ln.lower()]
+        if real_errors:
+            return False, "\n".join(real_errors)
+        seen_mp = {}
+        for ln in text.splitlines():
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            fields = s.split()
+            if len(fields) < 4:
+                return False, "malformed entry (need >=4 fields): %r" % ln
+            mp = os.path.normpath(fields[1])
+            if mp in seen_mp and mp != "none" and mp != "swap":
+                return False, "duplicate mount point: %s" % mp
+            seen_mp[mp] = True
+        return True, detail or "ok"
+    except subprocess.TimeoutExpired:
+        return False, "findmnt --verify timed out"
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def write_fstab_atomic(text):
+    """Backup, validate, then atomically replace /etc/fstab. Refuses if invalid."""
+    if not text.endswith("\n"):
+        text += "\n"
+    ok, detail = validate_candidate(text)
+    if not ok:
+        die("REFUSING to write fstab — validation failed:\n" + detail, 5)
+    bak = "%s.hash-bak-%s" % (FSTAB, time.strftime("%Y%m%d-%H%M%S"))
+    shutil.copy2(FSTAB, bak)
+    tmp = FSTAB + ".hash-tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, FSTAB)
+    print("Backed up previous fstab to %s" % bak)
+    print("fstab updated and validated.")
+    if detail and detail != "ok":
+        print("findmnt: " + detail)
+    return 0
+
+
+# ──────────────────────────────── subcommands ────────────────────────────────
+def cmd_fstab_add(uuid, mp, fstype, opts):
+    if not valid_uuid(uuid):
+        die("invalid UUID: %r" % uuid, 2)
+    if not safe_mountpoint(mp):
+        die("refusing protected/invalid mount point: %r" % mp, 3)
+    lines = parse_lines(read_fstab())
+    for ln in lines:
+        if is_protected_line(ln) and os.path.normpath(ln.split()[1]) == os.path.normpath(mp):
+            die("mount point %s is protected (root/boot)" % mp, 3)
+    try:
+        os.makedirs(mp, exist_ok=True)
+        norm = os.path.normpath(mp)
+        if norm.startswith("/home/"):
+            user = norm.split("/")[2]
+            import pwd
+            try:
+                pw = pwd.getpwnam(user)
+                os.chown(mp, pw.pw_uid, pw.pw_gid)
+            except KeyError:
+                pass
+    except OSError as e:
+        die("could not create mount point %s: %s" % (mp, e), 4)
+    lines = rewrite_without_uuid(lines, uuid)
+    lines.append(build_managed(uuid, mp, fstype, opts))
+    return write_fstab_atomic("\n".join(lines))
+
+
+def cmd_fstab_remove(uuid):
+    if not valid_uuid(uuid):
+        die("invalid UUID: %r" % uuid, 2)
+    lines = parse_lines(read_fstab())
+    new = rewrite_without_uuid(lines, uuid)
+    if new == lines:
+        print("No managed entry for UUID=%s (nothing to do)." % uuid)
+        return 0
+    return write_fstab_atomic("\n".join(new))
+
+
+def cmd_mount(device, mp, fstype, opts):
+    if not safe_mountpoint(mp):
+        die("refusing protected/invalid mount point: %r" % mp, 3)
+    if not device.startswith("/dev/"):
+        die("device must be a /dev path: %r" % device, 2)
+    os.makedirs(mp, exist_ok=True)
+    argv = ["mount"]
+    if fstype and fstype != "auto":
+        argv += ["-t", fstype]
+    if opts:
+        argv += ["-o", sanitize_opts_runtime(opts)]
+    argv += [device, mp]
+    r = subprocess.run(argv)
+    return r.returncode
+
+
+def sanitize_opts_runtime(opts):
+    parts = [o.strip() for o in (opts or "").split(",") if o.strip()]
+    return ",".join(parts) if parts else "defaults"
+
+
+def cmd_unmount(mp):
+    if not safe_mountpoint(mp):
+        die("refusing protected/invalid mount point: %r" % mp, 3)
+    r = subprocess.run(["umount", mp])
+    return r.returncode
+
+
+def cmd_ntfs_fix(device, mp, uid, gid):
+    """The NTFS read-only fix: unmount and remount via ntfs-3g with uid/gid so
+    the user can write. Refuses on system disks. Falls back via ntfsfix."""
+    refuse_if_system_partition(device)
+    if not safe_mountpoint(mp):
+        die("refusing protected/invalid mount point: %r" % mp, 3)
+    try:
+        uid = int(uid)
+        gid = int(gid)
+    except ValueError:
+        die("uid/gid must be integers", 2)
+    subprocess.run(["umount", device], capture_output=True)
+    subprocess.run(["umount", mp], capture_output=True)
+    fixr = subprocess.run(["ntfsfix", "-d", device], capture_output=True, text=True)
+    if fixr.stdout:
+        print(fixr.stdout.strip())
+    os.makedirs(mp, exist_ok=True)
+    if os.path.normpath(mp).startswith("/home/"):
+        import pwd
+        try:
+            pw = pwd.getpwnam(os.path.normpath(mp).split("/")[2])
+            os.chown(mp, pw.pw_uid, pw.pw_gid)
+        except (KeyError, IndexError):
+            pass
+    opts = "rw,uid=%d,gid=%d,umask=022,windows_names,big_writes" % (uid, gid)
+    r = subprocess.run(["mount", "-t", "ntfs-3g", "-o", opts, device, mp],
+                       capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if r.returncode == 0:
+        print("NTFS volume %s remounted read/write at %s (owned by uid=%d)"
+              % (device, mp, uid))
+    return r.returncode
+
+
+def cmd_fsck(device):
+    if not valid_device(device):
+        die("device must be a valid /dev path: %r" % device, 2)
+    refuse_if_mounted(device)
+    r = subprocess.run(["fsck", "-y", device])
+    return r.returncode
+
+
+def cmd_smart(device):
+    """SMART health summary + selected attributes. smartctl exits with a
+    bitmask; we treat any output as success and let the GUI parse it."""
+    if not valid_device(device):
+        die("device must be a valid /dev path: %r" % device, 2)
+    if not shutil.which("smartctl"):
+        die("smartmontools not installed (smartctl missing)", 3)
+    r = subprocess.run(["smartctl", "-H", "-A", "-i", device],
+                       capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+    # smartctl returns a bitmask (bit0/bit1 = open/cmd error). Only bits 0/1
+    # mean we couldn't talk to the device at all.
+    if r.returncode & 0x03:
+        return r.returncode & 0x03
+    return 0
+
+
+# ─────────────────────────── DESTRUCTIVE: format ─────────────────────────────
+def cmd_format(device, fstype, label, uid=None, gid=None):
+    """DESTRUCTIVE. Create a fresh filesystem on a partition. Refuses on the
+    system disk, refuses mounted devices, validates the label."""
+    refuse_if_system_partition(device)        # <-- the hard guard
+    refuse_if_mounted(device)
+    fstype = (fstype or "").lower().strip()
+    if fstype not in SUPPORTED_FS:
+        die("unsupported filesystem: %r (allowed: %s)"
+            % (fstype, ", ".join(sorted(SUPPORTED_FS))), 2)
+    if not valid_label(label):
+        die("invalid label (allowed: letters, digits, space . _ - , max 32): %r"
+            % label, 2)
+    label = label.strip()
+
+    if fstype == "ntfs":
+        if not shutil.which("mkfs.ntfs"):
+            die("mkfs.ntfs missing — install ntfs-3g", 3)
+        argv = ["mkfs.ntfs", "-f", "-Q"]          # -f fast, -Q quick (no zero)
+        if label:
+            argv += ["-L", label]
+        argv.append(device)
+    elif fstype == "exfat":
+        if not shutil.which("mkfs.exfat"):
+            die("mkfs.exfat missing — install exfatprogs", 3)
+        argv = ["mkfs.exfat"]
+        if label:
+            argv += ["-n", label]
+        argv.append(device)
+    elif fstype == "ext4":
+        argv = ["mkfs.ext4", "-F"]
+        if label:
+            argv += ["-L", label]
+        argv.append(device)
+    elif fstype in ("fat32", "vfat"):
+        argv = ["mkfs.vfat", "-F", "32"]
+        if label:
+            argv += ["-n", label[:11].upper()]    # FAT label: 11 chars, upper
+        argv.append(device)
+    elif fstype == "btrfs":
+        argv = ["mkfs.btrfs", "-f"]
+        if label:
+            argv += ["-L", label]
+        argv.append(device)
+    elif fstype == "xfs":
+        argv = ["mkfs.xfs", "-f"]
+        if label:
+            argv += ["-L", label]
+        argv.append(device)
+    else:
+        die("unsupported filesystem: %r" % fstype, 2)
+
+    print("Wiping old signatures on %s ..." % device)
+    subprocess.run(["wipefs", "-a", device], capture_output=True, text=True)
+    print("$ " + " ".join(argv))
+    r = subprocess.run(argv, capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+    if r.returncode == 0:
+        print("\nFormatted %s as %s%s."
+              % (device, fstype, (" labelled '%s'" % label) if label else ""))
+        subprocess.run(["udevadm", "settle"], capture_output=True)
+    return r.returncode
+
+
+# ─────────────────────────── relabel a filesystem ────────────────────────────
+def cmd_relabel(device, fstype, label):
+    refuse_if_system_partition(device)
+    fstype = (fstype or "").lower().strip()
+    if not valid_label(label):
+        die("invalid label: %r" % label, 2)
+    label = label.strip()
+    if fstype in ("ext2", "ext3", "ext4"):
+        argv = ["e2label", device, label]
+    elif fstype in ("ntfs", "ntfs3"):
+        if not shutil.which("ntfslabel"):
+            die("ntfslabel missing — install ntfs-3g", 3)
+        argv = ["ntfslabel", device, label]
+    elif fstype == "exfat":
+        if not shutil.which("exfatlabel"):
+            die("exfatlabel missing — install exfatprogs", 3)
+        argv = ["exfatlabel", device, label]
+    elif fstype in ("vfat", "fat", "fat32", "msdos"):
+        argv = ["fatlabel", device, label[:11].upper()]
+    elif fstype == "btrfs":
+        argv = ["btrfs", "filesystem", "label", device, label]
+    elif fstype == "xfs":
+        argv = ["xfs_admin", "-L", label, device]
+    else:
+        die("don't know how to relabel filesystem type %r" % fstype, 2)
+    print("$ " + " ".join(argv))
+    r = subprocess.run(argv, capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+    if r.returncode == 0:
+        print("Label of %s set to '%s'." % (device, label))
+        subprocess.run(["udevadm", "settle"], capture_output=True)
+    return r.returncode
+
+
+# ────────────────────── DESTRUCTIVE: partition table ops ──────────────────────
+def cmd_part_table(disk, kind):
+    """Create a brand-new (empty) partition table. WIPES the whole disk."""
+    refuse_if_system_disk(disk)               # <-- the hard guard (whole disk)
+    kind = (kind or "").lower().strip()
+    if kind not in ("gpt", "msdos", "mbr"):
+        die("partition table must be gpt or msdos: %r" % kind, 2)
+    if kind == "mbr":
+        kind = "msdos"
+    # Refuse if any partition on this disk is mounted.
+    _refuse_if_any_part_mounted(disk)
+    print("$ parted -s %s mklabel %s" % (disk, kind))
+    subprocess.run(["wipefs", "-a", disk], capture_output=True, text=True)
+    r = subprocess.run(["parted", "-s", disk, "mklabel", kind],
+                       capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+    if r.returncode == 0:
+        print("New %s partition table created on %s." % (kind, disk))
+        subprocess.run(["partprobe", disk], capture_output=True)
+        subprocess.run(["udevadm", "settle"], capture_output=True)
+    return r.returncode
+
+
+def cmd_part_new(disk, start, end, parttype="primary"):
+    """Create a partition on a disk. start/end as parted units e.g. '0%' '100%'
+    or '1MiB' '50%'. Does NOT make a filesystem (use 'format' after)."""
+    refuse_if_system_disk(disk)
+    _refuse_if_any_part_mounted(disk)
+    # Validate the start/end tokens conservatively.
+    tok = re.compile(r"^[0-9]+(\.[0-9]+)?(%|s|B|kB|MB|GB|TB|KiB|MiB|GiB|TiB)?$")
+    if not tok.match(start or "") or not tok.match(end or ""):
+        die("invalid start/end (e.g. 0%% 100%% or 1MiB 50%%): %r %r"
+            % (start, end), 2)
+    parttype = (parttype or "primary").lower()
+    if parttype not in ("primary", "logical", "extended"):
+        parttype = "primary"
+    argv = ["parted", "-s", "-a", "optimal", disk,
+            "mkpart", parttype, start, end]
+    print("$ " + " ".join(argv))
+    r = subprocess.run(argv, capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+    if r.returncode == 0:
+        print("Partition created on %s (%s..%s)." % (disk, start, end))
+        subprocess.run(["partprobe", disk], capture_output=True)
+        subprocess.run(["udevadm", "settle"], capture_output=True)
+    return r.returncode
+
+
+def cmd_part_del(disk, number):
+    """Delete partition <number> from <disk>."""
+    refuse_if_system_disk(disk)
+    try:
+        n = int(number)
+        if n < 1:
+            raise ValueError
+    except ValueError:
+        die("partition number must be a positive integer: %r" % number, 2)
+    # Build the would-be partition node name and refuse if it (or any) is mounted.
+    _refuse_if_any_part_mounted(disk)
+    argv = ["parted", "-s", disk, "rm", str(n)]
+    print("$ " + " ".join(argv))
+    r = subprocess.run(argv, capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+    if r.returncode == 0:
+        print("Deleted partition %d on %s." % (n, disk))
+        subprocess.run(["partprobe", disk], capture_output=True)
+        subprocess.run(["udevadm", "settle"], capture_output=True)
+    return r.returncode
+
+
+def _refuse_if_any_part_mounted(disk):
+    """Refuse a whole-disk op if the disk itself or any of its partitions is
+    currently mounted (belt-and-braces beyond the system-disk guard)."""
+    if not valid_device(disk):
+        die("invalid or non-existent disk: %r" % disk, 2)
+    real = os.path.realpath(disk)
+    r = subprocess.run(["lsblk", "-nro", "NAME,MOUNTPOINT", real],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        for ln in r.stdout.splitlines():
+            f = ln.split(None, 1)
+            if len(f) == 2 and f[1].strip():
+                die("refusing: %s has a mounted partition (%s at %s) — "
+                    "unmount it first" % (disk, f[0], f[1].strip()), 4)
+
+
+# ───────────────────────── eject / power-off a disk ───────────────────────────
+def cmd_power_off(disk):
+    """Safely power off (and unmount) a removable disk via udisksctl."""
+    refuse_if_system_disk(disk)
+    if not shutil.which("udisksctl"):
+        die("udisksctl missing (udisks2 not installed)", 3)
+    # Unmount any mounted partitions first (best-effort).
+    real = os.path.realpath(disk)
+    r = subprocess.run(["lsblk", "-nro", "NAME,MOUNTPOINT", real],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        for ln in r.stdout.splitlines():
+            f = ln.split(None, 1)
+            if len(f) == 2 and f[1].strip():
+                subprocess.run(["udisksctl", "unmount", "-b", "/dev/" + f[0]],
+                               capture_output=True)
+    print("$ udisksctl power-off -b %s" % disk)
+    r = subprocess.run(["udisksctl", "power-off", "-b", disk],
+                       capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+    if r.returncode == 0:
+        print("%s is now safe to remove." % disk)
+    return r.returncode
+
+
+# ──────────────────────────── network shares (SMB/NFS) ────────────────────────
+def cmd_net_mount(kind, remote, mp, opts, credfile=""):
+    """Mount a CIFS/SMB or NFS share. Optional credfile (root-readable, 600)
+    holds username/password for CIFS. Refuses protected mount points."""
+    kind = (kind or "").lower().strip()
+    if kind not in ("cifs", "smb", "nfs", "nfs4"):
+        die("network share type must be cifs or nfs: %r" % kind, 2)
+    if kind == "smb":
+        kind = "cifs"
+    if not safe_mountpoint(mp):
+        die("refusing protected/invalid mount point: %r" % mp, 3)
+    if not remote or remote.startswith("-"):
+        die("invalid remote: %r" % remote, 2)
+    helper = "mount.cifs" if kind == "cifs" else ("mount.nfs4" if kind == "nfs4" else "mount.nfs")
+    if not shutil.which(helper) and not shutil.which("mount"):
+        die("%s missing — install %s" % (helper,
+            "cifs-utils" if kind == "cifs" else "nfs-utils"), 3)
+    os.makedirs(mp, exist_ok=True)
+    optlist = [o.strip() for o in (opts or "").split(",") if o.strip()]
+    if credfile:
+        if not os.path.isfile(credfile):
+            die("credentials file not found: %r" % credfile, 4)
+        # tighten perms regardless of how it was created
+        try:
+            os.chmod(credfile, 0o600)
+        except OSError:
+            pass
+        optlist = [o for o in optlist if not o.startswith("credentials=")]
+        optlist.append("credentials=%s" % credfile)
+    fstype = "cifs" if kind == "cifs" else ("nfs4" if kind == "nfs4" else "nfs")
+    argv = ["mount", "-t", fstype, remote, mp]
+    if optlist:
+        argv = ["mount", "-t", fstype, "-o", ",".join(optlist), remote, mp]
+    print("$ mount -t %s %s %s" % (fstype, remote, mp))
+    r = subprocess.run(argv, capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+    if r.returncode == 0:
+        print("Mounted %s at %s." % (remote, mp))
+    return r.returncode
+
+
+def cmd_net_fstab_add(kind, remote, mp, opts):
+    """Persist a network share in fstab with nofail + _netdev."""
+    kind = (kind or "").lower().strip()
+    if kind == "smb":
+        kind = "cifs"
+    if kind not in ("cifs", "nfs", "nfs4"):
+        die("network share type must be cifs or nfs: %r" % kind, 2)
+    if not safe_mountpoint(mp):
+        die("refusing protected/invalid mount point: %r" % mp, 3)
+    if not remote or remote.startswith("-"):
+        die("invalid remote: %r" % remote, 2)
+    os.makedirs(mp, exist_ok=True)
+    lines = parse_lines(read_fstab())
+    lines = rewrite_without_target(lines, mp)
+    lines.append(build_managed_net(remote, mp, kind, opts))
+    return write_fstab_atomic("\n".join(lines))
+
+
+def cmd_save_creds(path, username, password, domain=""):
+    """Write a root-owned CIFS credentials file with 600 perms."""
+    if not path.startswith("/"):
+        die("credentials path must be absolute", 2)
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("username=%s\n" % username)
+        f.write("password=%s\n" % password)
+        if domain:
+            f.write("domain=%s\n" % domain)
+    os.chmod(path, 0o600)
+    print("Saved credentials to %s (600)." % path)
+    return 0
+
+
+USAGE = __doc__
+
+
+def main(argv):
+    if not argv:
+        sys.stderr.write(USAGE)
+        return 2
+    must_root()
+    cmd = argv[0]
+    a = argv[1:]
+    try:
+        if cmd == "fstab-add":
+            return cmd_fstab_add(a[0], a[1], a[2] if len(a) > 2 else "auto",
+                                 a[3] if len(a) > 3 else "defaults")
+        if cmd == "fstab-remove":
+            return cmd_fstab_remove(a[0])
+        if cmd == "mount":
+            return cmd_mount(a[0], a[1], a[2] if len(a) > 2 else "auto",
+                            a[3] if len(a) > 3 else "")
+        if cmd == "unmount":
+            return cmd_unmount(a[0])
+        if cmd == "ntfs-fix":
+            return cmd_ntfs_fix(a[0], a[1], a[2], a[3])
+        if cmd == "fsck":
+            return cmd_fsck(a[0])
+        if cmd == "smart":
+            return cmd_smart(a[0])
+        if cmd == "format":
+            return cmd_format(a[0], a[1], a[2] if len(a) > 2 else "",
+                              a[3] if len(a) > 3 else None,
+                              a[4] if len(a) > 4 else None)
+        if cmd == "relabel":
+            return cmd_relabel(a[0], a[1], a[2] if len(a) > 2 else "")
+        if cmd == "part-new":
+            return cmd_part_new(a[0], a[1], a[2],
+                                a[3] if len(a) > 3 else "primary")
+        if cmd == "part-del":
+            return cmd_part_del(a[0], a[1])
+        if cmd == "part-table":
+            return cmd_part_table(a[0], a[1])
+        if cmd == "power-off":
+            return cmd_power_off(a[0])
+        if cmd == "net-mount":
+            return cmd_net_mount(a[0], a[1], a[2], a[3] if len(a) > 3 else "",
+                                 a[4] if len(a) > 4 else "")
+        if cmd == "net-fstab-add":
+            return cmd_net_fstab_add(a[0], a[1], a[2], a[3] if len(a) > 3 else "")
+        if cmd == "save-creds":
+            return cmd_save_creds(a[0], a[1], a[2], a[3] if len(a) > 3 else "")
+    except IndexError:
+        die("missing arguments for %r\n\n%s" % (cmd, USAGE), 2)
+    die("unknown subcommand: %r" % cmd, 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

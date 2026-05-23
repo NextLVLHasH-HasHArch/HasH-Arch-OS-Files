@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Set up the Apple Music background PWA for a Chromium browser (Edge/Chrome/Brave).
+# Firefox can't make web-app windows, so it's refused. Generalised from the working
+# Edge setup. Run per-user (e.g. first login):  hash-applemusic-setup [edge|chrome|brave|auto]
+set -uo pipefail
+
+APP_ID="blgdilankhbcpipclgpdndahbehalgkh"   # = Chromium app id for music.apple.com
+URL="https://music.apple.com/"
+TRAY="${HASH_APPLEMUSIC_TRAY:-/usr/bin/hash-applemusic-tray.py}"
+[ -x "$TRAY" ] || TRAY="$HOME/.local/bin/hash-applemusic-tray.py"
+
+pick_browser() {  # echo "bin|prefix" for the requested/auto browser, or empty
+    local want="${1:-auto}" bin
+    try() { for b in "$@"; do [ -x "$b" ] && { echo "$b"; return 0; }; done; return 1; }
+    case "$want" in
+      edge)   bin=$(try /opt/microsoft/msedge/microsoft-edge /usr/bin/microsoft-edge-stable) && echo "$bin|msedge" ;;
+      chrome) bin=$(try /usr/bin/google-chrome-stable /opt/google/chrome/google-chrome) && echo "$bin|chrome" ;;
+      brave)  bin=$(try /usr/bin/brave /opt/brave-bin/brave /usr/bin/brave-browser) && echo "$bin|brave" ;;
+      firefox|librewolf) return 1 ;;   # no PWA support
+      auto)   for w in edge brave chrome; do r=$(pick_browser "$w") && { echo "$r"; return 0; }; done; return 1 ;;
+    esac
+}
+
+SEL="$(pick_browser "${1:-auto}")"
+if [ -z "$SEL" ]; then
+    echo "hash-applemusic: no Chromium browser found (Firefox can't run web apps) — skipping Apple Music app."
+    exit 0
+fi
+BIN="${SEL%%|*}"; PREFIX="${SEL##*|}"
+echo "hash-applemusic: configuring Apple Music app via $PREFIX ($BIN)"
+
+# 1) config the tray reads
+install -d "$HOME/.config/hash"
+cat > "$HOME/.config/hash/applemusic.conf" <<EOF
+BROWSER_BIN=$BIN
+APP_ID=$APP_ID
+DESKTOP_PREFIX=$PREFIX
+URL=$URL
+EOF
+
+# 2) the app .desktop (background app window)
+install -d "$HOME/.local/share/applications"
+cat > "$HOME/.local/share/applications/$PREFIX-$APP_ID-Default.desktop" <<EOF
+[Desktop Entry]
+Categories=X-HasH-Media;
+Version=1.0
+Terminal=false
+Type=Application
+Name=Apple Music
+Exec=$BIN --enable-features=VaapiVideoDecoder,VaapiVideoEncoder --ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy --profile-directory=Default --app-id=$APP_ID --app-url=$URL
+Icon=lxmusic
+StartupWMClass=crx__$APP_ID
+EOF
+# Icon: the themed "lxmusic" (BeautyLine — the HasH icon theme), so it matches the
+# build instead of the browser's raster PWA icon. BeautyLine ships it system-wide.
+
+# 4) background-app KWin rule (no taskbar / pager / switcher), appended once
+KR="$HOME/.config/kwinrulesrc"
+if ! grep -q "wmclass=$APP_ID" "$KR" 2>/dev/null; then
+    uuid="am$(date +%s)"
+    cat >> "$KR" <<EOF
+
+[$uuid]
+Description=Apple Music - background app (no taskbar)
+skippager=true
+skippagerrule=2
+skipswitcher=true
+skipswitcherrule=2
+skiptaskbar=true
+skiptaskbarrule=2
+wmclass=$APP_ID
+wmclassmatch=2
+EOF
+    # add to the [General] rules list
+    if grep -q '^\[General\]' "$KR"; then
+        if grep -q '^rules=' "$KR"; then
+            sed -i "s/^rules=/rules=$uuid,/" "$KR"
+        else
+            sed -i "/^\[General\]/a rules=$uuid" "$KR"
+        fi
+    else
+        printf '\n[General]\nrules=%s\n' "$uuid" >> "$KR"
+    fi
+    qdbus6 org.kde.KWin /KWin org.kde.KWin.reconfigure 2>/dev/null || true
+fi
+
+# 5) tray systemd user service (Restart=always so it survives shell restarts)
+install -d "$HOME/.config/systemd/user"
+cat > "$HOME/.config/systemd/user/hash-applemusic-tray.service" <<EOF
+[Unit]
+Description=Apple Music background tray icon
+After=plasma-plasmashell.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=$TRAY
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload 2>/dev/null || true
+systemctl --user enable --now hash-applemusic-tray.service 2>/dev/null || true
+echo "hash-applemusic: done — Apple Music tray app set up for $PREFIX."

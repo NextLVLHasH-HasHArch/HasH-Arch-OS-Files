@@ -1,0 +1,3238 @@
+#!/usr/bin/env python3
+"""HasH-Arch Settings  (hash-settings)
+
+A standalone, dark/rounded System Settings hub for HasH-Arch — a copy of KDE's
+System Settings, improved, that unifies the standard KDE KCMs AND the whole HasH
+suite (Accounts, Security, Disks, Software Center, Uninstaller, wallpaper /
+visualiser tweaks) in one place with a real page system, instant fuzzy search,
+a landing Overview, and live quick toggles.
+
+Chrome (frameless rounded #12141a, draggable TitleBar, ACCENT #56c5d8, sidebar,
+PageRouter with Back/Exit/Escape) mirrors hash-store exactly.
+
+Every sidebar category opens a real CUSTOM in-app page — nothing is a launcher:
+    native pages -> Network, Appearance, Display & Sound, Power, System (built
+                    with real controls over nmcli/bluetoothctl/pactl/wpctl/
+                    powerprofilesctl/kwriteconfig6/qdbus and /proc).
+    embedded HasH panes -> Accounts, Security, Disks, Apps render the HasH
+                    tools' own backends inside this window (the tool is imported
+                    as a module and its module-level backend functions drive a
+                    native pane), with an "Open full tool" button for the rich
+                    flows (wizards, pkexec transactions).
+KDE modules (KCMs) hook in DEEPLY: opening one loads the real KCM *embedded*
+inside this window via X11 reparenting — we launch `kcmshell6 <module>`, locate
+its top-level window by matching _NET_WM_PID, and host it with
+QWindow.fromWinId() + QWidget.createWindowContainer(), behind a consistent in-app
+header with Back.  Privileged modules (Users, clock, SDDM, Plymouth, firewall…)
+still raise their OWN polkit prompt because they run in the kcmshell6 child, not
+in us (hash-settings is never run as root).  On pure-Wayland sessions, or if the
+window can't be embedded, the same in-app "module" page shows a clear launch
+panel instead — embedding degrades gracefully and nothing detaches silently.
+Every one of the ~96 installed KCMs is reachable, grouped and searchable on the
+"More KDE settings" page, each with a real icon.
+
+Entry-list `kind` is informational for the Overview search index only:
+    page  -> a native in-app settings page
+    hash  -> a pane embedding a HasH tool's backend
+
+Usage:
+    hash-settings                 launch the GUI (Overview landing)
+    hash-settings --page network  open straight on a category
+    hash-settings --shot <png>    (internal) grab a screenshot then exit
+"""
+import importlib.machinery
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+
+# ──────────────────────────── tool / KCM detection ───────────────────────────
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, ".local", "bin")
+
+
+# ──────────────────────── HasH tool backend module loader ────────────────────
+# The HasH tools (hash-disks, hash-accounts, hash-security, hash-uninstaller)
+# are hyphenated Python scripts with NO .py extension; their GUI widget classes
+# are nested inside a gui() function and cannot be imported directly without a
+# large refactor of each tool.  Instead we import each tool *as a module* (using
+# the same SourceFileLoader pattern hash-uninstaller-gui already uses) and call
+# its module-level BACKEND functions to render native, in-app panes that share
+# the tools' exact look & feel — fully inside hash-settings, no extra windows.
+_TOOL_CACHE = {}
+
+
+def load_tool(name):
+    """Import a hyphenated HasH tool script as a module and cache it.
+
+    Returns the module on success or None if the tool isn't installed / fails
+    to import (so a missing tool degrades gracefully instead of crashing)."""
+    if name in _TOOL_CACHE:
+        return _TOOL_CACHE[name]
+    path = tool_path(name)
+    mod = None
+    if path:
+        try:
+            modname = "hash_tool_" + name.replace("-", "_")
+            spec = importlib.util.spec_from_loader(
+                modname, importlib.machinery.SourceFileLoader(modname, path))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception:
+            mod = None
+    _TOOL_CACHE[name] = mod
+    return mod
+
+HAS_SYSTEMSETTINGS = bool(shutil.which("systemsettings"))
+HAS_KCMSHELL = bool(shutil.which("kcmshell6")) or bool(shutil.which("kcmshell5"))
+KCMSHELL = shutil.which("kcmshell6") or shutil.which("kcmshell5") or "kcmshell6"
+
+
+def tool_path(name):
+    """Absolute path to a HasH tool if it exists (in ~/.local/bin or PATH)."""
+    local = os.path.join(BIN, name)
+    if os.path.exists(local):
+        return local
+    return shutil.which(name)
+
+
+def have(cmd):
+    return bool(shutil.which(cmd))
+
+
+# A KCM is considered launchable if either systemsettings or kcmshell exists.
+# (We can't cheaply prove a specific KCM module is installed without launching
+# it, so we gate on the host binary and let the launch fall back gracefully.)
+def kcm_launchable():
+    return HAS_SYSTEMSETTINGS or HAS_KCMSHELL
+
+
+# ──────────────────────────── category / entry model ─────────────────────────
+# SECTIONS rows are (key, label, icon, page_key, entries).  page_key selects a
+# custom page builder (PAGE_BUILDERS) — a native page or an embedded HasH pane.
+# `entries` only feed the Overview search index; each carries {name, icon,
+# comment, kind ('page'|'hash'), target}.  Clicking a search/category card
+# navigates to that category's page — nothing launches an external window.
+# Every category now opens a real, custom in-app PAGE (page=<builder key>),
+# never an external launcher.  The `entries` list still feeds the Overview
+# search index: each entry advertises a searchable feature of that page.  An
+# entry's `kind` is informational for search/labelling only — clicking a card
+# (or the sidebar) navigates to the page; nothing spawns an external window
+# except a few clearly-labelled last-resort "Open in System Settings" buttons
+# inside the native pages (Display, Users, Date & Time, Wallpaper).
+SECTIONS = [
+    ("overview", "Overview", "go-home", None, []),
+    ("network", "Network", "network-wireless", "network", [
+        {"name": "Wi-Fi", "icon": "network-wireless",
+         "comment": "Scan, connect & toggle Wi-Fi networks (nmcli)",
+         "kind": "page", "target": "network"},
+        {"name": "Bluetooth", "icon": "network-bluetooth",
+         "comment": "Power, scan & pair devices (bluetoothctl)",
+         "kind": "page", "target": "network"},
+    ]),
+    ("appearance", "Appearance", "preferences-desktop-theme", "appearance", [
+        {"name": "Global Theme", "icon": "preferences-desktop-theme-global",
+         "comment": "Light / dark look & feel", "kind": "page",
+         "target": "appearance"},
+        {"name": "Icons", "icon": "preferences-desktop-icons",
+         "comment": "Icon theme", "kind": "page", "target": "appearance"},
+        {"name": "Music Visualiser", "icon": "view-media-visualization",
+         "comment": "Enable/disable & colour scheme of the wallpaper audio "
+                    "visualiser", "kind": "page", "target": "appearance"},
+        {"name": "Wallpaper", "icon": "preferences-desktop-wallpaper",
+         "comment": "Desktop background", "kind": "page",
+         "target": "appearance"},
+    ]),
+    ("display", "Display & Sound", "preferences-desktop-display", "display", [
+        {"name": "Sound", "icon": "audio-volume-high",
+         "comment": "Output / input devices & volume (pactl / wpctl)",
+         "kind": "page", "target": "display"},
+        {"name": "Display", "icon": "preferences-desktop-display",
+         "comment": "Monitors, resolution & scaling", "kind": "page",
+         "target": "display"},
+    ]),
+    ("power", "Power", "battery", "power", [
+        {"name": "Power Profile", "icon": "battery",
+         "comment": "Performance / balanced / power-saver (powerprofilesctl)",
+         "kind": "page", "target": "power"},
+        {"name": "Screen timeout", "icon": "preferences-desktop-display",
+         "comment": "Blank the screen after idle", "kind": "page",
+         "target": "power"},
+    ]),
+    ("accounts", "Accounts", "system-users", "accounts", [
+        {"name": "Cloud Accounts", "icon": "preferences-system-network",
+         "comment": "Cloud storage & online accounts (HasH Accounts)",
+         "kind": "hash", "target": "hash-accounts"},
+    ]),
+    ("security", "Security", "security-high", "security", [
+        {"name": "Security Center", "icon": "security-high",
+         "comment": "Password / PIN / TOTP / face / fingerprint for "
+                    "login, lock & sudo (HasH Security)", "kind": "hash",
+         "target": "hash-security"},
+    ]),
+    ("disks", "Disks", "drive-harddisk", "disks", [
+        {"name": "Drives", "icon": "drive-harddisk",
+         "comment": "Mount, auto-mount & writable-fix your drives "
+                    "(HasH Disks)", "kind": "hash", "target": "hash-disks"},
+    ]),
+    ("apps", "Apps", "applications-other", "apps", [
+        {"name": "Software Center", "icon": "system-software-install",
+         "comment": "Browse, search & install apps — no terminal",
+         "kind": "hash", "target": "hash-store"},
+        {"name": "Updates", "icon": "system-software-update",
+         "comment": "Update everything (graphical password prompt)",
+         "kind": "hash", "target": "hash-store"},
+        {"name": "Uninstall a Program", "icon": "edit-delete",
+         "comment": "Map a program + ALL its files and remove it",
+         "kind": "hash", "target": "hash-uninstaller"},
+    ]),
+    ("system", "System", "computer", "system", [
+        {"name": "About HasH-Arch", "icon": "help-about",
+         "comment": "Distro, kernel, CPU & RAM information", "kind": "page",
+         "target": "system"},
+        {"name": "Users", "icon": "system-users",
+         "comment": "Add, remove & edit user accounts (kcm_users — self-elevates)",
+         "kind": "page", "target": "system"},
+        {"name": "Date & Time", "icon": "clock",
+         "comment": "Clock, timezone & format (kcm_clock — self-elevates)",
+         "kind": "page", "target": "system"},
+        {"name": "Login Screen (SDDM)", "icon": "system-lock-screen",
+         "comment": "Login / display-manager theme (kcm_sddm — self-elevates)",
+         "kind": "page", "target": "system"},
+        {"name": "Printers", "icon": "printer",
+         "comment": "Configure printers (kcm_printer_manager)",
+         "kind": "page", "target": "system"},
+        {"name": "Firewall", "icon": "security-high",
+         "comment": "Firewall rules (kcm_firewall)", "kind": "page",
+         "target": "system"},
+        {"name": "Boot Splash", "icon": "preferences-desktop",
+         "comment": "Plymouth boot splash (kcm_plymouth — self-elevates)",
+         "kind": "page", "target": "system"},
+    ]),
+    ("kde", "More KDE settings", "applications-system", "kde", [
+        {"name": "All KDE modules", "icon": "configure",
+         "comment": "Every KDE setting module (KCM) installed on this system, "
+                    "with search — privileged ones self-elevate via polkit",
+         "kind": "page", "target": "kde"},
+    ]),
+]
+
+
+def entry_available(e):
+    """Is this entry usable on this machine? (else hide/disable it)."""
+    k = e["kind"]
+    if k == "hash":
+        return tool_path(e["target"]) is not None
+    # "page" entries are native and always present; the page itself degrades
+    # gracefully when a backend (nmcli, pactl, …) is missing.
+    return True
+
+
+def all_entries():
+    """Flat list of (section_key, entry) across every category, for search."""
+    out = []
+    for key, _label, _icon, _page, entries in SECTIONS:
+        for e in entries:
+            out.append((key, e))
+    return out
+
+
+# ─────────────────────────────── launch helpers ──────────────────────────────
+def launch_kcm(module):
+    """Open a KDE KCM in its host.
+
+    We prefer kcmshell6 because that is what lets the *privileged* KCMs (Users,
+    Date & Time, Login Screen/SDDM, …) put up their OWN polkit elevation prompt
+    when an action needs root — hash-settings itself is never run as root.  We
+    fall back to `systemsettings <module>` only when kcmshell isn't present.
+    """
+    if HAS_KCMSHELL:
+        return [KCMSHELL, module]
+    return ["systemsettings", module]
+
+
+# ───────────────────── X11 KCM embedding (reparent into us) ───────────────────
+# How we "hook into" the KDE modules: there is no clean, PyQt-callable C++/QML
+# host for loading an arbitrary installed KCM by id (org.kde.kcmutils QML only
+# ships KCM *authoring* helpers — SimpleKCM/ScrollViewKCM/… — not a loader for
+# existing modules; that lives in libKF6KCMUtils' KCModuleLoader, which has no
+# Python binding).  The robust, dependency-light route under X11 / XWayland is
+# XEmbed-style reparenting: launch `kcmshell6 <module>`, find its top-level
+# window by matching _NET_WM_PID against the child process, then host it with
+# QWindow.fromWinId() + QWidget.createWindowContainer().  Privileged modules
+# still raise their OWN polkit prompt because they run in the kcmshell6 child,
+# not in us.  If the platform isn't xcb, xprop is missing, or the window never
+# appears, callers fall back to a clearly-labelled "Open in its own window"
+# launcher — so embedding degrades gracefully and never blocks the UI.
+HAS_XPROP = bool(shutil.which("xprop"))
+
+
+def _on_x11():
+    """True when we can do X11 reparenting (native X11 or XWayland via xcb)."""
+    if not HAS_XPROP:
+        return False
+    plat = os.environ.get("QT_QPA_PLATFORM", "")
+    if "wayland" in plat and "xcb" not in plat:
+        # forced pure-Wayland: no XEmbed of foreign windows
+        return False
+    # a DISPLAY means an X server (real or XWayland) is reachable
+    return bool(os.environ.get("DISPLAY"))
+
+
+def _xprop_root_windows():
+    """All managed top-level X window ids (ints) via _NET_CLIENT_LIST.
+
+    xprop prints e.g. `_NET_CLIENT_LIST(WINDOW): window id # 0x1e7, 0x2a1`
+    (note the `#` separator, not `=`)."""
+    if not HAS_XPROP:
+        return []
+    r = _run(["xprop", "-root", "_NET_CLIENT_LIST"], timeout=4)
+    out = []
+    tail = ""
+    if "#" in r.stdout:
+        tail = r.stdout.split("#", 1)[1]
+    elif "=" in r.stdout:                       # tolerate alternate formats
+        tail = r.stdout.split("=", 1)[1]
+    for tok in tail.split(","):
+        tok = tok.strip()
+        try:
+            out.append(int(tok, 16) if tok.lower().startswith("0x")
+                       else int(tok))
+        except ValueError:
+            pass
+    return out
+
+
+def _xprop_window_pid(wid):
+    """_NET_WM_PID of a window id, or None."""
+    r = _run(["xprop", "-id", hex(wid), "_NET_WM_PID"], timeout=4)
+    if "=" in r.stdout:
+        try:
+            return int(r.stdout.split("=", 1)[1].strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _descendant_pids(root_pid):
+    """root_pid plus its descendants (kcmshell6 may fork its real window)."""
+    pids = {root_pid}
+    try:
+        # build child map from /proc
+        children = {}
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/%s/stat" % entry) as f:
+                    fields = f.read().rsplit(")", 1)[1].split()
+                ppid = int(fields[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            children.setdefault(ppid, []).append(int(entry))
+        stack = [root_pid]
+        while stack:
+            cur = stack.pop()
+            for ch in children.get(cur, []):
+                if ch not in pids:
+                    pids.add(ch)
+                    stack.append(ch)
+    except OSError:
+        pass
+    return pids
+
+
+def find_kcm_window(child_pid, before):
+    """Return the X window id created by `child_pid` (or a descendant) that is
+    not in the `before` set, else None."""
+    if not HAS_XPROP:
+        return None
+    pids = _descendant_pids(child_pid)
+    for wid in _xprop_root_windows():
+        if wid in before:
+            continue
+        if _xprop_window_pid(wid) in pids:
+            return wid
+    return None
+
+
+# ───────────────────────── KCM (KDE module) enumeration ──────────────────────
+# We don't hard-code a short KCM list.  Instead we ask the host what modules it
+# actually has via `kcmshell6 --list` (fallback kcmshell5) and parse it, so the
+# "More KDE settings…" page offers whatever is installed.  Each KCM self-elevates
+# via polkit when launched through kcmshell6, including the privileged ones.
+_KCM_CACHE = None
+
+# Group discovered KCMs under the existing HasH categories by matching the
+# module name against keyword lists.  The first matching group wins; anything
+# unmatched falls into "other".  Privileged modules are noted so the UI can flag
+# that they self-elevate.
+KCM_GROUPS = [
+    ("network", "Network & Connectivity",
+     ["network", "wifi", "wireless", "bluetooth", "proxy", "connection",
+      "sharing", "samba", "nm", "wireguard", "vpn"]),
+    ("appearance", "Appearance & Theme",
+     ["theme", "color", "colour", "icon", "font", "cursor", "splash",
+      "lookandfeel", "style", "wallpaper", "desktoptheme", "plymouth",
+      "boot", "emoticon", "gtk", "launchfeedback"]),
+    ("display", "Display & Sound",
+     ["screen", "display", "kscreen", "monitor", "gamma", "nightcolor",
+      "audio", "sound", "multimedia", "kgamma", "compositor", "kwin",
+      "effect"]),
+    ("power", "Power & Session",
+     ["power", "battery", "energy", "session", "autostart", "screenlocker",
+      "lockscreen", "ksmserver", "activities"]),
+    ("input", "Input & Devices",
+     ["keyboard", "mouse", "touchpad", "tablet", "joystick", "input",
+      "device", "kgamepad", "shortcut", "keys", "keybinding", "trackpoint"]),
+    ("system", "System & Hardware",
+     ["users", "user", "clock", "datetime", "date", "time", "language",
+      "locale", "formats", "translations", "regional", "sddm", "login",
+      "printer", "printmanager", "firewall", "ufw", "firewalld", "kdrivers",
+      "kernel", "fwupd", "firmware", "smserver", "componentchooser",
+      "filetypes", "mimetypes", "spellchecking", "kded", "baloo", "search",
+      "notifications", "kaccounts", "webshortcuts", "cookies", "cache",
+      "useragent", "access", "accessibility", "workspace", "kcm_about",
+      "about", "memory", "smartcard", "yubikey"]),
+]
+
+# Privileged KCMs that put up their own polkit prompt when launched via
+# kcmshell6 — used to label them in the UI (no sudo needed by hash-settings).
+PRIVILEGED_KCMS = {"kcm_users", "users", "user_manager", "kcm_clock",
+                   "clock", "kcm_datetime", "datetime", "kcm_sddm", "sddm",
+                   "kcm_plymouth", "plymouth", "kcm_grub", "grub",
+                   "kcm_firewall", "firewall", "kcm_kwallet5", "kcm_smserver"}
+
+
+def _is_privileged(module):
+    m = module.lower()
+    if m in PRIVILEGED_KCMS:
+        return True
+    return any(k in m for k in ("user", "sddm", "clock", "datetime",
+                                "plymouth", "grub", "firewall", "boot"))
+
+
+def _group_for(module, name):
+    hay = (module + " " + name).lower()
+    for key, _label, keys in KCM_GROUPS:
+        if any(k in hay for k in keys):
+            return key
+    return "other"
+
+
+# Best-effort freedesktop icon name for a KCM (so every row shows a real icon
+# instead of a generic gear).  Matched by keyword against the module + name.
+_KCM_ICON_RULES = [
+    (("wifi", "wireless", "wlan"), "network-wireless"),
+    (("bluetooth",), "network-bluetooth"),
+    (("network", "connection", "nm", "proxy", "vpn", "wireguard"),
+     "network-wired"),
+    (("share", "samba", "smb"), "folder-network"),
+    (("theme", "lookandfeel", "look"), "preferences-desktop-theme-global"),
+    (("color", "colour", "gamma"), "preferences-desktop-color"),
+    (("icon",), "preferences-desktop-icons"),
+    (("font",), "preferences-desktop-font"),
+    (("cursor",), "input-mouse"),
+    (("wallpaper", "background"), "preferences-desktop-wallpaper"),
+    (("splash", "launchfeedback"), "preferences-desktop"),
+    (("plymouth", "boot"), "preferences-desktop"),
+    (("style", "gtk", "applicationstyle", "widget"), "preferences-desktop-theme"),
+    (("screen", "display", "monitor", "kscreen"), "preferences-desktop-display"),
+    (("night", "redshift"), "redshift"),
+    (("audio", "sound", "multimedia", "volume"), "audio-volume-high"),
+    (("kwin", "compositor", "effect", "desktopeffect"), "preferences-system-windows"),
+    (("activit",), "preferences-desktop-activities"),
+    (("power", "battery", "energy"), "battery"),
+    (("session", "ksmserver", "smserver", "autostart"), "system-run"),
+    (("lock", "screenlocker"), "system-lock-screen"),
+    (("keyboard", "keys", "keybinding", "shortcut"), "input-keyboard"),
+    (("mouse", "trackpoint"), "input-mouse"),
+    (("touchpad",), "input-touchpad"),
+    (("tablet",), "input-tablet"),
+    (("joystick", "gamepad", "joypad"), "input-gaming"),
+    (("user",), "system-users"),
+    (("clock", "datetime", "date", "time"), "clock"),
+    (("language", "locale", "format", "translation", "regional"),
+     "preferences-desktop-locale"),
+    (("sddm", "login"), "system-lock-screen"),
+    (("printer", "printmanager"), "printer"),
+    (("firewall", "ufw", "firewalld"), "security-high"),
+    (("notification",), "preferences-desktop-notification"),
+    (("baloo", "search", "file-search"), "system-search"),
+    (("kded", "service", "background"), "applications-system"),
+    (("filetype", "mimetype", "associations"), "application-x-zerosize"),
+    (("spellcheck", "spelling"), "tools-check-spelling"),
+    (("access",), "preferences-desktop-accessibility"),
+    (("wallet", "kwallet"), "kwalletmanager"),
+    (("about", "info", "memory"), "help-about"),
+    (("component",), "preferences-desktop-default-applications"),
+    (("emoticon", "emoji"), "face-smile"),
+    (("kaccount", "online", "webshortcut", "cookie", "useragent", "cache"),
+     "preferences-system-network"),
+    (("touchscreen", "device", "solid"), "computer"),
+]
+
+
+def kcm_icon(module, name=""):
+    hay = (module + " " + name).lower()
+    for keys, icon in _KCM_ICON_RULES:
+        if any(k in hay for k in keys):
+            return icon
+    return "configure"
+
+
+def kcm_list():
+    """Parse `kcmshell6 --list` -> sorted [{module, name, group, privileged}].
+
+    `kcmshell6 --list` prints lines like:
+        kcm_users     - Manage user accounts
+    (the separator is a run of spaces then "- "; older builds use a tab).  We
+    parse defensively and degrade to [] if the binary is missing or errors,
+    so the page just shows "no modules" instead of crashing.
+    """
+    global _KCM_CACHE
+    if _KCM_CACHE is not None:
+        return _KCM_CACHE
+    out = []
+    if HAS_KCMSHELL:
+        r = _run([KCMSHELL, "--list"], timeout=20)
+        seen = set()
+        for ln in r.stdout.splitlines():
+            ln = ln.rstrip()
+            if not ln or not ln[0].strip():
+                # skip headers / blank / indented continuation lines
+                continue
+            # split "module<spaces>- description" or "module\tdescription"
+            mod = desc = ""
+            if "\t" in ln:
+                parts = ln.split("\t", 1)
+                mod, desc = parts[0].strip(), (parts[1].strip()
+                                               if len(parts) > 1 else "")
+            else:
+                import re as _re
+                m = _re.match(r"^(\S+)\s+-\s+(.*)$", ln)
+                if m:
+                    mod, desc = m.group(1).strip(), m.group(2).strip()
+                else:
+                    parts = ln.split(None, 1)
+                    mod = parts[0].strip()
+                    desc = parts[1].strip() if len(parts) > 1 else ""
+            if not mod or mod in seen or mod.startswith("-"):
+                continue
+            # ignore obvious non-module header words
+            if mod.lower() in ("the", "following", "available", "modules:",
+                               "usage:", "options:"):
+                continue
+            seen.add(mod)
+            name = desc or mod
+            out.append({"module": mod, "name": name,
+                        "group": _group_for(mod, name),
+                        "icon": kcm_icon(mod, name),
+                        "privileged": _is_privileged(mod)})
+        out.sort(key=lambda d: d["name"].lower())
+    _KCM_CACHE = out
+    return out
+
+
+def kcm_module_exists(module):
+    """Best-effort: is a specific KCM present? (used to wire privileged ones)."""
+    mods = {d["module"] for d in kcm_list()}
+    if not mods:                       # couldn't enumerate -> assume launchable
+        return kcm_launchable()
+    if module in mods:
+        return True
+    # tolerate kcm_ prefix differences (kcm_users vs users)
+    base = module[4:] if module.startswith("kcm_") else module
+    return any(m == base or m == "kcm_" + base for m in mods)
+
+
+def tool_argv(name, *args):
+    """argv to launch a HasH tool standalone (used for the Software Center
+    launch button, which is genuinely its own big app), or None."""
+    p = tool_path(name)
+    if not p:
+        return None
+    return [p] + list(args)
+
+
+# ════════════════════════════════ quick toggles ══════════════════════════════
+# Each toggle: backend availability check, read state, set state. If a backend
+# is missing the toggle is HIDDEN (never crashes). All run in the user session.
+def _run(cmd, timeout=6):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = str(e)
+        return _R()
+
+
+# ---- Wi-Fi (nmcli radio wifi) ----
+def wifi_available():
+    return have("nmcli")
+
+
+def wifi_state():
+    r = _run(["nmcli", "radio", "wifi"])
+    return "enabled" in r.stdout.lower()
+
+
+def wifi_set(on):
+    _run(["nmcli", "radio", "wifi", "on" if on else "off"])
+
+
+# ---- Bluetooth (rfkill, fallback bluetoothctl) ----
+def bt_available():
+    return have("rfkill") or have("bluetoothctl")
+
+
+def bt_state():
+    if have("rfkill"):
+        r = _run(["rfkill", "list", "bluetooth"])
+        # "Soft blocked: no" means powered/unblocked
+        for ln in r.stdout.splitlines():
+            if "soft blocked" in ln.lower():
+                return "no" in ln.lower().split(":")[-1]
+    if have("bluetoothctl"):
+        r = _run(["bluetoothctl", "show"])
+        for ln in r.stdout.splitlines():
+            if "powered" in ln.lower():
+                return "yes" in ln.lower()
+    return False
+
+
+def bt_set(on):
+    if have("rfkill"):
+        _run(["rfkill", "unblock" if on else "block", "bluetooth"])
+    if have("bluetoothctl"):
+        _run(["bluetoothctl", "power", "on" if on else "off"])
+
+
+# ---- Night Light (kscreen-doctor, fallback qdbus to KWin) ----
+def night_available():
+    return have("kscreen-doctor") or have("qdbus") or have("qdbus6")
+
+
+def _qdbus():
+    return shutil.which("qdbus6") or shutil.which("qdbus")
+
+
+def night_state():
+    # KWin's NightLight DBus exposes "running"/"inhibited"; best-effort read.
+    q = _qdbus()
+    if q:
+        for path in ("org.kde.KWin.NightLight", "org.kde.KWin.ColorCorrect"):
+            r = _run([q, "org.kde.KWin", "/ColorCorrect",
+                      "org.freedesktop.DBus.Properties.Get",
+                      path, "running"])
+            if r.returncode == 0 and r.stdout.strip():
+                return "true" in r.stdout.lower()
+    return False
+
+
+def night_set(on):
+    # KWin's NightLight DBus exposes a single toggle() that flips the current
+    # state, so only invoke it when the desired state differs from the current.
+    q = _qdbus()
+    if q and night_state() != on:
+        _run([q, "org.kde.KWin", "/ColorCorrect",
+              "org.kde.KWin.NightLight.toggle"])
+
+
+# ---- Dark / Light theme (plasma-apply-lookandfeel, fallback kwriteconfig6) ----
+DARK_LNF = "org.kde.breezedark.desktop"
+LIGHT_LNF = "org.kde.breeze.desktop"
+
+
+def theme_available():
+    return have("plasma-apply-lookandfeel") or have("kwriteconfig6") \
+        or have("kwriteconfig5")
+
+
+def theme_is_dark():
+    # Read the current colour scheme from kdeglobals if readable.
+    rc = os.path.join(HOME, ".config", "kdeglobals")
+    try:
+        txt = open(rc).read().lower()
+        for ln in txt.splitlines():
+            if ln.startswith("colorscheme="):
+                return "dark" in ln
+    except OSError:
+        pass
+    return True  # default assumption
+
+
+def theme_set_dark(dark):
+    lnf = DARK_LNF if dark else LIGHT_LNF
+    if have("plasma-apply-lookandfeel"):
+        _run(["plasma-apply-lookandfeel", "-a", lnf], timeout=20)
+        return
+    kw = shutil.which("kwriteconfig6") or shutil.which("kwriteconfig5")
+    if kw:
+        _run([kw, "--file", "kdeglobals", "--group", "KDE", "--key",
+              "LookAndFeelPackage", lnf])
+
+
+# ---- Visualiser (systemctl --user cava-wallpaper.service) ----
+VIS_UNIT = "cava-wallpaper.service"
+
+
+def vis_available():
+    if not have("systemctl"):
+        return False
+    r = _run(["systemctl", "--user", "list-unit-files", VIS_UNIT])
+    # available if the unit file is known to the user manager
+    return VIS_UNIT in r.stdout
+
+
+def vis_state():
+    r = _run(["systemctl", "--user", "is-active", VIS_UNIT])
+    return r.stdout.strip() == "active"
+
+
+def vis_set(on):
+    _run(["systemctl", "--user", "start" if on else "stop", VIS_UNIT])
+
+
+# ════════════════════ native-page backends (no external apps) ════════════════
+# Each helper is best-effort and never raises; pages disable controls whose
+# backend is missing.
+
+# ---- Wi-Fi scan / connect (nmcli) ----
+def wifi_scan():
+    """[{ssid, signal, security, active, known}] from `nmcli -t`."""
+    if not have("nmcli"):
+        return []
+    _run(["nmcli", "device", "wifi", "rescan"], timeout=8)
+    r = _run(["nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL,SECURITY",
+              "device", "wifi", "list"], timeout=12)
+    known = set()
+    rk = _run(["nmcli", "-t", "-f", "NAME", "connection", "show"])
+    for ln in rk.stdout.splitlines():
+        if ln.strip():
+            known.add(ln.strip())
+    nets, seen = [], set()
+    for ln in r.stdout.splitlines():
+        # nmcli -t escapes ':' inside fields as '\:' — split carefully.
+        parts = ln.replace("\\:", "\0").split(":")
+        parts = [p.replace("\0", ":") for p in parts]
+        if len(parts) < 4:
+            continue
+        active, ssid, signal, sec = parts[0], parts[1], parts[2], parts[3]
+        if not ssid or ssid in seen:
+            continue
+        seen.add(ssid)
+        nets.append({
+            "ssid": ssid, "signal": signal, "security": sec or "Open",
+            "active": active == "yes", "known": ssid in known,
+        })
+    nets.sort(key=lambda n: (not n["active"], -int(n["signal"] or 0)))
+    return nets
+
+
+def wifi_connect(ssid, password=None):
+    if not have("nmcli"):
+        return False, "nmcli not installed"
+    cmd = ["nmcli", "device", "wifi", "connect", ssid]
+    if password:
+        cmd += ["password", password]
+    r = _run(cmd, timeout=45)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+def wifi_disconnect(ssid):
+    r = _run(["nmcli", "connection", "down", ssid], timeout=20)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+# ---- Bluetooth devices (bluetoothctl) ----
+def bt_devices():
+    """[{mac, name, connected}] of known/paired devices."""
+    if not have("bluetoothctl"):
+        return []
+    out = []
+    r = _run(["bluetoothctl", "devices"], timeout=8)
+    for ln in r.stdout.splitlines():
+        parts = ln.split(" ", 2)
+        if len(parts) >= 3 and parts[0] == "Device":
+            mac, name = parts[1], parts[2]
+            ci = _run(["bluetoothctl", "info", mac], timeout=6)
+            conn = "Connected: yes" in ci.stdout
+            out.append({"mac": mac, "name": name, "connected": conn})
+    return out
+
+
+def bt_connect(mac, connect=True):
+    sub = "connect" if connect else "disconnect"
+    r = _run(["bluetoothctl", sub, mac], timeout=20)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+# ---- Sound (pactl preferred, wpctl fallback) ----
+def _snd_tool():
+    if have("pactl"):
+        return "pactl"
+    if have("wpctl"):
+        return "wpctl"
+    return None
+
+
+def sound_available():
+    return _snd_tool() is not None
+
+
+def _pactl_list(kind):
+    """kind = 'sinks' or 'sources' -> [{name, desc, default}]."""
+    items = []
+    default = ""
+    rd = _run(["pactl", "get-default-" + kind[:-1]])
+    default = rd.stdout.strip()
+    r = _run(["pactl", "-f", "json", "list", kind])
+    try:
+        import json as _json
+        data = _json.loads(r.stdout) if r.stdout.strip() else []
+        for d in data:
+            nm = d.get("name", "")
+            desc = d.get("description") or d.get("properties", {}).get(
+                "device.description") or nm
+            items.append({"name": nm, "desc": desc, "default": nm == default})
+    except Exception:
+        # textual fallback
+        name = desc = None
+        for ln in r.stdout.splitlines():
+            s = ln.strip()
+            if s.startswith("Name:"):
+                name = s.split(":", 1)[1].strip()
+            elif s.startswith("Description:"):
+                desc = s.split(":", 1)[1].strip()
+                if name:
+                    items.append({"name": name, "desc": desc or name,
+                                  "default": name == default})
+                    name = desc = None
+    return items
+
+
+def sound_devices(kind):
+    """kind = 'sinks' (output) or 'sources' (input)."""
+    if have("pactl"):
+        return _pactl_list(kind)
+    return []
+
+
+def sound_set_default(kind, name):
+    if have("pactl"):
+        _run(["pactl", "set-default-" + kind[:-1], name])
+        return True
+    return False
+
+
+def sound_volume(kind):
+    """Current default volume 0-100 (best-effort)."""
+    if have("pactl"):
+        tgt = "@DEFAULT_SINK@" if kind == "sinks" else "@DEFAULT_SOURCE@"
+        r = _run(["pactl", "get-" + kind[:-1] + "-volume", tgt])
+        import re as _re
+        m = _re.search(r"(\d+)%", r.stdout)
+        if m:
+            return int(m.group(1))
+    if have("wpctl"):
+        tgt = "@DEFAULT_AUDIO_SINK@" if kind == "sinks" else "@DEFAULT_AUDIO_SOURCE@"
+        r = _run(["wpctl", "get-volume", tgt])
+        import re as _re
+        m = _re.search(r"([\d.]+)", r.stdout)
+        if m:
+            return int(float(m.group(1)) * 100)
+    return 0
+
+
+def sound_set_volume(kind, pct):
+    pct = max(0, min(150, int(pct)))
+    if have("pactl"):
+        tgt = "@DEFAULT_SINK@" if kind == "sinks" else "@DEFAULT_SOURCE@"
+        _run(["pactl", "set-" + kind[:-1] + "-volume", tgt, "%d%%" % pct])
+        return True
+    if have("wpctl"):
+        tgt = "@DEFAULT_AUDIO_SINK@" if kind == "sinks" else "@DEFAULT_AUDIO_SOURCE@"
+        _run(["wpctl", "set-volume", tgt, "%.2f" % (pct / 100.0)])
+        return True
+    return False
+
+
+# ---- Power profiles (powerprofilesctl) ----
+def power_available():
+    return have("powerprofilesctl")
+
+
+def power_profiles():
+    if not have("powerprofilesctl"):
+        return [], ""
+    r = _run(["powerprofilesctl", "list"])
+    profs, active = [], ""
+    for ln in r.stdout.splitlines():
+        s = ln.strip()
+        if s.startswith("* "):
+            name = s[2:].rstrip(":")
+            active = name
+            profs.append(name)
+        elif s.endswith(":") and " " not in s.rstrip(":"):
+            profs.append(s.rstrip(":"))
+    # de-dup preserve order
+    seen, out = set(), []
+    for p in profs:
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    if not active:
+        ra = _run(["powerprofilesctl", "get"])
+        active = ra.stdout.strip()
+    return out, active
+
+
+def power_set_profile(name):
+    _run(["powerprofilesctl", "set", name])
+
+
+# ---- Screen timeout (KDE powerdevil via kwriteconfig6) ----
+def _kwrite():
+    return shutil.which("kwriteconfig6") or shutil.which("kwriteconfig5")
+
+
+def _kread():
+    return shutil.which("kreadconfig6") or shutil.which("kreadconfig5")
+
+
+def screen_timeout_get():
+    """Idle DPMS timeout in seconds (0 = never), best-effort from powerdevil."""
+    kr = _kread()
+    if not kr:
+        return None
+    r = _run([kr, "--file", "powerdevilrc", "--group", "AC", "--group",
+              "Display", "--key", "TurnOffDisplayIdleTimeoutSec"])
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def screen_timeout_set(seconds):
+    kw = _kwrite()
+    if not kw:
+        return False
+    for prof in ("AC", "Battery"):
+        _run([kw, "--file", "powerdevilrc", "--group", prof, "--group",
+              "Display", "--key", "TurnOffDisplayIdleTimeoutSec", str(seconds)])
+    # nudge powerdevil to reload (best-effort)
+    q = _qdbus()
+    if q:
+        _run([q, "org.kde.Solid.PowerManagement",
+              "/org/kde/Solid/PowerManagement", "refreshStatus"])
+    return True
+
+
+# ---- Icon themes (enumerate from standard icon dirs) ----
+def icon_themes():
+    dirs = ["/usr/share/icons", os.path.join(HOME, ".local/share/icons"),
+            os.path.join(HOME, ".icons")]
+    out = []
+    for d in dirs:
+        try:
+            for name in sorted(os.listdir(d)):
+                idx = os.path.join(d, name, "index.theme")
+                if os.path.exists(idx) and name not in out:
+                    try:
+                        txt = open(idx).read()
+                    except OSError:
+                        continue
+                    # only real icon themes (have Directories=) — skip cursors
+                    if "Directories=" in txt or "Inherits=" in txt:
+                        out.append(name)
+        except OSError:
+            continue
+    return out
+
+
+def icon_theme_current():
+    kr = _kread()
+    if kr:
+        r = _run([kr, "--file", "kdeglobals", "--group", "Icons",
+                  "--key", "Theme"])
+        if r.stdout.strip():
+            return r.stdout.strip()
+    return ""
+
+
+def icon_theme_set(name):
+    if have("plasma-apply-icontheme"):
+        _run(["plasma-apply-icontheme", name], timeout=15)
+        return True
+    kw = _kwrite()
+    if kw:
+        _run([kw, "--file", "kdeglobals", "--group", "Icons", "--key",
+              "Theme", name])
+        return True
+    return False
+
+
+# ---- Visualiser config (read/write the matrixrain wallpaper via plasma) ----
+VIS_COLORS = [("level", "Reactive (blue → orange)"), ("cyan", "Cyan / blue"),
+              ("rainbow", "Rainbow"), ("warm", "Warm (orange / red)")]
+
+
+def vis_apply(color, show):
+    """Write visualizerColor + showVisualizer into the com.hash.matrixrain
+    wallpaper config on every desktop, live (same as the old kdialog script)."""
+    q = _qdbus()
+    if not q:
+        return False
+    script = (
+        "var ds = desktops();"
+        "for (var i = 0; i < ds.length; i++) {"
+        " var d = ds[i]; var g = screenGeometry(d.screen);"
+        " d.currentConfigGroup = ['Wallpaper', 'com.hash.matrixrain', 'General'];"
+        " d.writeConfig('visualizerColor', '%s');"
+        " var primary = (d.readConfig('showInfo') === 'true') || g.x === 2560;"
+        " d.writeConfig('showVisualizer', (%s) ? primary : false);"
+        "}" % (color, "true" if show else "false"))
+    r = _run([q, "org.kde.plasmashell", "/PlasmaShell",
+              "org.kde.PlasmaShell.evaluateScript", script], timeout=10)
+    return r.returncode == 0
+
+
+# ---- System / About (distro, kernel, CPU, RAM) ----
+def system_info():
+    info = {}
+    osr = {}
+    try:
+        for ln in open("/etc/os-release"):
+            if "=" in ln:
+                k, v = ln.rstrip().split("=", 1)
+                osr[k] = v.strip().strip('"')
+    except OSError:
+        pass
+    info["distro"] = osr.get("PRETTY_NAME") or osr.get("NAME") or "Linux"
+    u = os.uname()
+    info["kernel"] = "%s %s" % (u.sysname, u.release)
+    info["arch"] = u.machine
+    info["hostname"] = u.nodename
+    # CPU model + cores
+    cpu, cores = "", 0
+    try:
+        for ln in open("/proc/cpuinfo"):
+            if ln.startswith("model name") and not cpu:
+                cpu = ln.split(":", 1)[1].strip()
+            if ln.startswith("processor"):
+                cores += 1
+    except OSError:
+        pass
+    info["cpu"] = cpu or "Unknown CPU"
+    info["cores"] = cores
+    # RAM
+    memkb = 0
+    try:
+        for ln in open("/proc/meminfo"):
+            if ln.startswith("MemTotal:"):
+                memkb = int(ln.split()[1])
+                break
+    except (OSError, ValueError):
+        pass
+    info["ram"] = ("%.1f GB" % (memkb / 1024.0 / 1024.0)) if memkb else "Unknown"
+    # Desktop / session
+    info["desktop"] = (os.environ.get("XDG_CURRENT_DESKTOP")
+                       or os.environ.get("DESKTOP_SESSION") or "Unknown")
+    info["session"] = os.environ.get("XDG_SESSION_TYPE", "")
+    # uptime
+    try:
+        with open("/proc/uptime") as f:
+            secs = float(f.read().split()[0])
+        d, rem = divmod(int(secs), 86400)
+        h, rem = divmod(rem, 3600)
+        m, _ = divmod(rem, 60)
+        info["uptime"] = (("%dd " % d if d else "") + "%dh %dm" % (h, m))
+    except (OSError, ValueError):
+        info["uptime"] = ""
+    return info
+
+
+TOGGLES = [
+    {"id": "wifi", "name": "Wi-Fi", "icon": "network-wireless",
+     "avail": wifi_available, "get": wifi_state, "set": wifi_set},
+    {"id": "bluetooth", "name": "Bluetooth", "icon": "network-bluetooth",
+     "avail": bt_available, "get": bt_state, "set": bt_set},
+    {"id": "night", "name": "Night Light", "icon": "redshift",
+     "avail": night_available, "get": night_state, "set": night_set},
+    {"id": "theme", "name": "Dark Theme", "icon": "preferences-desktop-color",
+     "avail": theme_available, "get": theme_is_dark, "set": theme_set_dark},
+    {"id": "visualiser", "name": "Visualiser", "icon": "view-media-visualization",
+     "avail": vis_available, "get": vis_state, "set": vis_set},
+]
+
+
+# ════════════════════════════════════ GUI ════════════════════════════════════
+def gui(start_key="overview", shot=None):
+    from PyQt6.QtCore import (Qt, QSize, QTimer, QProcess,
+                              QPropertyAnimation, QEasingCurve, pyqtSignal)
+    from PyQt6.QtGui import (QPainter, QColor, QPainterPath, QIcon, QCursor,
+                             QKeySequence, QShortcut, QWindow)
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QLabel, QPushButton, QLineEdit, QHBoxLayout,
+        QVBoxLayout, QGridLayout, QFrame, QScrollArea, QStackedWidget,
+        QGraphicsOpacityEffect, QComboBox, QSlider, QCheckBox, QInputDialog,
+        QMessageBox, QSizePolicy)
+
+    ACCENT, DANGER = "#56c5d8", "#e06c75"
+
+    def btn_qss(a=ACCENT):
+        return f"""
+            QPushButton{{ background:rgba(255,255,255,0.07); color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.10); border-radius:9px;
+                padding:7px 16px; font-size:13px; }}
+            QPushButton:hover{{ background:rgba(255,255,255,0.13); }}
+            QPushButton#primary{{ background:{a}; color:#06222a; font-weight:600; border:none; }}
+            QPushButton#primary:hover{{ background:#6fd6e7; }}
+            QPushButton#danger{{ background:{DANGER}; color:#2a0a0c; font-weight:600; border:none; }}
+            QPushButton:disabled{{ color:#7f8a8d; background:rgba(255,255,255,0.05); }}
+        """
+
+    def card_qss():
+        return f"""
+            QFrame#card{{ background:#0e1117;
+                border:1px solid rgba(255,255,255,0.07); border-radius:14px; }}
+            QFrame#card[hover="true"]{{ background:#141a22;
+                border:1px solid {ACCENT}; }}
+            QFrame#card[disabled="true"]{{ background:#0b0d12;
+                border:1px solid rgba(255,255,255,0.04); }}
+            QLabel#cardname{{ color:#f3f7f8; font-size:15px; font-weight:700; }}
+            QLabel#cardname[disabled="true"]{{ color:#5c686b; }}
+            QLabel#cardsumm{{ color:#94a3a6; font-size:12px; }}
+            QLabel#cardkind{{ color:{ACCENT}; font-size:10px; font-weight:800;
+                letter-spacing:1px; background:rgba(86,197,216,0.12);
+                border-radius:7px; padding:2px 7px; }}
+        """
+
+    def toggle_qss():
+        return f"""
+            QFrame#toggle{{ background:#0e1117;
+                border:1px solid rgba(255,255,255,0.07); border-radius:14px; }}
+            QFrame#toggle[on="true"]{{ background:#13212a;
+                border:1px solid {ACCENT}; }}
+            QLabel#togname{{ color:#f3f7f8; font-size:14px; font-weight:700; }}
+            QLabel#togstate{{ color:#94a3a6; font-size:11px; font-weight:600; }}
+            QLabel#togstate[on="true"]{{ color:{ACCENT}; }}
+        """
+
+    def app_qss():
+        return f"""
+            #sidebar{{ background:rgba(255,255,255,0.03); border-radius:14px; }}
+            #apptitle{{ color:#fff; font-size:15px; font-weight:700; }}
+            QPushButton#winbtn{{ background:transparent; color:#9fb0b4; border:none;
+                border-radius:8px; font-size:14px; }}
+            QPushButton#winbtn:hover{{ background:rgba(255,255,255,0.12); color:#fff; }}
+            QPushButton#nav{{ text-align:left; background:transparent; color:#c6d2d5;
+                border:none; border-radius:10px; padding:10px 12px; font-size:14px; }}
+            QPushButton#nav:hover{{ background:rgba(255,255,255,0.07); }}
+            QPushButton#nav:checked{{ background:{ACCENT}; color:#06222a; font-weight:700; }}
+            QPushButton#exitbtn{{ text-align:left; background:rgba(224,108,117,0.10);
+                color:#e6a3a9; border:1px solid rgba(224,108,117,0.25);
+                border-radius:10px; padding:9px 12px; font-size:13px; font-weight:600; }}
+            QPushButton#exitbtn:hover{{ background:{DANGER}; color:#2a0a0c;
+                border:1px solid {DANGER}; }}
+            #pagehead{{ background:transparent; }}
+            #pagetitle{{ color:#fff; font-size:20px; font-weight:800; }}
+            #pagesub{{ color:#94a3a6; font-size:13px; }}
+            QPushButton#backbtn{{ background:rgba(255,255,255,0.06); color:#cfe9ee;
+                border:1px solid rgba(255,255,255,0.12); border-radius:10px;
+                padding:7px 14px; font-size:13px; font-weight:600; }}
+            QPushButton#backbtn:hover{{ background:rgba(255,255,255,0.14); color:#fff; }}
+            QPushButton#backbtn:disabled{{ color:#5c686b;
+                background:rgba(255,255,255,0.03);
+                border:1px solid rgba(255,255,255,0.05); }}
+            #brand{{ color:rgba(255,255,255,0.30); font-size:11px;
+                qproperty-alignment:'AlignCenter'; padding:4px; }}
+            QLineEdit{{ background:#0e1117; color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.12); border-radius:11px;
+                padding:10px 14px; font-size:14px; }}
+            QLineEdit:focus{{ border:1px solid {ACCENT}; }}
+            QLabel#sectiontitle{{ color:#fff; font-size:16px; font-weight:800;
+                padding-left:2px; }}
+            QScrollArea#scroll{{ background:transparent; border:none; }}
+            QScrollArea#scroll > QWidget > QWidget{{ background:transparent; }}
+            QScrollBar:vertical{{ background:transparent; width:10px; }}
+            QScrollBar::handle:vertical{{ background:rgba(255,255,255,0.18);
+                border-radius:5px; min-height:30px; }}
+            QScrollBar::add-line,QScrollBar::sub-line{{ height:0; width:0; }}
+            QFrame#card2{{ background:#0e1117;
+                border:1px solid rgba(255,255,255,0.07); border-radius:14px; }}
+            QFrame#row{{ background:#0e1117;
+                border:1px solid rgba(255,255,255,0.07); border-radius:12px; }}
+            QFrame#row[active="true"]{{ background:#13212a;
+                border:1px solid {ACCENT}; }}
+            QLabel#h2{{ color:#fff; font-size:16px; font-weight:800; }}
+            QLabel#rowname{{ color:#f3f7f8; font-size:14px; font-weight:700; }}
+            QLabel#rowsub{{ color:#94a3a6; font-size:12px; }}
+            QLabel#big{{ color:#fff; font-size:17px; font-weight:700; }}
+            QLabel#muted{{ color:#94a3a6; font-size:13px; }}
+            QLabel#pill{{ color:{ACCENT}; background:rgba(86,197,216,0.12);
+                border-radius:8px; padding:3px 10px; font-size:11px;
+                font-weight:700; }}
+            QComboBox{{ background:#0e1117; color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.12); border-radius:10px;
+                padding:7px 11px; font-size:13px; }}
+            QComboBox:focus{{ border:1px solid {ACCENT}; }}
+            QComboBox QAbstractItemView{{ background:#14161d; color:#e8eef0;
+                selection-background-color:{ACCENT}; selection-color:#06222a; }}
+            QCheckBox{{ color:#c6d2d5; font-size:13px; }}
+            QSlider::groove:horizontal{{ height:6px; background:rgba(255,255,255,0.10);
+                border-radius:3px; }}
+            QSlider::sub-page:horizontal{{ background:{ACCENT}; border-radius:3px; }}
+            QSlider::handle:horizontal{{ background:#e8eef0; width:16px;
+                margin:-6px 0; border-radius:8px; }}
+        """ + btn_qss()
+
+    # ─────────────────────────────── chrome ──────────────────────────────
+    class WinBtn(QPushButton):
+        """A circular window-control button (close / minimise) matching the rest
+        of the HasH suite: a flat coloured disc whose glyph is *painted*
+        (vector minus / cross) so it never depends on a glyph font being present
+        — which is why the old text "—"/"✕" buttons could look icon-less.
+
+        kind="close"  -> danger-red disc, white cross
+        kind="min"    -> neutral disc, white minus
+        Both brighten on hover."""
+        def __init__(self, kind):
+            super().__init__()
+            self.kind = kind
+            self.setFixedSize(28, 28)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setFlat(True)
+            self._hover = False
+            self.setStyleSheet("QPushButton{ background:transparent; border:none; }")
+
+        def enterEvent(self, e):
+            self._hover = True
+            self.update()
+            super().enterEvent(e)
+
+        def leaveEvent(self, e):
+            self._hover = False
+            self.update()
+            super().leaveEvent(e)
+
+        def paintEvent(self, _e):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = self.rect().adjusted(3, 3, -3, -3)
+            if self.kind == "close":
+                disc = QColor(DANGER) if self._hover else QColor(224, 108, 117, 90)
+            else:
+                disc = QColor(ACCENT) if self._hover else QColor(255, 255, 255, 28)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(disc)
+            p.drawEllipse(r)
+            # glyph colour: dark on the bright hover disc, light otherwise
+            gc = QColor(0x12, 0x14, 0x1a) if self._hover else QColor("#e8eef0")
+            pen = p.pen()
+            pen.setColor(gc)
+            pen.setWidthF(1.8)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            cx, cy = r.center().x() + 0.5, r.center().y() + 0.5
+            d = 4.5
+            if self.kind == "close":
+                p.drawLine(int(cx - d), int(cy - d), int(cx + d), int(cy + d))
+                p.drawLine(int(cx - d), int(cy + d), int(cx + d), int(cy - d))
+            else:  # minimise: a horizontal bar
+                p.drawLine(int(cx - d), int(cy), int(cx + d), int(cy))
+
+    class TitleBar(QWidget):
+        def __init__(self, win):
+            super().__init__(win)
+            self.win, self._off = win, None
+            self.setFixedHeight(46)
+            h = QHBoxLayout(self)
+            h.setContentsMargins(18, 0, 12, 0)
+            h.setSpacing(8)
+            ttl = QLabel("  HasH Settings")
+            ttl.setObjectName("apptitle")
+            mn, cl = WinBtn("min"), WinBtn("close")
+            mn.setToolTip("Minimise")
+            cl.setToolTip("Close")
+            mn.clicked.connect(win.showMinimized)
+            cl.clicked.connect(win.close)
+            h.addWidget(ttl)
+            h.addStretch(1)
+            h.addWidget(mn)
+            h.addWidget(cl)
+
+        def mousePressEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self._off = e.globalPosition().toPoint() \
+                    - self.win.frameGeometry().topLeft()
+
+        def mouseMoveEvent(self, e):
+            if self._off is not None and (e.buttons() & Qt.MouseButton.LeftButton):
+                self.win.move(e.globalPosition().toPoint() - self._off)
+
+        def mouseReleaseEvent(self, e):
+            self._off = None
+
+    class PageHeader(QWidget):
+        """[← Back]  Title / subtitle  …… (actions slot)."""
+        def __init__(self, title, subtitle=""):
+            super().__init__()
+            self.setObjectName("pagehead")
+            h = QHBoxLayout(self)
+            h.setContentsMargins(2, 0, 2, 0)
+            h.setSpacing(12)
+            self.back = QPushButton("←  Back")
+            self.back.setObjectName("backbtn")
+            self.back.setCursor(Qt.CursorShape.PointingHandCursor)
+            tcol = QVBoxLayout()
+            tcol.setSpacing(1)
+            self.title = QLabel(title)
+            self.title.setObjectName("pagetitle")
+            self.sub = QLabel(subtitle)
+            self.sub.setObjectName("pagesub")
+            self.sub.setVisible(bool(subtitle))
+            tcol.addWidget(self.title)
+            tcol.addWidget(self.sub)
+            self.actions = QHBoxLayout()
+            self.actions.setSpacing(8)
+            h.addWidget(self.back, 0)
+            h.addLayout(tcol, 0)
+            h.addStretch(1)
+            h.addLayout(self.actions)
+
+        def add_action(self, w):
+            self.actions.addWidget(w)
+
+        def set_can_back(self, can):
+            self.back.setEnabled(can)
+
+    class PageRouter(QWidget):
+        """Keyed page container with history + fade transitions (hash-store)."""
+        navigated = pyqtSignal(str)
+
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            self.stack = QStackedWidget()
+            v.addWidget(self.stack)
+            self._index = {}
+            self._keys = {}
+            self._history = []
+            self._anim = None
+
+        def add_page(self, key, widget):
+            self._index[key] = self.stack.addWidget(widget)
+            self._keys[key] = widget
+
+        def widget(self, key):
+            return self._keys.get(key)
+
+        def current_key(self):
+            return self._history[-1] if self._history else None
+
+        def can_back(self):
+            return len(self._history) > 1
+
+        def _leave_current(self, going_to):
+            cur = self.current_key()
+            if cur and cur != going_to:
+                w = self._keys.get(cur)
+                if w is not None and hasattr(w, "leaving"):
+                    try:
+                        w.leaving()
+                    except Exception:
+                        pass
+
+        def navigate(self, key, record=True):
+            if key not in self._index:
+                return
+            self._leave_current(key)
+            if record:
+                if self._history and self._history[-1] == key:
+                    record = False
+                else:
+                    self._history.append(key)
+            self.stack.setCurrentIndex(self._index[key])
+            self._fade(self._keys[key])
+            self.navigated.emit(key)
+
+        def back(self):
+            if not self.can_back():
+                return False
+            leaving_key = self._history.pop()
+            key = self._history[-1]
+            w = self._keys.get(leaving_key)
+            if w is not None and hasattr(w, "leaving"):
+                try:
+                    w.leaving()
+                except Exception:
+                    pass
+            self.stack.setCurrentIndex(self._index[key])
+            self._fade(self._keys[key])
+            self.navigated.emit(key)
+            return True
+
+        def _fade(self, w):
+            eff = QGraphicsOpacityEffect(w)
+            w.setGraphicsEffect(eff)
+            self._anim = QPropertyAnimation(eff, b"opacity", self)
+            self._anim.setDuration(180)
+            self._anim.setStartValue(0.0)
+            self._anim.setEndValue(1.0)
+            self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._anim.finished.connect(lambda: w.setGraphicsEffect(None))
+            self._anim.start()
+
+    # ──────────────────────────── cards / toggles ────────────────────────
+    class EntryCard(QFrame):
+        """A rounded, hoverable settings tile: clicking it opens the page that
+        hosts this feature."""
+        def __init__(self, win, entry, section_key=None):
+            super().__init__()
+            self.win, self.entry = win, entry
+            self.section_key = section_key or entry.get("target")
+            self.enabled = entry_available(entry)
+            self.setObjectName("card")
+            self.setFixedHeight(96)
+            self.setMinimumWidth(250)
+            self.setProperty("disabled", not self.enabled)
+            if self.enabled:
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            v = QHBoxLayout(self)
+            v.setContentsMargins(16, 14, 16, 14)
+            v.setSpacing(14)
+            ic = QLabel()
+            ic.setFixedSize(40, 40)
+            px = QIcon.fromTheme(entry.get("icon", "configure")).pixmap(QSize(40, 40))
+            ic.setPixmap(px)
+            v.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+            tcol = QVBoxLayout()
+            tcol.setSpacing(3)
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            nm = QLabel(entry["name"])
+            nm.setObjectName("cardname")
+            nm.setProperty("disabled", not self.enabled)
+            row.addWidget(nm, 0)
+            kindlbl = {"hash": "HASH", "page": "SETTINGS"}.get(entry["kind"], "")
+            if kindlbl:
+                kl = QLabel(kindlbl)
+                kl.setObjectName("cardkind")
+                row.addWidget(kl, 0)
+            row.addStretch(1)
+            tcol.addLayout(row)
+            sm = QLabel(entry.get("comment", "") if self.enabled
+                        else "Not available on this system")
+            sm.setObjectName("cardsumm")
+            sm.setWordWrap(True)
+            tcol.addWidget(sm, 1)
+            v.addLayout(tcol, 1)
+            self.setStyleSheet(card_qss())
+
+        def enterEvent(self, e):
+            if self.enabled:
+                self.setProperty("hover", True)
+                self.setStyleSheet(card_qss())
+            super().enterEvent(e)
+
+        def leaveEvent(self, e):
+            self.setProperty("hover", False)
+            self.setStyleSheet(card_qss())
+            super().leaveEvent(e)
+
+        def mouseReleaseEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton and self.enabled \
+                    and self.section_key:
+                self.win.go(self.section_key)
+            super().mouseReleaseEvent(e)
+
+    class ToggleCard(QFrame):
+        """A live quick-toggle tile (icon + name + On/Off) on the Overview."""
+        def __init__(self, win, spec):
+            super().__init__()
+            self.win, self.spec = win, spec
+            self.setObjectName("toggle")
+            self.setFixedSize(170, 92)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            v = QVBoxLayout(self)
+            v.setContentsMargins(16, 13, 16, 13)
+            v.setSpacing(6)
+            top = QHBoxLayout()
+            top.setSpacing(10)
+            ic = QLabel()
+            ic.setFixedSize(30, 30)
+            ic.setPixmap(QIcon.fromTheme(spec.get("icon", "configure"))
+                         .pixmap(QSize(30, 30)))
+            top.addWidget(ic, 0)
+            nm = QLabel(spec["name"])
+            nm.setObjectName("togname")
+            top.addWidget(nm, 1)
+            v.addLayout(top)
+            self.state = QLabel("…")
+            self.state.setObjectName("togstate")
+            v.addWidget(self.state)
+            self.setStyleSheet(toggle_qss())
+            self.refresh()
+
+        def refresh(self):
+            try:
+                on = bool(self.spec["get"]())
+            except Exception:
+                on = False
+            self.setProperty("on", on)
+            self.state.setProperty("on", on)
+            self.state.setText("On" if on else "Off")
+            self.setStyleSheet(toggle_qss())
+
+        def mouseReleaseEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                try:
+                    cur = bool(self.spec["get"]())
+                    self.spec["set"](not cur)
+                except Exception:
+                    pass
+                QTimer.singleShot(500, self.refresh)
+            super().mouseReleaseEvent(e)
+
+    # ──────────────────────────── overview page ──────────────────────────
+    class OverviewPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self._toggle_cards = []
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(12)
+            self.header = PageHeader("HasH-Arch Settings",
+                                     "One hub for KDE settings and the HasH suite")
+            self.header.back.clicked.connect(win.go_back)
+            outer.addWidget(self.header)
+
+            self.search = QLineEdit()
+            self.search.setPlaceholderText("Search every setting…")
+            self.search.textChanged.connect(self._on_search)
+            self.search.setClearButtonEnabled(True)
+            outer.addWidget(self.search)
+
+            sc = QScrollArea()
+            sc.setObjectName("scroll")
+            sc.setWidgetResizable(True)
+            sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            inner = QWidget()
+            iv = QVBoxLayout(inner)
+            iv.setContentsMargins(2, 2, 10, 10)
+            iv.setSpacing(16)
+
+            # quick toggles (only those whose backend exists)
+            self.togTitle = QLabel("Quick toggles")
+            self.togTitle.setObjectName("sectiontitle")
+            iv.addWidget(self.togTitle)
+            self.togRow = QWidget()
+            tl = QHBoxLayout(self.togRow)
+            tl.setContentsMargins(0, 0, 0, 0)
+            tl.setSpacing(12)
+            any_tog = False
+            for spec in TOGGLES:
+                try:
+                    ok = spec["avail"]()
+                except Exception:
+                    ok = False
+                if not ok:
+                    continue   # hide toggle whose backend is missing
+                c = ToggleCard(win, spec)
+                self._toggle_cards.append(c)
+                tl.addWidget(c)
+                any_tog = True
+            tl.addStretch(1)
+            if not any_tog:
+                self.togTitle.hide()
+                self.togRow.hide()
+            iv.addWidget(self.togRow)
+
+            # search-results grid (hidden until the user types)
+            self.resTitle = QLabel("Results")
+            self.resTitle.setObjectName("sectiontitle")
+            self.resTitle.hide()
+            iv.addWidget(self.resTitle)
+            self.resWrap = QWidget()
+            self.resGrid = QGridLayout(self.resWrap)
+            self.resGrid.setContentsMargins(0, 0, 0, 0)
+            self.resGrid.setHorizontalSpacing(12)
+            self.resGrid.setVerticalSpacing(12)
+            self.resWrap.hide()
+            iv.addWidget(self.resWrap)
+
+            # category shortcuts grid (the default landing content)
+            self.catTitle = QLabel("All settings")
+            self.catTitle.setObjectName("sectiontitle")
+            iv.addWidget(self.catTitle)
+            self.catWrap = QWidget()
+            cg = QGridLayout(self.catWrap)
+            cg.setContentsMargins(0, 0, 0, 0)
+            cg.setHorizontalSpacing(12)
+            cg.setVerticalSpacing(12)
+            col = r = 0
+            for key, label, icon, _page, entries in SECTIONS:
+                if key == "overview":
+                    continue
+                cg.addWidget(self._cat_tile(key, label, icon, entries), r, col)
+                col += 1
+                if col >= 3:
+                    col = 0
+                    r += 1
+            iv.addWidget(self.catWrap)
+            iv.addStretch(1)
+            sc.setWidget(inner)
+            outer.addWidget(sc, 1)
+
+        def _cat_tile(self, key, label, icon, entries):
+            navi = sum(1 for e in entries if entry_available(e))
+            card = QFrame()
+            card.setObjectName("card")
+            card.setFixedHeight(96)
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            v = QHBoxLayout(card)
+            v.setContentsMargins(16, 14, 16, 14)
+            v.setSpacing(14)
+            ic = QLabel()
+            ic.setFixedSize(40, 40)
+            ic.setPixmap(QIcon.fromTheme(icon).pixmap(QSize(40, 40)))
+            v.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+            tcol = QVBoxLayout()
+            tcol.setSpacing(3)
+            nm = QLabel(label)
+            nm.setObjectName("cardname")
+            tcol.addWidget(nm)
+            if key == "kde":
+                n = len(kcm_list())
+                desc = ("%d KDE modules" % n) if n else "All KDE modules"
+            else:
+                desc = "%d item%s" % (navi, "" if navi == 1 else "s")
+            sm = QLabel(desc)
+            sm.setObjectName("cardsumm")
+            tcol.addWidget(sm)
+            v.addLayout(tcol, 1)
+            card.setStyleSheet(card_qss())
+
+            def _enter(_e, c=card):
+                c.setProperty("hover", True)
+                c.setStyleSheet(card_qss())
+
+            def _leave(_e, c=card):
+                c.setProperty("hover", False)
+                c.setStyleSheet(card_qss())
+            card.enterEvent = _enter
+            card.leaveEvent = _leave
+            card.mouseReleaseEvent = lambda e, k=key: (
+                self.win.go(k) if e.button() == Qt.MouseButton.LeftButton else None)
+            return card
+
+        def focus_default(self):
+            self.search.setFocus()
+            for c in self._toggle_cards:
+                c.refresh()
+
+        def _on_search(self, text):
+            t = text.lower().strip()
+            # clear previous result cards
+            while self.resGrid.count():
+                w = self.resGrid.takeAt(0).widget()
+                if w:
+                    w.deleteLater()
+            if not t:
+                self.resTitle.hide()
+                self.resWrap.hide()
+                self.catTitle.show()
+                self.catWrap.show()
+                if self._toggle_cards:
+                    self.togTitle.show()
+                    self.togRow.show()
+                return
+            # fuzzy: every search token must appear somewhere in the entry text
+            toks = t.split()
+            matches = []
+            for key, e in all_entries():
+                hay = (e["name"] + " " + e.get("comment", "") + " "
+                       + e["kind"] + " " + str(e.get("target", ""))).lower()
+                if all(tok in hay for tok in toks):
+                    matches.append((key, e))
+            self.catTitle.hide()
+            self.catWrap.hide()
+            self.togTitle.hide()
+            self.togRow.hide()
+            self.resTitle.setText("Results (%d)" % len(matches))
+            self.resTitle.show()
+            self.resWrap.show()
+            if not matches:
+                lbl = QLabel("No settings match “%s”." % text)
+                lbl.setObjectName("cardsumm")
+                self.resGrid.addWidget(lbl, 0, 0)
+                return
+            col = r = 0
+            for key, e in matches:
+                self.resGrid.addWidget(EntryCard(self.win, e, key), r, col)
+                col += 1
+                if col >= 2:
+                    col = 0
+                    r += 1
+
+    # ════════════════════ shared page scaffold for custom pages ══════════════
+    class BasePage(QWidget):
+        """A custom category page: header (Back + title) + scrollable body.
+
+        Subclasses override build_body(layout) and may define refresh()."""
+        def __init__(self, win, title, subtitle=""):
+            super().__init__()
+            self.win = win
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(12)
+            self.header = PageHeader(title, subtitle)
+            self.header.back.clicked.connect(win.go_back)
+            outer.addWidget(self.header)
+            sc = QScrollArea()
+            sc.setObjectName("scroll")
+            sc.setWidgetResizable(True)
+            sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            inner = QWidget()
+            self.body = QVBoxLayout(inner)
+            self.body.setContentsMargins(2, 2, 12, 12)
+            self.body.setSpacing(14)
+            self.build_body(self.body)
+            self.body.addStretch(1)
+            sc.setWidget(inner)
+            outer.addWidget(sc, 1)
+
+        def build_body(self, v):
+            pass
+
+        def focus_default(self):
+            if hasattr(self, "refresh"):
+                try:
+                    self.refresh()
+                except Exception:
+                    pass
+
+        # small builders shared by the custom pages
+        def section(self, v, title):
+            lbl = QLabel(title)
+            lbl.setObjectName("h2")
+            v.addWidget(lbl)
+
+        def card(self):
+            f = QFrame()
+            f.setObjectName("card2")
+            cv = QVBoxLayout(f)
+            cv.setContentsMargins(18, 16, 18, 16)
+            cv.setSpacing(12)
+            return f, cv
+
+        def open_kcm(self, module, label="Open in System Settings", title=None):
+            """A clearly-labelled button that opens a KDE module *inside*
+            hash-settings (embedded, with a Back button) when X11 reparenting is
+            possible, falling back to its own window otherwise.  Routes through
+            the shared in-app module host so nothing detaches unexpectedly.
+            `label` is the button text; `title` (defaults to label) is the
+            in-app page title shown for the module."""
+            page_title = title or label
+            b = QPushButton(label)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(
+                lambda: self.win.open_module(module, page_title))
+            b.setEnabled(kcm_launchable())
+            return b
+
+    # ════════════════════ embedded KDE module (KCM) host ═════════════════════
+    class EmbeddedKCM(QWidget):
+        """Hosts a real KDE KCM *inside* this window by launching
+        `kcmshell6 <module>` and reparenting its X11 window into a
+        QWidget.createWindowContainer.  Emits failed() if it can't embed within
+        the timeout (platform not xcb, xprop missing, window never appeared, or
+        the process died) so the host page can show a launch fallback."""
+        embedded = pyqtSignal()
+        failed = pyqtSignal(str)
+
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+            self.proc = None
+            self.container = None
+            self.foreign = None
+            self._tries = 0
+            self._before = set()
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(0)
+            self._layout = v
+            self._status = QLabel("Loading %s…" % module)
+            self._status.setObjectName("muted")
+            self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            v.addWidget(self._status, 1)
+
+        def start(self):
+            if not _on_x11():
+                self.failed.emit("not-x11")
+                return
+            self._before = set(_xprop_root_windows())
+            self.proc = QProcess(self)
+            self.proc.setProgram(KCMSHELL)
+            self.proc.setArguments([self.module])
+            self.proc.finished.connect(self._on_proc_done)
+            self.proc.start()
+            if not self.proc.waitForStarted(3000):
+                self.failed.emit("spawn")
+                return
+            self._tries = 0
+            QTimer.singleShot(400, self._poll)
+
+        def _on_proc_done(self, *a):
+            # The kcmshell6 launcher can exit early after handing off to an
+            # existing instance.  Don't fail immediately — give the poller a few
+            # more rounds to spot a new window by PID, then by "newest new
+            # window".  Only the poll timeout reports a hard failure.
+            self._exited = True
+
+        def _poll(self):
+            if self.foreign is not None:
+                return
+            self._tries += 1
+            pid = int(self.proc.processId()) if self.proc else 0
+            wid = find_kcm_window(pid, self._before) if pid else None
+            # late fallback: if the launcher exited or PID matching keeps
+            # missing, accept the newest window that appeared after we started.
+            if not wid and (getattr(self, "_exited", False) or self._tries >= 12):
+                new = [w for w in _xprop_root_windows() if w not in self._before]
+                if new:
+                    wid = new[-1]
+            if wid:
+                self._embed(wid)
+                return
+            if self._tries >= 40:                 # ~10s @ 250ms
+                self.failed.emit("timeout")
+                return
+            QTimer.singleShot(250, self._poll)
+
+        def _embed(self, wid):
+            try:
+                self.foreign = QWindow.fromWinId(wid)
+                self.container = QWidget.createWindowContainer(
+                    self.foreign, self)
+                self.container.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                self._status.hide()
+                self._layout.addWidget(self.container, 1)
+                self.embedded.emit()
+            except Exception as e:
+                self.failed.emit("embed:%s" % e)
+
+        def shutdown(self):
+            if self.proc is not None:
+                try:
+                    self.proc.finished.disconnect()
+                except Exception:
+                    pass
+                if self.proc.state() != QProcess.ProcessState.NotRunning:
+                    self.proc.terminate()
+                    if not self.proc.waitForFinished(1500):
+                        self.proc.kill()
+
+    class KCMHostPage(BasePage):
+        """Shared in-app page that hosts a single KDE module.  It tries to embed
+        the KCM (EmbeddedKCM); if embedding isn't possible it shows a clear
+        elevation/launch panel.  Either way the user gets a consistent header
+        with Back — never a silently-detached window."""
+        def __init__(self, win):
+            super().__init__(win, "KDE module", "")
+            self._kcm = None
+
+        def build_body(self, v):
+            self._body = v
+            self._host = QWidget()
+            self._host.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                     QSizePolicy.Policy.Expanding)
+            self._host.setMinimumHeight(420)
+            self._hostLay = QVBoxLayout(self._host)
+            self._hostLay.setContentsMargins(0, 0, 0, 0)
+            # large stretch so the embedded module dominates over BasePage's
+            # trailing addStretch(1) and fills the page height.
+            v.addWidget(self._host, 100)
+
+        def _clear_host(self):
+            if self._kcm is not None:
+                self._kcm.shutdown()
+                self._kcm = None
+            while self._hostLay.count():
+                it = self._hostLay.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def load(self, module, label=None, privileged=False):
+            """(Re)point this page at a module."""
+            self.module = module
+            self.header.title.setText(label or module)
+            sub = module
+            if privileged or _is_privileged(module):
+                sub += "   ·   asks for a password itself (polkit)"
+            self.header.sub.setText(sub)
+            self.header.sub.setVisible(True)
+            self._clear_host()
+            # try to embed; fall back to a launch panel
+            if _on_x11() and kcm_launchable():
+                kcm = EmbeddedKCM(module)
+                self._kcm = kcm
+                kcm.failed.connect(lambda why, m=module: self._fallback(m, why))
+                self._hostLay.addWidget(kcm, 1)
+                kcm.start()
+            else:
+                self._fallback(module, "not-x11")
+
+        def _fallback(self, module, why):
+            # embedding unavailable — present a tidy in-app launch panel
+            self._clear_host()
+            panel = QFrame()
+            panel.setObjectName("card2")
+            pv = QVBoxLayout(panel)
+            pv.setContentsMargins(24, 24, 24, 24)
+            pv.setSpacing(12)
+            ic = QLabel()
+            ic.setPixmap(QIcon.fromTheme("configure").pixmap(QSize(48, 48)))
+            ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pv.addWidget(ic)
+            ttl = QLabel(self.header.title.text())
+            ttl.setObjectName("big")
+            ttl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pv.addWidget(ttl)
+            reason = {
+                "not-x11": "This KDE module opens in its own window on "
+                           "Wayland sessions.",
+                "timeout": "This module took too long to embed; opening it in "
+                           "its own window instead.",
+                "exited": "This module closed before it could be embedded.",
+                "spawn": "Could not start kcmshell6.",
+            }.get(why.split(":", 1)[0],
+                  "Opening this module in its own window.")
+            msg = QLabel(reason)
+            msg.setObjectName("muted")
+            msg.setWordWrap(True)
+            msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pv.addWidget(msg)
+            if _is_privileged(module):
+                pill = QLabel("This module elevates via polkit when needed.")
+                pill.setObjectName("muted")
+                pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                pv.addWidget(pill)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            b = QPushButton("Open “%s” in its own window"
+                            % self.header.title.text())
+            b.setObjectName("primary")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setEnabled(kcm_launchable())
+            b.clicked.connect(lambda: self.win.spawn(launch_kcm(module)))
+            row.addWidget(b)
+            row.addStretch(1)
+            pv.addLayout(row)
+            wrap = QWidget()
+            wl = QVBoxLayout(wrap)
+            wl.addStretch(1)
+            wl.addWidget(panel, 0, Qt.AlignmentFlag.AlignCenter)
+            wl.addStretch(1)
+            self._hostLay.addWidget(wrap, 1)
+
+        def leaving(self):
+            # called by the router when we navigate away — tear down the child
+            self._clear_host()
+
+    # ─────────────────────────────── Network page ────────────────────────────
+    class NetworkPage(BasePage):
+        def __init__(self, win):
+            super().__init__(win, "Network",
+                             "Wi-Fi and Bluetooth, managed natively")
+
+        def build_body(self, v):
+            # Wi-Fi block
+            self.section(v, "Wi-Fi")
+            self.wifiCard, wc = self.card()
+            top = QHBoxLayout()
+            self.wifiToggle = QPushButton()
+            self.wifiToggle.setObjectName("primary")
+            self.wifiToggle.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.wifiToggle.clicked.connect(self._toggle_wifi)
+            rescan = QPushButton("Rescan")
+            rescan.setCursor(Qt.CursorShape.PointingHandCursor)
+            rescan.clicked.connect(self.refresh)
+            top.addWidget(self.wifiToggle)
+            top.addStretch(1)
+            top.addWidget(rescan)
+            wc.addLayout(top)
+            self.wifiList = QVBoxLayout()
+            self.wifiList.setSpacing(8)
+            wc.addLayout(self.wifiList)
+            v.addWidget(self.wifiCard)
+
+            # Bluetooth block
+            self.section(v, "Bluetooth")
+            self.btCard, bc = self.card()
+            btop = QHBoxLayout()
+            self.btToggle = QPushButton()
+            self.btToggle.setObjectName("primary")
+            self.btToggle.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btToggle.clicked.connect(self._toggle_bt)
+            btop.addWidget(self.btToggle)
+            btop.addStretch(1)
+            self.btCard.setVisible(bt_available())
+            bc.addLayout(btop)
+            self.btList = QVBoxLayout()
+            self.btList.setSpacing(8)
+            bc.addLayout(self.btList)
+            v.addWidget(self.btCard)
+            self.refresh()
+
+        def _clear(self, lay):
+            while lay.count():
+                it = lay.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def refresh(self):
+            # Wi-Fi
+            if not wifi_available():
+                self.wifiToggle.setEnabled(False)
+                self.wifiToggle.setText("nmcli not installed")
+            else:
+                on = wifi_state()
+                self.wifiToggle.setText("Wi-Fi: On — turn off" if on
+                                        else "Wi-Fi: Off — turn on")
+                self._clear(self.wifiList)
+                if on:
+                    nets = wifi_scan()
+                    if not nets:
+                        self.wifiList.addWidget(self._note("No networks found."))
+                    for n in nets:
+                        self.wifiList.addWidget(self._wifi_row(n))
+            # Bluetooth
+            self.btCard.setVisible(bt_available())
+            if bt_available():
+                on = bt_state()
+                self.btToggle.setText("Bluetooth: On — turn off" if on
+                                      else "Bluetooth: Off — turn on")
+                self._clear(self.btList)
+                if on:
+                    devs = bt_devices()
+                    if not devs:
+                        self.btList.addWidget(self._note(
+                            "No known devices. Pair from your device's menu."))
+                    for d in devs:
+                        self.btList.addWidget(self._bt_row(d))
+
+        def _note(self, text):
+            l = QLabel(text)
+            l.setObjectName("rowsub")
+            return l
+
+        def _row_frame(self, active=False):
+            f = QFrame()
+            f.setObjectName("row")
+            f.setProperty("active", active)
+            h = QHBoxLayout(f)
+            h.setContentsMargins(14, 10, 14, 10)
+            h.setSpacing(12)
+            return f, h
+
+        def _wifi_row(self, n):
+            f, h = self._row_frame(n["active"])
+            ic = QLabel()
+            ic.setPixmap(QIcon.fromTheme("network-wireless").pixmap(QSize(24, 24)))
+            h.addWidget(ic)
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            nm = QLabel(n["ssid"])
+            nm.setObjectName("rowname")
+            sub = QLabel("%s%%  ·  %s%s" % (
+                n["signal"], n["security"],
+                "  ·  saved" if n["known"] else ""))
+            sub.setObjectName("rowsub")
+            col.addWidget(nm)
+            col.addWidget(sub)
+            h.addLayout(col, 1)
+            if n["active"]:
+                st = QLabel("Connected")
+                st.setObjectName("pill")
+                h.addWidget(st)
+                btn = QPushButton("Disconnect")
+                btn.clicked.connect(lambda: self._do_wifi_disconnect(n["ssid"]))
+                h.addWidget(btn)
+            else:
+                btn = QPushButton("Connect")
+                btn.setObjectName("primary")
+                btn.clicked.connect(lambda: self._do_wifi_connect(n))
+                h.addWidget(btn)
+            return f
+
+        def _do_wifi_connect(self, n):
+            pw = None
+            secured = n["security"] and n["security"].lower() not in ("", "open", "--")
+            if secured and not n["known"]:
+                pw, ok = QInputDialog.getText(
+                    self.win, "Wi-Fi password",
+                    "Password for “%s”:" % n["ssid"],
+                    QLineEdit.EchoMode.Password)
+                if not ok:
+                    return
+            self.win.status("Connecting to %s…" % n["ssid"])
+            ok, msg = wifi_connect(n["ssid"], pw)
+            self.win.status("Connected." if ok else ("Failed: " + msg[:60]))
+            QTimer.singleShot(800, self.refresh)
+
+        def _do_wifi_disconnect(self, ssid):
+            wifi_disconnect(ssid)
+            QTimer.singleShot(500, self.refresh)
+
+        def _toggle_wifi(self):
+            wifi_set(not wifi_state())
+            QTimer.singleShot(900, self.refresh)
+
+        def _bt_row(self, d):
+            f, h = self._row_frame(d["connected"])
+            ic = QLabel()
+            ic.setPixmap(QIcon.fromTheme("network-bluetooth").pixmap(QSize(24, 24)))
+            h.addWidget(ic)
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            nm = QLabel(d["name"])
+            nm.setObjectName("rowname")
+            sub = QLabel(d["mac"])
+            sub.setObjectName("rowsub")
+            col.addWidget(nm)
+            col.addWidget(sub)
+            h.addLayout(col, 1)
+            btn = QPushButton("Disconnect" if d["connected"] else "Connect")
+            if not d["connected"]:
+                btn.setObjectName("primary")
+            btn.clicked.connect(lambda: self._do_bt(d["mac"], not d["connected"]))
+            h.addWidget(btn)
+            return f
+
+        def _do_bt(self, mac, connect):
+            self.win.status("Bluetooth: working…")
+            ok, msg = bt_connect(mac, connect)
+            self.win.status("Done." if ok else ("Failed: " + msg[:60]))
+            QTimer.singleShot(900, self.refresh)
+
+        def _toggle_bt(self):
+            bt_set(not bt_state())
+            QTimer.singleShot(900, self.refresh)
+
+    # ────────────────────────────── Appearance page ──────────────────────────
+    class AppearancePage(BasePage):
+        def __init__(self, win):
+            super().__init__(win, "Appearance",
+                             "Theme, icons and the live wallpaper visualiser")
+
+        def build_body(self, v):
+            # Theme
+            self.section(v, "Global Theme")
+            tcard, tc = self.card()
+            row = QHBoxLayout()
+            row.addWidget(self._lbl("Choose a light or dark look & feel.", True), 1)
+            self.darkBtn = QPushButton("Dark")
+            self.lightBtn = QPushButton("Light")
+            for b in (self.darkBtn, self.lightBtn):
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.darkBtn.clicked.connect(lambda: self._set_theme(True))
+            self.lightBtn.clicked.connect(lambda: self._set_theme(False))
+            row.addWidget(self.lightBtn)
+            row.addWidget(self.darkBtn)
+            tc.addLayout(row)
+            if not theme_available():
+                tc.addWidget(self._lbl("Theme tools unavailable on this system.",
+                                       True))
+                self.darkBtn.setEnabled(False)
+                self.lightBtn.setEnabled(False)
+            v.addWidget(tcard)
+
+            # Icons
+            self.section(v, "Icon Theme")
+            icard, ic = self.card()
+            irow = QHBoxLayout()
+            irow.addWidget(self._lbl("Icon theme:", True), 0)
+            self.iconBox = QComboBox()
+            self.iconBox.setMinimumWidth(240)
+            irow.addWidget(self.iconBox, 1)
+            applyI = QPushButton("Apply")
+            applyI.setObjectName("primary")
+            applyI.clicked.connect(self._apply_icons)
+            irow.addWidget(applyI)
+            ic.addLayout(irow)
+            v.addWidget(icard)
+
+            # Visualiser
+            self.section(v, "Music Visualiser")
+            vcard, vc = self.card()
+            vc.addWidget(self._lbl(
+                "Enable/disable and pick the colour scheme of the wallpaper "
+                "audio visualiser (writes the live com.hash.matrixrain config).",
+                True))
+            self.visEnable = QCheckBox("Show the visualiser on the wallpaper")
+            self.visEnable.setChecked(vis_state())
+            vc.addWidget(self.visEnable)
+            crow = QHBoxLayout()
+            crow.addWidget(self._lbl("Colour scheme:", True), 0)
+            self.visBox = QComboBox()
+            for key, label in VIS_COLORS:
+                self.visBox.addItem(label, key)
+            crow.addWidget(self.visBox, 1)
+            applyV = QPushButton("Apply")
+            applyV.setObjectName("primary")
+            applyV.clicked.connect(self._apply_vis)
+            crow.addWidget(applyV)
+            vc.addLayout(crow)
+            if not have("qdbus6") and not have("qdbus"):
+                vc.addWidget(self._lbl("qdbus not found — visualiser writes need "
+                                       "a running Plasma session.", True))
+            v.addWidget(vcard)
+
+            # Wallpaper (picker is hard → button, as instructed)
+            self.section(v, "Wallpaper")
+            wcard, wc = self.card()
+            wrow = QHBoxLayout()
+            wrow.addWidget(self._lbl(
+                "Picking a wallpaper involves Plasma's containment config; open "
+                "the system picker for now.", True), 1)
+            wrow.addWidget(self.open_kcm("kcm_wallpaper", "Choose wallpaper…",
+                                         title="Wallpaper"))
+            wc.addLayout(wrow)
+            v.addWidget(wcard)
+            self.refresh()
+
+        def _lbl(self, text, muted=False):
+            l = QLabel(text)
+            l.setObjectName("muted" if muted else "rowname")
+            l.setWordWrap(True)
+            return l
+
+        def refresh(self):
+            # icons
+            cur = icon_theme_current()
+            self.iconBox.blockSignals(True)
+            self.iconBox.clear()
+            themes = icon_themes()
+            self.iconBox.addItems(themes)
+            if cur and cur in themes:
+                self.iconBox.setCurrentText(cur)
+            self.iconBox.blockSignals(False)
+            # theme buttons reflect current
+            dark = theme_is_dark()
+            self.darkBtn.setObjectName("primary" if dark else "")
+            self.lightBtn.setObjectName("primary" if not dark else "")
+            self.darkBtn.setStyleSheet(btn_qss())
+            self.lightBtn.setStyleSheet(btn_qss())
+            self.visEnable.setChecked(vis_state())
+
+        def _set_theme(self, dark):
+            theme_set_dark(dark)
+            self.win.status("Applying %s theme…" % ("dark" if dark else "light"))
+            QTimer.singleShot(1500, self.refresh)
+
+        def _apply_icons(self):
+            name = self.iconBox.currentText()
+            if name and icon_theme_set(name):
+                self.win.status("Icon theme set to %s." % name)
+            else:
+                self.win.status("Could not set icon theme.")
+
+        def _apply_vis(self):
+            color = self.visBox.currentData()
+            show = self.visEnable.isChecked()
+            ok = vis_apply(color, show)
+            self.win.status("Visualiser updated." if ok
+                            else "Could not reach Plasma to update visualiser.")
+
+    # ───────────────────────────── Display & Sound page ──────────────────────
+    class DisplaySoundPage(BasePage):
+        def __init__(self, win):
+            super().__init__(win, "Display & Sound",
+                             "Audio devices & volume, plus display settings")
+
+        def build_body(self, v):
+            self.section(v, "Output (speakers / headphones)")
+            self.outCard, oc = self.card()
+            orow = QHBoxLayout()
+            self.outBox = QComboBox()
+            self.outBox.setMinimumWidth(260)
+            self.outBox.activated.connect(self._set_out)
+            orow.addWidget(self.outBox, 1)
+            oc.addLayout(orow)
+            ovol = QHBoxLayout()
+            ovol.addWidget(self._lbl("Volume"))
+            self.outVol = QSlider(Qt.Orientation.Horizontal)
+            self.outVol.setRange(0, 100)
+            self.outVol.sliderReleased.connect(
+                lambda: sound_set_volume("sinks", self.outVol.value()))
+            self.outVolLbl = QLabel("")
+            self.outVolLbl.setObjectName("muted")
+            self.outVol.valueChanged.connect(
+                lambda x: self.outVolLbl.setText("%d%%" % x))
+            ovol.addWidget(self.outVol, 1)
+            ovol.addWidget(self.outVolLbl)
+            oc.addLayout(ovol)
+            v.addWidget(self.outCard)
+
+            self.section(v, "Input (microphone)")
+            self.inCard, icl = self.card()
+            irow = QHBoxLayout()
+            self.inBox = QComboBox()
+            self.inBox.setMinimumWidth(260)
+            self.inBox.activated.connect(self._set_in)
+            irow.addWidget(self.inBox, 1)
+            icl.addLayout(irow)
+            ivol = QHBoxLayout()
+            ivol.addWidget(self._lbl("Level"))
+            self.inVol = QSlider(Qt.Orientation.Horizontal)
+            self.inVol.setRange(0, 100)
+            self.inVol.sliderReleased.connect(
+                lambda: sound_set_volume("sources", self.inVol.value()))
+            self.inVolLbl = QLabel("")
+            self.inVolLbl.setObjectName("muted")
+            self.inVol.valueChanged.connect(
+                lambda x: self.inVolLbl.setText("%d%%" % x))
+            ivol.addWidget(self.inVol, 1)
+            ivol.addWidget(self.inVolLbl)
+            icl.addLayout(ivol)
+            v.addWidget(self.inCard)
+
+            if not sound_available():
+                self.outCard.setEnabled(False)
+                self.inCard.setEnabled(False)
+                lbl = QLabel("No audio backend (pactl / wpctl) found.")
+                lbl.setObjectName("muted")
+                v.addWidget(lbl)
+
+            # Display — native reimplementation of monitor layout is complex;
+            # offer the system display KCM as a clearly-labelled fallback.
+            self.section(v, "Display")
+            dcard, dc = self.card()
+            drow = QHBoxLayout()
+            drow.addWidget(self._lbl(
+                "Monitor layout, resolution, refresh rate & scaling. This is "
+                "deferred to KDE's display module (kscreen)."), 1)
+            drow.addWidget(self.open_kcm("kcm_kscreen", "Open display settings…",
+                                         title="Display"))
+            dc.addLayout(drow)
+            v.addWidget(dcard)
+            self.refresh()
+
+        def _lbl(self, text):
+            l = QLabel(text)
+            l.setObjectName("muted")
+            l.setWordWrap(True)
+            return l
+
+        def refresh(self):
+            if not sound_available():
+                return
+            self._fill(self.outBox, sound_devices("sinks"))
+            self._fill(self.inBox, sound_devices("sources"))
+            ov = sound_volume("sinks")
+            self.outVol.blockSignals(True)
+            self.outVol.setValue(ov)
+            self.outVol.blockSignals(False)
+            self.outVolLbl.setText("%d%%" % ov)
+            iv = sound_volume("sources")
+            self.inVol.blockSignals(True)
+            self.inVol.setValue(iv)
+            self.inVol.blockSignals(False)
+            self.inVolLbl.setText("%d%%" % iv)
+
+        def _fill(self, box, devs):
+            box.blockSignals(True)
+            box.clear()
+            cur = 0
+            for i, d in enumerate(devs):
+                box.addItem(d["desc"], d["name"])
+                if d["default"]:
+                    cur = i
+            box.setCurrentIndex(cur)
+            box.blockSignals(False)
+
+        def _set_out(self, _i):
+            name = self.outBox.currentData()
+            if name:
+                sound_set_default("sinks", name)
+                QTimer.singleShot(300, self.refresh)
+
+        def _set_in(self, _i):
+            name = self.inBox.currentData()
+            if name:
+                sound_set_default("sources", name)
+                QTimer.singleShot(300, self.refresh)
+
+    # ──────────────────────────────── Power page ─────────────────────────────
+    class PowerPage(BasePage):
+        TIMEOUTS = [("Never", 0), ("1 minute", 60), ("2 minutes", 120),
+                    ("5 minutes", 300), ("10 minutes", 600),
+                    ("15 minutes", 900), ("30 minutes", 1800)]
+
+        def __init__(self, win):
+            super().__init__(win, "Power", "Energy profile & screen timeout")
+
+        def build_body(self, v):
+            self.section(v, "Power Profile")
+            self.profCard, pc = self.card()
+            self.profRow = QHBoxLayout()
+            pc.addLayout(self.profRow)
+            if not power_available():
+                pc.addWidget(self._lbl(
+                    "power-profiles-daemon (powerprofilesctl) not found. "
+                    "Install it to switch performance / balanced / power-saver."))
+            v.addWidget(self.profCard)
+
+            self.section(v, "Screen Timeout")
+            scard, sc = self.card()
+            srow = QHBoxLayout()
+            srow.addWidget(self._lbl("Turn off the screen after:"), 0)
+            self.toBox = QComboBox()
+            for label, secs in self.TIMEOUTS:
+                self.toBox.addItem(label, secs)
+            srow.addWidget(self.toBox, 1)
+            applyB = QPushButton("Apply")
+            applyB.setObjectName("primary")
+            applyB.clicked.connect(self._apply_timeout)
+            srow.addWidget(applyB)
+            sc.addLayout(srow)
+            if not _kwrite():
+                sc.addWidget(self._lbl(
+                    "kwriteconfig not found — cannot change the KDE screen "
+                    "timeout on this system."))
+                applyB.setEnabled(False)
+            v.addWidget(scard)
+            self.refresh()
+
+        def _lbl(self, text):
+            l = QLabel(text)
+            l.setObjectName("muted")
+            l.setWordWrap(True)
+            return l
+
+        def _clear(self, lay):
+            while lay.count():
+                it = lay.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def refresh(self):
+            self._clear(self.profRow)
+            if power_available():
+                profs, active = power_profiles()
+                self._prof_btns = []
+                for p in profs:
+                    b = QPushButton(p.replace("-", " ").title())
+                    b.setCheckable(True)
+                    b.setChecked(p == active)
+                    b.setObjectName("primary" if p == active else "")
+                    b.setStyleSheet(btn_qss())
+                    b.setCursor(Qt.CursorShape.PointingHandCursor)
+                    b.clicked.connect(lambda _=False, name=p: self._set_prof(name))
+                    self.profRow.addWidget(b)
+                self.profRow.addStretch(1)
+            # screen timeout
+            cur = screen_timeout_get()
+            if cur is not None:
+                idx = self.toBox.findData(cur)
+                if idx < 0:
+                    # add a custom value
+                    self.toBox.addItem("%d s" % cur, cur)
+                    idx = self.toBox.findData(cur)
+                self.toBox.setCurrentIndex(max(0, idx))
+
+        def _set_prof(self, name):
+            power_set_profile(name)
+            self.win.status("Power profile: %s" % name)
+            QTimer.singleShot(600, self.refresh)
+
+        def _apply_timeout(self):
+            secs = self.toBox.currentData()
+            if screen_timeout_set(secs):
+                self.win.status("Screen timeout updated.")
+            else:
+                self.win.status("Could not update screen timeout.")
+
+    # ──────────────────────────────── System page ────────────────────────────
+    class SystemPage(BasePage):
+        def __init__(self, win):
+            super().__init__(win, "System", "About this computer")
+
+        def build_body(self, v):
+            self.section(v, "About HasH-Arch")
+            self.aboutCard, ac = self.card()
+            self.grid = QGridLayout()
+            self.grid.setHorizontalSpacing(20)
+            self.grid.setVerticalSpacing(8)
+            ac.addLayout(self.grid)
+            v.addWidget(self.aboutCard)
+
+            # Privileged & system-level KDE modules.  These open the real KDE
+            # KCM via kcmshell6, which lets each module raise its OWN polkit
+            # password prompt when it needs root — hash-settings is never run as
+            # root.  We try several known module ids per row for portability.
+            self.section(v, "Accounts, time & system modules")
+            ucard, uc = self.card()
+            sysmods = [
+                ("User accounts", ["kcm_users", "user_manager", "users"], True),
+                ("Date, time & timezone",
+                 ["kcm_clock", "kcm_datetime", "clock", "datetime"], True),
+                ("Login screen (SDDM)", ["kcm_sddm", "sddm"], True),
+                ("Boot splash (Plymouth)", ["kcm_plymouth", "plymouth"], True),
+                ("Printers",
+                 ["kcm_printer_manager", "kcm_printers", "printmanager"], False),
+                ("Firewall", ["kcm_firewall", "firewall"], False),
+                ("Language & locale",
+                 ["kcm_regionandlang", "kcm_translations", "formats"], False),
+            ]
+            for label, mods, priv in sysmods:
+                mod = next((m for m in mods if kcm_module_exists(m)), None)
+                if mod is None:
+                    continue
+                row = QHBoxLayout()
+                lbl = QLabel(label + ("   ·  asks for a password when needed"
+                                      if priv else ""))
+                row.addWidget(lbl, 1)
+                row.addWidget(self.open_kcm(mod, "Open…", title=label))
+                uc.addLayout(row)
+            note = QLabel("These open the matching KDE module. Privileged "
+                          "modules (users, clock, login screen, boot splash) "
+                          "raise their own password prompt via polkit — "
+                          "hash-settings never runs as root.")
+            note.setObjectName("muted")
+            note.setWordWrap(True)
+            uc.addWidget(note)
+            v.addWidget(ucard)
+
+            allrow = QHBoxLayout()
+            allrow.addWidget(QLabel("Looking for something else?"), 1)
+            more = QPushButton("Browse all KDE modules…")
+            more.setObjectName("primary")
+            more.setCursor(Qt.CursorShape.PointingHandCursor)
+            more.clicked.connect(lambda: self.win.go("kde"))
+            allrow.addWidget(more)
+            v.addLayout(allrow)
+            self.refresh()
+
+        def refresh(self):
+            while self.grid.count():
+                it = self.grid.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+            info = system_info()
+            rows = [
+                ("Distribution", info["distro"]),
+                ("Kernel", info["kernel"]),
+                ("Architecture", info["arch"]),
+                ("Hostname", info["hostname"]),
+                ("Desktop", info["desktop"] + (
+                    "  (%s)" % info["session"] if info["session"] else "")),
+                ("Processor", "%s  (%d cores)" % (info["cpu"], info["cores"])),
+                ("Memory", info["ram"]),
+                ("Uptime", info["uptime"] or "—"),
+            ]
+            for r, (k, val) in enumerate(rows):
+                kl = QLabel(k)
+                kl.setObjectName("muted")
+                vl = QLabel(str(val))
+                vl.setObjectName("rowname")
+                vl.setWordWrap(True)
+                self.grid.addWidget(kl, r, 0, Qt.AlignmentFlag.AlignTop)
+                self.grid.addWidget(vl, r, 1)
+            self.grid.setColumnStretch(1, 1)
+
+    # ════════════════ embedded HasH-tool panes (native, in-process) ══════════
+    # These render a HasH tool's data INSIDE hash-settings by importing the
+    # tool as a module and calling its module-level backend functions, plus a
+    # button to open the full standalone tool when the user wants the complete
+    # experience (wizards, transaction windows, pkexec flows).
+    class ToolPaneBase(BasePage):
+        TOOL = ""
+        LAUNCH_LABEL = "Open full tool"
+
+        def build_body(self, v):
+            self.mod = load_tool(self.TOOL)
+            head = QHBoxLayout()
+            head.addStretch(1)
+            self.openBtn = QPushButton(self.LAUNCH_LABEL)
+            self.openBtn.setObjectName("primary")
+            self.openBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.openBtn.clicked.connect(self._open_full)
+            ref = QPushButton("Refresh")
+            ref.clicked.connect(self.refresh)
+            head.addWidget(ref)
+            head.addWidget(self.openBtn)
+            v.addLayout(head)
+            self.listBox = QVBoxLayout()
+            self.listBox.setSpacing(10)
+            v.addLayout(self.listBox)
+            if self.mod is None:
+                self.listBox.addWidget(self._note(
+                    "%s is not installed." % self.TOOL))
+                self.openBtn.setEnabled(False)
+            else:
+                self.populate()
+
+        def _open_full(self, *a):
+            argv = tool_argv(self.TOOL) if tool_path(self.TOOL) else None
+            if argv:
+                self.win.spawn(argv)
+
+        def _note(self, text):
+            l = QLabel(text)
+            l.setObjectName("muted")
+            l.setWordWrap(True)
+            return l
+
+        def _row(self, icon, name, sub, widgets=()):
+            f = QFrame()
+            f.setObjectName("row")
+            h = QHBoxLayout(f)
+            h.setContentsMargins(14, 11, 14, 11)
+            h.setSpacing(12)
+            ic = QLabel()
+            ic.setPixmap(QIcon.fromTheme(icon).pixmap(QSize(30, 30)))
+            h.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            nm = QLabel(name)
+            nm.setObjectName("rowname")
+            col.addWidget(nm)
+            if sub:
+                sb = QLabel(sub)
+                sb.setObjectName("rowsub")
+                sb.setWordWrap(True)
+                col.addWidget(sb)
+            h.addLayout(col, 1)
+            for w in widgets:
+                h.addWidget(w)
+            return f
+
+        def _clear(self):
+            while self.listBox.count():
+                it = self.listBox.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def refresh(self):
+            if self.mod is not None:
+                self._clear()
+                self.populate()
+
+        def populate(self):
+            pass
+
+    class DisksPane(ToolPaneBase):
+        TOOL = "hash-disks"
+        LAUNCH_LABEL = "Open HasH Disks"
+
+        def __init__(self, win):
+            super().__init__(win, "Disks",
+                             "Drives, partitions & mounts (HasH Disks)")
+
+        def populate(self):
+            try:
+                groups = self.mod.get_drives()
+            except Exception as e:
+                self.listBox.addWidget(self._note("Could not read drives: %s" % e))
+                return
+            shown = 0
+            for g in groups:
+                parts = [p for p in g["parts"] if p["fstype"] or p["mounted"]]
+                if not parts:
+                    continue
+                hdr = QLabel(g["disk"] + (
+                    "  ·  " + parts[0]["model"] if parts[0].get("model") else ""))
+                hdr.setObjectName("muted")
+                self.listBox.addWidget(hdr)
+                for p in parts:
+                    self.listBox.addWidget(self._drive_row(p))
+                    shown += 1
+            if not shown:
+                self.listBox.addWidget(self._note("No mountable partitions found."))
+
+        def _drive_row(self, p):
+            label = p["label"] or p["device"].split("/")[-1]
+            meta = "%s · %s · %s" % (p["device"], p["fstype"] or "no fs",
+                                     p["size_h"] or "?")
+            if p["mounted"] and p["mountpoint"]:
+                meta += "  ·  mounted at %s" % p["mountpoint"]
+            icon = ("media-optical" if p["fstype"].lower() in ("iso9660", "udf")
+                    else "drive-removable-media" if p["removable"]
+                    else "drive-harddisk")
+            badge = QLabel("mounted" if p["mounted"] else "not mounted")
+            badge.setObjectName("pill" if p["mounted"] else "rowsub")
+            widgets = [badge]
+            if not p["protected"]:
+                if p["mounted"]:
+                    b = QPushButton("Unmount")
+                    b.clicked.connect(lambda _=False, part=p: self._unmount(part))
+                else:
+                    b = QPushButton("Mount")
+                    b.setObjectName("primary")
+                    b.clicked.connect(lambda _=False, part=p: self._mount(part))
+                widgets.append(b)
+            return self._row(icon, label, meta, widgets)
+
+        def _mount(self, part):
+            # removable + udisks → no-password mount in-process; else open the
+            # full tool (which handles the pkexec helper + mount-point dialog).
+            if part["removable"] and getattr(self.mod, "HAS_UDISKS", False):
+                self.win.status("Mounting %s…" % part["device"])
+                r = self.mod.run(self.mod.udisks_mount(part["device"]))
+                self.win.status("Mounted." if r.returncode == 0
+                                else "Mount failed — opening HasH Disks.")
+                if r.returncode != 0:
+                    self._open_full()
+                QTimer.singleShot(900, self.refresh)
+            else:
+                self.win.status("Opening HasH Disks for a privileged mount…")
+                self._open_full()
+
+        def _unmount(self, part):
+            if part["removable"] and getattr(self.mod, "HAS_UDISKS", False):
+                self.win.status("Unmounting %s…" % part["device"])
+                self.mod.run(self.mod.udisks_unmount(part["device"]))
+                QTimer.singleShot(900, self.refresh)
+            else:
+                self._open_full()
+
+    class AccountsPane(ToolPaneBase):
+        TOOL = "hash-accounts"
+        LAUNCH_LABEL = "Open HasH Accounts"
+
+        def __init__(self, win):
+            super().__init__(win, "Accounts",
+                             "Cloud storage & online accounts (HasH Accounts)")
+
+        def populate(self):
+            if not getattr(self.mod, "HAS_RCLONE", False):
+                self.listBox.addWidget(self._note(
+                    "rclone is not installed — cloud accounts are unavailable. "
+                    "Install rclone + fuse3 from the Software Center."))
+                return
+            try:
+                rows = self.mod.list_remotes()
+            except Exception as e:
+                self.listBox.addWidget(self._note("Could not list accounts: %s" % e))
+                return
+            if not rows:
+                self.listBox.addWidget(self._note(
+                    "No accounts yet. Click “Open HasH Accounts” to connect your "
+                    "first cloud drive."))
+                return
+            for r in rows:
+                mounted = False
+                try:
+                    mounted = self.mod.is_mounted(r["name"])
+                except Exception:
+                    pass
+                badge = QLabel("mounted" if mounted else "not mounted")
+                badge.setObjectName("pill" if mounted else "rowsub")
+                btn = QPushButton("Unmount" if mounted else "Mount")
+                if not mounted:
+                    btn.setObjectName("primary")
+                btn.clicked.connect(
+                    lambda _=False, name=r["name"], m=mounted: self._toggle(name, m))
+                self.listBox.addWidget(self._row(
+                    r.get("icon", "folder-cloud"), r["name"],
+                    r["provider"], [badge, btn]))
+
+        def _toggle(self, name, mounted):
+            self.win.status("Working on %s…" % name)
+            try:
+                if mounted:
+                    self.mod.do_unmount(name)
+                else:
+                    self.mod.do_mount(name)
+            except Exception:
+                pass
+            QTimer.singleShot(800, self.refresh)
+
+    class SecurityPane(ToolPaneBase):
+        TOOL = "hash-security"
+        LAUNCH_LABEL = "Open Security Center"
+
+        def __init__(self, win):
+            super().__init__(win, "Security",
+                             "Login / lock / sudo authentication (HasH Security)")
+
+        def populate(self):
+            try:
+                state = self.mod.gather_state()
+            except Exception as e:
+                self.listBox.addWidget(self._note("Could not read state: %s" % e))
+                return
+            # one row per method showing its status chip + which surfaces use it
+            surfaces = state.get("surfaces", {})
+            for mkey, mlabel in self.mod.METHODS:
+                clabel, _kind = self.mod.method_chip(mkey, state)
+                on_surfaces = [sl for skey, sl in self.mod.SURFACES
+                               if mkey in surfaces.get(skey, {}).get("enabled", [])]
+                sub = "Status: %s" % clabel
+                if on_surfaces:
+                    sub += "   ·   active on: " + ", ".join(on_surfaces)
+                icon = {"password": "dialog-password", "pin": "dialpad",
+                        "totp": "smartphone", "face": "camera-web",
+                        "fingerprint": "fingerprint"}.get(mkey, "security-high")
+                pill = QLabel(clabel)
+                pill.setObjectName("pill")
+                self.listBox.addWidget(self._row(icon, mlabel, sub, [pill]))
+            self.listBox.addWidget(self._note(
+                "Toggle methods per-surface and enrol TOTP / face / fingerprint "
+                "in the full Security Center (privileged PAM edits run via "
+                "pkexec there)."))
+
+    class AppsPane(ToolPaneBase):
+        TOOL = "hash-uninstaller"
+        LAUNCH_LABEL = "Open Uninstaller"
+
+        def __init__(self, win):
+            super().__init__(win, "Apps",
+                             "Software Center, updates & uninstall")
+
+        def build_body(self, v):
+            # quick actions for the Software Center (its own large app)
+            self.section(v, "Software Center")
+            scard, sc = self.card()
+            srow = QHBoxLayout()
+            srow.addWidget(self._scn_lbl(
+                "Browse, search & install apps, or update everything. The "
+                "Software Center is a full app and opens in its own window."), 1)
+            store = QPushButton("Open Software Center")
+            store.setObjectName("primary")
+            store.clicked.connect(lambda: self._spawn("hash-store"))
+            store.setEnabled(tool_path("hash-store") is not None)
+            upd = QPushButton("Check for updates")
+            upd.clicked.connect(lambda: self._spawn("hash-store", "--updates"))
+            upd.setEnabled(tool_path("hash-store") is not None)
+            srow.addWidget(upd)
+            srow.addWidget(store)
+            sc.addLayout(srow)
+            v.addWidget(scard)
+
+            # uninstaller: native list of installed programs
+            self.section(v, "Installed programs")
+            self.mod = load_tool(self.TOOL)
+            head = QHBoxLayout()
+            self.search = QLineEdit()
+            self.search.setPlaceholderText("Filter installed programs…")
+            self.search.textChanged.connect(lambda _t: self._render())
+            head.addWidget(self.search, 1)
+            self.openBtn = QPushButton(self.LAUNCH_LABEL)
+            self.openBtn.setObjectName("primary")
+            self.openBtn.clicked.connect(self._open_full)
+            self.openBtn.setEnabled(tool_path("hash-uninstaller-gui") is not None
+                                    or self.mod is not None)
+            head.addWidget(self.openBtn)
+            v.addLayout(head)
+            self.listBox = QVBoxLayout()
+            self.listBox.setSpacing(8)
+            v.addLayout(self.listBox)
+            self._progs = []
+            if self.mod is None:
+                self.listBox.addWidget(self._note(
+                    "hash-uninstaller is not installed."))
+            else:
+                self._load_progs()
+
+        def _scn_lbl(self, text):
+            l = QLabel(text)
+            l.setObjectName("muted")
+            l.setWordWrap(True)
+            return l
+
+        def _spawn(self, tool, *args):
+            argv = tool_argv(tool, *args)
+            if argv:
+                self.win.spawn(argv)
+
+        def _open_full(self, *a):
+            argv = tool_argv("hash-uninstaller-gui")
+            if not argv:
+                p = tool_path("hash-uninstaller")
+                argv = [p, "gui"] if p else None
+            if argv:
+                self.win.spawn(argv)
+
+        def _load_progs(self):
+            try:
+                self._progs = self.mod.list_programs()
+            except Exception as e:
+                self.listBox.addWidget(self._note(
+                    "Could not enumerate programs: %s" % e))
+                self._progs = []
+            self._render()
+
+        def refresh(self):
+            if self.mod is not None:
+                self._load_progs()
+
+        def _render(self):
+            self._clear()
+            term = self.search.text().lower().strip()
+            shown = 0
+            for p in self._progs:
+                if term and term not in p["name"].lower() \
+                        and term not in p.get("source", "").lower():
+                    continue
+                if shown >= 200:
+                    break
+                src = p.get("source", "")
+                ver = p.get("version", "")
+                sub = src + (("  ·  " + ver) if ver else "")
+                pill = QLabel(src.upper())
+                pill.setObjectName("pill")
+                btn = QPushButton("Uninstall…")
+                btn.setObjectName("danger")
+                btn.clicked.connect(
+                    lambda _=False, prog=p: self._uninstall(prog))
+                icon = {"pacman": "package-x-generic", "flatpak": "flatpak",
+                        "appimage": "application-x-executable"}.get(
+                            src, "applications-other")
+                self.listBox.addWidget(self._row(icon, p["name"], sub,
+                                                 [pill, btn]))
+                shown += 1
+            if not shown:
+                self.listBox.addWidget(self._note("No programs match."))
+
+        def _uninstall(self, prog):
+            # Removal involves a review + pkexec for system paths; that flow
+            # lives in the full uninstaller GUI. Open it focused on this program.
+            if QMessageBox.question(
+                    self.win, "Uninstall %s" % prog["name"],
+                    "Map and remove “%s”?\n\nThis opens the HasH Uninstaller, "
+                    "which reviews every file and asks again before deleting "
+                    "anything (system paths via a graphical password prompt)."
+                    % prog["name"]) != QMessageBox.StandardButton.Yes:
+                return
+            self._open_full()
+
+    # ──────────────────── More KDE settings (all KCMs) page ──────────────────
+    class KCMPage(BasePage):
+        """Lists EVERY KDE setting module discovered via `kcmshell6 --list`,
+        grouped under the HasH categories, with instant search.  Each row opens
+        the real KCM through kcmshell6 so privileged modules self-elevate via
+        polkit.  This makes hash-settings a full System Settings replacement
+        without hiding any underlying KDE module."""
+        def __init__(self, win):
+            super().__init__(win, "More KDE settings",
+                             "Every KDE setting module on this system — "
+                             "privileged ones ask for a password themselves")
+
+        def build_body(self, v):
+            self._mods = kcm_list()
+            self.search = QLineEdit()
+            self.search.setPlaceholderText("Search KDE modules…")
+            self.search.setClearButtonEnabled(True)
+            self.search.textChanged.connect(lambda _t: self._render())
+            v.addWidget(self.search)
+            self.count = QLabel("")
+            self.count.setObjectName("muted")
+            v.addWidget(self.count)
+
+            if not kcm_launchable():
+                v.addWidget(self._note(
+                    "Neither kcmshell6 nor systemsettings was found, so KDE "
+                    "modules can't be opened on this system."))
+                return
+            if not self._mods:
+                v.addWidget(self._note(
+                    "Could not enumerate KDE modules (kcmshell6 --list returned "
+                    "nothing). You can still open modules from the category "
+                    "pages above."))
+                return
+            note = QLabel("Open any module to load it embedded inside this "
+                          "window. Modules marked ELEVATES raise their own "
+                          "polkit password prompt — hash-settings never runs "
+                          "as root.")
+            note.setObjectName("muted")
+            note.setWordWrap(True)
+            v.addWidget(note)
+            self._wrap = QWidget()
+            self._wrapLay = QVBoxLayout(self._wrap)
+            self._wrapLay.setContentsMargins(0, 0, 0, 0)
+            self._wrapLay.setSpacing(14)
+            v.addWidget(self._wrap)
+            self._render()
+
+        def _note(self, text):
+            l = QLabel(text)
+            l.setObjectName("muted")
+            l.setWordWrap(True)
+            return l
+
+        def _clear(self):
+            while self._wrapLay.count():
+                it = self._wrapLay.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def _render(self):
+            if not getattr(self, "_wrapLay", None):
+                return
+            self._clear()
+            term = self.search.text().lower().strip()
+            # bucket modules by group, preserving the HasH category order
+            order = [g[0] for g in KCM_GROUPS] + ["other"]
+            labels = {g[0]: g[1] for g in KCM_GROUPS}
+            labels["other"] = "Other modules"
+            buckets = {k: [] for k in order}
+            total = 0
+            for d in self._mods:
+                hay = (d["module"] + " " + d["name"]).lower()
+                if term and term not in hay:
+                    continue
+                buckets.setdefault(d["group"], []).append(d)
+                total += 1
+            if hasattr(self, "count"):
+                if term:
+                    self.count.setText("Showing %d of %d modules"
+                                       % (total, len(self._mods)))
+                else:
+                    self.count.setText("%d modules installed" % len(self._mods))
+            if total == 0:
+                self._wrapLay.addWidget(self._note("No modules match."))
+                return
+            for gkey in order:
+                items = buckets.get(gkey) or []
+                if not items:
+                    continue
+                hdr = QLabel("%s  (%d)" % (labels.get(gkey, gkey), len(items)))
+                hdr.setObjectName("h2")
+                self._wrapLay.addWidget(hdr)
+                for d in items:
+                    self._wrapLay.addWidget(self._kcm_row(d))
+
+        def _kcm_row(self, d):
+            f = QFrame()
+            f.setObjectName("row")
+            f.setCursor(Qt.CursorShape.PointingHandCursor)
+            h = QHBoxLayout(f)
+            h.setContentsMargins(14, 11, 14, 11)
+            h.setSpacing(12)
+            ic = QLabel()
+            ic.setPixmap(QIcon.fromTheme(d.get("icon", "configure"))
+                         .pixmap(QSize(26, 26)))
+            h.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            nm = QLabel(d["name"])
+            nm.setObjectName("rowname")
+            col.addWidget(nm)
+            sub = QLabel(d["module"] + ("   ·  asks for a password when needed"
+                                        if d["privileged"] else ""))
+            sub.setObjectName("rowsub")
+            col.addWidget(sub)
+            h.addLayout(col, 1)
+            if d["privileged"]:
+                pill = QLabel("ELEVATES")
+                pill.setObjectName("pill")
+                h.addWidget(pill)
+            btn = QPushButton("Open")
+            btn.setObjectName("primary")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            _open = lambda d=d: self.win.open_module(
+                d["module"], d["name"], d["privileged"])
+            btn.clicked.connect(lambda _=False: _open())
+            h.addWidget(btn)
+            f.mouseReleaseEvent = lambda e: (
+                _open() if e.button() == Qt.MouseButton.LeftButton else None)
+            return f
+
+    # ─────────────────────────── category page ───────────────────────────
+    PAGE_BUILDERS = {
+        "network": NetworkPage,
+        "appearance": AppearancePage,
+        "display": DisplaySoundPage,
+        "power": PowerPage,
+        "system": SystemPage,
+        "accounts": AccountsPane,
+        "security": SecurityPane,
+        "disks": DisksPane,
+        "apps": AppsPane,
+        "kde": KCMPage,
+    }
+
+    # ──────────────────────────── main window ────────────────────────────
+    class Settings(QWidget):
+        def __init__(self):
+            super().__init__(None, Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setWindowTitle("HasH Settings")
+            scr = (QApplication.screenAt(QCursor.pos())
+                   or QApplication.primaryScreen()).geometry()
+            W = max(900, int(scr.height() * 0.92))
+            H = max(580, int(scr.height() * 0.72))
+            self.resize(W, H)
+            self.move(scr.center().x() - W // 2, scr.center().y() - H // 2)
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(1, 1, 1, 1)
+            root.setSpacing(0)
+            root.addWidget(TitleBar(self))
+
+            body = QHBoxLayout()
+            body.setContentsMargins(14, 4, 14, 14)
+            body.setSpacing(14)
+
+            side = QVBoxLayout()
+            side.setSpacing(6)
+            self.nav = {}
+            self.router = PageRouter()
+            self.router.navigated.connect(self._on_navigated)
+            for key, label, icon, page_key, entries in SECTIONS:
+                b = QPushButton("  " + label)
+                b.setCheckable(True)
+                b.setObjectName("nav")
+                b.setIcon(QIcon.fromTheme(icon))
+                b.setIconSize(QSize(20, 20))
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(lambda _, k=key: self.go(k))
+                side.addWidget(b)
+                self.nav[key] = b
+                if key == "overview":
+                    pg = OverviewPage(self)
+                else:
+                    builder = PAGE_BUILDERS.get(page_key, SystemPage)
+                    pg = builder(self)
+                self.router.add_page(key, pg)
+            # shared, sidebar-less host for embedding a single KDE module
+            self.modulePage = KCMHostPage(self)
+            self.router.add_page("__module__", self.modulePage)
+            side.addStretch(1)
+            self.statusLbl = QLabel("")
+            self.statusLbl.setObjectName("brand")
+            side.addWidget(self.statusLbl)
+            exitb = QPushButton("  ⏻  Exit")
+            exitb.setObjectName("exitbtn")
+            exitb.setIcon(QIcon.fromTheme("application-exit"))
+            exitb.setIconSize(QSize(18, 18))
+            exitb.setCursor(Qt.CursorShape.PointingHandCursor)
+            exitb.clicked.connect(self.close)
+            side.addWidget(exitb)
+            brand = QLabel("HasH-Arch")
+            brand.setObjectName("brand")
+            side.addWidget(brand)
+            sw = QWidget()
+            sw.setObjectName("sidebar")
+            sw.setLayout(side)
+            sw.setFixedWidth(184)
+            body.addWidget(sw)
+            body.addWidget(self.router, 1)
+            root.addLayout(body, 1)
+            self.setStyleSheet(app_qss())
+
+            QShortcut(QKeySequence(Qt.Key.Key_Escape), self,
+                      activated=self.on_escape)
+
+            self.go(start_key if start_key in self.nav else "overview")
+
+        def go(self, key):
+            self.router.navigate(key)
+
+        def go_back(self):
+            self.router.back()
+
+        def open_module(self, module, label=None, privileged=False):
+            """Open a KDE module embedded in-app (with Back), falling back to a
+            launch panel where embedding isn't possible."""
+            self.modulePage.load(module, label, privileged)
+            self.router.navigate("__module__")
+
+        def spawn(self, argv):
+            """Launch an external process detached (used only for the few
+            last-resort 'Open in System Settings' buttons and the standalone
+            Software Center)."""
+            if not argv:
+                self.status("Unavailable")
+                return
+            QProcess.startDetached(argv[0], argv[1:])
+
+        def status(self, text):
+            self.statusLbl.setText(text or "")
+
+        def on_escape(self):
+            fw = QApplication.focusWidget()
+            if isinstance(fw, QLineEdit) and fw.text():
+                fw.clear()
+                return
+            if self.router.can_back():
+                self.router.back()
+            else:
+                self.close()
+
+        def _on_navigated(self, key):
+            for k, b in self.nav.items():
+                b.setChecked(k == key)
+            pg = self.router.widget(key)
+            if pg is None:
+                return
+            if hasattr(pg, "header"):
+                pg.header.set_can_back(self.router.can_back())
+            if hasattr(pg, "focus_default"):
+                QTimer.singleShot(0, pg.focus_default)
+
+        def closeEvent(self, e):
+            # tear down any embedded KDE module child process cleanly
+            try:
+                self.modulePage.leaving()
+            except Exception:
+                pass
+            super().closeEvent(e)
+
+        def paintEvent(self, _e):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(0.5, 0.5, self.width() - 1,
+                                self.height() - 1, 20, 20)
+            p.fillPath(path, QColor(0x12, 0x14, 0x1a))
+            p.setPen(QColor(255, 255, 255, 30))
+            p.drawPath(path)
+
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("HasH Settings")
+    app.setApplicationDisplayName("HasH Settings")
+    w = Settings()
+    w.show()
+    if shot:
+        def _grab():
+            w.grab().save(shot)
+            os._exit(0)
+        QTimer.singleShot(2500, _grab)
+    return app.exec()
+
+
+def main():
+    a = sys.argv[1:]
+    start = "overview"
+    if "--page" in a:
+        i = a.index("--page")
+        if i + 1 < len(a):
+            start = a[i + 1]
+    shot = None
+    if "--shot" in a:
+        i = a.index("--shot")
+        shot = a[i + 1] if i + 1 < len(a) else "/tmp/hash-settings.png"
+    return gui(start, shot)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

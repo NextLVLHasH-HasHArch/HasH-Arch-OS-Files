@@ -1,0 +1,12 @@
+[Unit]
+Description=HasH: select the VA-API driver for the detected GPU (hardware video decode)
+# run only until the drop-in exists (effectively once per install / GPU change)
+ConditionPathExists=!/etc/environment.d/10-hash-vaapi.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hash-gpu-env
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

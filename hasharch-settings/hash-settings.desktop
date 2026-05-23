@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=HasH Settings
+GenericName=System Settings
+Comment=Unified control center for KDE settings and the HasH suite
+Exec=hash-settings
+Icon=hash-settings
+Terminal=false
+Categories=Settings;System;
+Keywords=settings;control;system;configure;preferences;kcm;hash;
+StartupNotify=true

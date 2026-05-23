@@ -1,0 +1,6 @@
+[Unit]
+Description=Keep OBS set to minimize-to-tray (re-applies after OBS rewrites its config)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hash-obs-tray.sh

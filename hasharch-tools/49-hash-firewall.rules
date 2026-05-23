@@ -1,0 +1,13 @@
+// HasH-Arch — firewall "remember password".
+// Let members of 'wheel' drive the firewall (firewall-cmd via pkexec) with ONE
+// password prompt per session: AUTH_ADMIN_KEEP caches the authorisation for the
+// rest of the session (the "remember my password" behaviour the Settings app
+// firewall page expects). The app calls pkexec with firewall-cmd ARGV only —
+// never a shell string — so this narrowly-scoped, program-pinned rule is safe.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("program") == "/usr/bin/firewall-cmd" &&
+        subject.isInGroup("wheel")) {
+        return polkit.Result.AUTH_ADMIN_KEEP;
+    }
+});

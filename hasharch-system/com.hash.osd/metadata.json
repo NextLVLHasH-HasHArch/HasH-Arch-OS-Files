@@ -1,0 +1,14 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [{ "Email": "hash@nextlvlsync.co.uk", "Name": "HasH" }],
+        "Category": "Multimedia",
+        "Description": "HasH-OSD — fully custom rounded now-playing + media on-screen display (MPRIS), left/right configurable.",
+        "Id": "com.hash.osd",
+        "License": "GPL-2.0-or-later",
+        "Name": "HasH-OSD",
+        "Version": "1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-MainScript": "ui/main.qml"
+}

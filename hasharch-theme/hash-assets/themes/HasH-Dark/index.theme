@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=X-GNOME-Metatheme
+Name=HasH-Dark
+Comment=Light and dark colorful Gtk3.20+ theme
+Encoding=UTF-8
+
+[X-GNOME-Metatheme]
+GtkTheme=HasH-Dark
+MetacityTheme=HasH-Dark
+IconTheme=HasH-Icons
+ButtonLayout=:minimize,maximize,close

@@ -1,0 +1,28 @@
+#!/bin/sh
+# HasH first-login theme enforcement.
+# The ISO installer can't pre-apply a per-user Plasma look, and /etc/skel config
+# alone doesn't reliably set the icon theme / cursor / window decoration on the
+# first login. So this runs ONCE from the user's autostart, applies the full HasH
+# look-and-feel (which pulls in the HasH colour scheme, HasH-Icons, HasH-cursors,
+# HasH-Dark decoration), pins the pieces the apply sometimes misses, then removes
+# its own autostart entry so it never runs again.
+set -eu
+
+# Apply the HasH global theme + the individual pieces (best-effort; tools live in
+# plasma-workspace which is always present on the HasH desktop).
+plasma-apply-lookandfeel -a HasHTop   >/dev/null 2>&1 || true
+plasma-apply-cursortheme  HasH-cursors >/dev/null 2>&1 || true
+# NOTE: there is NO `plasma-apply-icontheme` — the icon theme is set by the
+# look-and-feel apply above and pinned via kwriteconfig + plasma-changeicons below.
+
+# Pin the bits a look-and-feel apply can miss (icon theme + Aurorae decoration).
+if command -v kwriteconfig6 >/dev/null 2>&1; then
+    kwriteconfig6 --file kdeglobals --group Icons --key Theme HasH-Icons
+    kwriteconfig6 --file kwinrc --group org.kde.kdecoration2 --key library org.kde.kwin.aurorae
+    kwriteconfig6 --file kwinrc --group org.kde.kdecoration2 --key theme  __aurorae__svg__HasH-Dark
+    kwriteconfig6 --file kdeglobals --group General --key ColorScheme HasH
+fi
+qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
+
+# Run-once: delete our autostart entry so we never fire again.
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/hash-apply-theme.desktop"

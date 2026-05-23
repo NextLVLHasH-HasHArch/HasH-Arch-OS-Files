@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=HasH Security
+GenericName=Authentication & Security
+Comment=Enable and enroll Password, PIN, TOTP 2FA, Face and Fingerprint per Login/Lock/Sudo
+Exec=hash-security
+Icon=hash-security
+Terminal=false
+Categories=Settings;System;Security;X-KDE-settings-system;
+Keywords=security;auth;2fa;totp;pam;face;howdy;fingerprint;fprintd;pin;login;lock;sudo;
+StartupNotify=true

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+                          http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+    <kcfgfile name=""/>
+    <group name="General">
+        <entry name="mode" type="String">
+            <default>weather</default>
+        </entry>
+        <entry name="locationName" type="String">
+            <default>Manchester</default>
+        </entry>
+        <entry name="fixedLatitude" type="Double">
+            <default>-999</default>
+        </entry>
+        <entry name="fixedLongitude" type="Double">
+            <default>-999</default>
+        </entry>
+        <entry name="units" type="String">
+            <default>metric</default>
+        </entry>
+        <entry name="forceCondition" type="String">
+            <default>auto</default>
+        </entry>
+        <entry name="showInfo" type="Bool">
+            <default>true</default>
+        </entry>
+        <!-- Big centred lock-screen-style clock. Shown on the desktop; set false on
+             the lock screen (which already has KDE's own clock) to avoid two clocks. -->
+        <entry name="showClock" type="Bool">
+            <default>true</default>
+        </entry>
+        <entry name="showVisualizer" type="Bool">
+            <default>false</default>
+        </entry>
+        <!-- Audio visualizer colour scheme: level | cyan | rainbow | warm -->
+        <entry name="visualizerColor" type="String">
+            <default>level</default>
+        </entry>
+        <entry name="paused" type="Bool">
+            <default>false</default>
+        </entry>
+        <entry name="rainColor" type="String">
+            <default>#9cddec</default>
+        </entry>
+        <!-- Live bottom-dock geometry (screen-local px), pushed by the wallpaperguard
+             KWin script so the visualizer's flat row tracks the task manager width.
+             dockCenter = -1 means "no dock on this screen / unknown". -->
+        <entry name="dockCenter" type="Double">
+            <default>-1</default>
+        </entry>
+        <entry name="dockWidth" type="Double">
+            <default>0</default>
+        </entry>
+        <!-- Last real weather, written into the LOCK config by hash-weather-sync so
+             the greeter shows the right temperature/place without its own network.
+             -999 / "" mean "no cache" (the desktop instance fetches live instead). -->
+        <entry name="cachedTemperature" type="Double">
+            <default>-999</default>
+        </entry>
+        <entry name="cachedPlace" type="String">
+            <default></default>
+        </entry>
+    </group>
+</kcfg>

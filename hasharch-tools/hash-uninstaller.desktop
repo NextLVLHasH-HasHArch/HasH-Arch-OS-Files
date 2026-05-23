@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=HasH Uninstaller
+GenericName=Remove Software
+Comment=Cleanly remove installed applications and their leftovers
+Exec=hash-uninstaller-gui
+Icon=hash-uninstaller
+Terminal=false
+Categories=System;Settings;
+Keywords=uninstall;remove;delete;cleanup;apps;packages;
+StartupNotify=true

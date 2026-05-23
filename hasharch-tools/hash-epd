@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""hash-epd — HasH Endpoint Protection & Detection (local EDR).
+
+A LOCAL, no-cloud detector: it snapshots the things attackers tamper with —
+SUID binaries, persistence (autostart / systemd / cron / kernel modules), critical
+files (passwd, sudoers, the PAM auth stacks, authorized_keys, ld.so.preload), and
+running processes — records a trusted BASELINE, and on each SCAN reports what
+changed as events with a severity and a suggested action (review / revert /
+quarantine / baseline).
+
+Nothing here phones home. Scans are read-only; the only writes are the baseline
+file and (via the privileged helper) quarantine. Most detectors run unprivileged;
+root-only reads (e.g. /etc/sudoers, btmp) are noted, and the GUI can run an
+elevated scan through hash-security-helper.
+
+Subcommands:
+  scan [--json]      run all detectors; print events (human table or JSON)
+  baseline           record the CURRENT state as the trusted baseline
+  status [--json]    summary: baseline present/age, last scan, threat counts
+  detectors          list the detectors
+
+State dir: /var/lib/hash/epd if writable (root), else ~/.local/share/hash/epd.
+"""
+import getpass
+import glob
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+USER = getpass.getuser()
+
+SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+# SUID/SGID is normal in these roots; anywhere else is highly suspicious.
+SUID_ROOTS = ["/usr", "/opt", "/bin", "/sbin"]
+SUID_SUSPECT_PREFIXES = ("/home", "/tmp", "/var/tmp", "/dev/shm", "/run", "/root")
+
+# Critical files whose contents we hash + watch for change.
+def _watchlist():
+    wl = ["/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow",
+          "/etc/sudoers", "/etc/hosts", "/etc/ld.so.preload", "/etc/crontab",
+          "/etc/resolv.conf", "/etc/nsswitch.conf"]
+    wl += sorted(glob.glob("/etc/pam.d/*"))           # the auth stacks
+    wl += sorted(glob.glob("/etc/sudoers.d/*"))
+    wl += [os.path.join(HOME, ".ssh", "authorized_keys"),
+           os.path.join(HOME, ".bashrc"), os.path.join(HOME, ".zshrc"),
+           os.path.join(HOME, ".profile"),
+           os.path.join(HOME, ".bash_profile"),
+           os.path.join(HOME, ".config", "autostart")]  # dir presence handled below
+    return wl
+
+# Places persistence hides.
+PERSIST_GLOBS = [
+    "/etc/systemd/system/*.service", "/etc/systemd/system/*.timer",
+    "/etc/systemd/system/*/*.service",
+    os.path.join(HOME, ".config/systemd/user/*"),
+    "/etc/xdg/autostart/*.desktop",
+    os.path.join(HOME, ".config/autostart/*.desktop"),
+    "/etc/cron.d/*", "/etc/cron.hourly/*", "/etc/cron.daily/*",
+    "/etc/cron.weekly/*", "/etc/cron.monthly/*",
+    "/var/spool/cron/*",
+    "/etc/profile.d/*.sh",
+]
+
+
+def state_dir():
+    for d in ("/var/lib/hash/epd", os.path.join(HOME, ".local/share/hash/epd")):
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.access(d, os.W_OK):
+                return d
+        except OSError:
+            continue
+    return os.path.join(HOME, ".local/share/hash/epd")
+
+
+def baseline_path():
+    # prefer a system baseline if present (authoritative), else the user one
+    for d in ("/var/lib/hash/epd", os.path.join(HOME, ".local/share/hash/epd")):
+        p = os.path.join(d, "baseline.json")
+        if os.path.exists(p):
+            return p
+    return os.path.join(state_dir(), "baseline.json")
+
+
+def run(argv, timeout=20):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        class _R:
+            returncode = 1
+            stdout = stderr = ""
+        return _R()
+
+
+def sha256_file(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except (OSError, PermissionError):
+        return None
+
+
+# ───────────────────────────── snapshot (the facts) ──────────────────────────
+def snap_suid():
+    found = {}
+    args = ["find"] + [r for r in SUID_ROOTS if os.path.isdir(r)] + \
+           ["-xdev", "(", "-perm", "-4000", "-o", "-perm", "-2000", ")",
+            "-type", "f", "-print"]
+    r = run(args, timeout=40)
+    for line in r.stdout.splitlines():
+        p = line.strip()
+        if p:
+            found[p] = sha256_file(p) or "?"
+    # also actively look in suspect dirs (small, fast) — any hit is alarming
+    for pref in SUID_SUSPECT_PREFIXES:
+        if not os.path.isdir(pref):
+            continue
+        rr = run(["find", pref, "-xdev", "(", "-perm", "-4000", "-o",
+                  "-perm", "-2000", ")", "-type", "f", "-print"], timeout=20)
+        for line in rr.stdout.splitlines():
+            p = line.strip()
+            if p:
+                found[p] = sha256_file(p) or "?"
+    return found
+
+
+def snap_persistence():
+    items = {}
+    for g in PERSIST_GLOBS:
+        for p in glob.glob(g):
+            if os.path.isfile(p):
+                items[p] = sha256_file(p) or "?"
+    # crontab for this user
+    r = run(["crontab", "-l"])
+    if r.returncode == 0 and r.stdout.strip():
+        items["crontab:" + USER] = hashlib.sha256(r.stdout.encode()).hexdigest()
+    # loaded kernel modules (names only; new modules are the signal)
+    lk = run(["lsmod"])
+    mods = sorted(ln.split()[0] for ln in lk.stdout.splitlines()[1:] if ln.split())
+    if mods:
+        items["kmods"] = hashlib.sha256(",".join(mods).encode()).hexdigest()
+    return items
+
+
+def snap_files():
+    out = {}
+    for p in _watchlist():
+        if os.path.isfile(p):
+            out[p] = sha256_file(p) or "unreadable"
+    return out
+
+
+def snapshot():
+    return {
+        "version": 1,
+        "taken": int(time.time()),
+        "suid": snap_suid(),
+        "persistence": snap_persistence(),
+        "files": snap_files(),
+    }
+
+
+# ───────────────────────────────── detectors ─────────────────────────────────
+def ev(sev, cat, title, detail, path=None, action="review"):
+    e = {"severity": sev, "category": cat, "title": title, "detail": detail,
+         "action": action}
+    if path:
+        e["path"] = path
+    return e
+
+
+def detect_processes():
+    """Live check (no baseline needed): processes whose binary lives in a temp/
+    writable dir, or whose binary was deleted while running — classic malware."""
+    events = []
+    for pid in [d for d in os.listdir("/proc") if d.isdigit()]:
+        try:
+            exe = os.readlink("/proc/%s/exe" % pid)
+        except (OSError, PermissionError):
+            continue
+        real = exe.split(" (deleted)")[0]
+        if exe.endswith("(deleted)"):
+            events.append(ev("high", "process",
+                             "Process running a DELETED binary (pid %s)" % pid,
+                             "%s no longer exists on disk — common for in-memory "
+                             "malware. Investigate the process." % real,
+                             path="/proc/%s" % pid, action="review"))
+        elif real.startswith(("/tmp/", "/dev/shm/", "/var/tmp/", "/run/user")):
+            events.append(ev("high", "process",
+                             "Process running from a temp dir (pid %s)" % pid,
+                             "Executable %s is in a world-writable/temp location." % real,
+                             path=real, action="quarantine"))
+    return events
+
+
+def _diff(base, cur, cat, what, sev_new, sev_changed, action):
+    events = []
+    bset, cset = set(base), set(cur)
+    for p in sorted(cset - bset):
+        sev = sev_new
+        if cat == "suid" and p.startswith(SUID_SUSPECT_PREFIXES):
+            sev = "critical"
+        events.append(ev(sev, cat, "New %s" % what,
+                         "%s appeared since the baseline." % p, path=p,
+                         action=action))
+    for p in sorted(cset & bset):
+        if base.get(p) != cur.get(p):
+            events.append(ev(sev_changed, cat, "%s changed" % what.capitalize(),
+                             "%s differs from the baseline." % p, path=p,
+                             action="revert"))
+    return events
+
+
+def detect_against_baseline(base, cur):
+    events = []
+    events += _diff(base.get("suid", {}), cur["suid"], "suid",
+                    "SUID/SGID binary", "medium", "high", "quarantine")
+    events += _diff(base.get("persistence", {}), cur["persistence"], "persistence",
+                    "persistence item", "high", "high", "review")
+    events += _diff(base.get("files", {}), cur["files"], "file",
+                    "critical-file", "medium", "high", "revert")
+    return events
+
+
+def detect_standing():
+    """Findings that don't need a baseline (always-bad signals)."""
+    events = []
+    if os.path.exists("/etc/ld.so.preload"):
+        events.append(ev("critical", "file", "/etc/ld.so.preload exists",
+                         "This file force-loads a library into every process — a "
+                         "classic userland rootkit hook. It is absent on a clean "
+                         "system.", path="/etc/ld.so.preload", action="review"))
+    # world-writable SUID binaries anywhere we found them
+    return events
+
+
+# ─────────────────────────────── commands ────────────────────────────────────
+def cmd_baseline():
+    snap = snapshot()
+    p = os.path.join(state_dir(), "baseline.json")
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(snap, f, indent=2)
+    os.replace(tmp, p)
+    n = len(snap["suid"]) + len(snap["persistence"]) + len(snap["files"])
+    print("Baseline recorded: %d items sealed -> %s" % (n, p))
+    return 0
+
+
+def run_scan():
+    cur = snapshot()
+    events = detect_processes() + detect_standing()
+    bp = baseline_path()
+    have_base = os.path.exists(bp)
+    if have_base:
+        try:
+            base = json.load(open(bp))
+            events += detect_against_baseline(base, cur)
+        except Exception as e:
+            events.append(ev("info", "epd", "Baseline unreadable",
+                             "Could not read %s (%s) — run `baseline`." % (bp, e),
+                             action="baseline"))
+    else:
+        events.append(ev("info", "epd", "No baseline yet",
+                         "Record a baseline so future changes can be detected.",
+                         action="baseline"))
+    events.sort(key=lambda e: SEV_ORDER.get(e["severity"], 9))
+    return cur, events, have_base
+
+
+def cmd_scan(as_json):
+    cur, events, have_base = run_scan()
+    if as_json:
+        print(json.dumps({"scanned": cur["taken"], "baseline": have_base,
+                          "events": events,
+                          "counts": _counts(events)}, indent=2))
+        return 0
+    threats = [e for e in events if e["severity"] in ("critical", "high")]
+    print("HasH EPD scan — %s" % time.strftime("%Y-%m-%d %H:%M"))
+    print("=" * 60)
+    if not events:
+        print("No findings. System matches the trusted baseline.")
+        return 0
+    for e in events:
+        print("[%-8s] %s" % (e["severity"].upper(), e["title"]))
+        print("           %s" % e["detail"])
+        if e.get("path"):
+            print("           path: %s   action: %s" % (e["path"], e["action"]))
+    print("-" * 60)
+    print("%d finding(s); %d need attention." % (len(events), len(threats)))
+    return 0
+
+
+def _counts(events):
+    c = {}
+    for e in events:
+        c[e["severity"]] = c.get(e["severity"], 0) + 1
+    return c
+
+
+def cmd_status(as_json):
+    bp = baseline_path()
+    have = os.path.exists(bp)
+    age = None
+    if have:
+        try:
+            age = int(time.time()) - json.load(open(bp)).get("taken", 0)
+        except Exception:
+            age = None
+    out = {"baseline": have, "baseline_path": bp if have else None,
+           "baseline_age_days": (age // 86400) if age is not None else None,
+           "state_dir": state_dir()}
+    if as_json:
+        print(json.dumps(out, indent=2))
+    else:
+        print("EPD baseline: %s" % ("present (%s)" % bp if have else "NONE — run `hash-epd baseline`"))
+        if age is not None:
+            print("Baseline age: %d days" % (age // 86400))
+    return 0
+
+
+def main(argv):
+    as_json = "--json" in argv
+    argv = [a for a in argv if a != "--json"]
+    cmd = argv[0] if argv else "scan"
+    if cmd == "scan":
+        return cmd_scan(as_json)
+    if cmd == "baseline":
+        return cmd_baseline()
+    if cmd == "status":
+        return cmd_status(as_json)
+    if cmd == "detectors":
+        for d in ("processes (deleted/temp-dir binaries)", "standing (ld.so.preload)",
+                  "suid/sgid drift", "persistence drift (autostart/systemd/cron/kmods)",
+                  "critical-file drift (passwd/sudoers/pam.d/authorized_keys)"):
+            print(" -", d)
+        return 0
+    sys.stderr.write(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

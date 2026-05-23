@@ -1,0 +1,1392 @@
+#!/usr/bin/env python3
+"""HasH-Arch Security Center  (hash-security)
+
+A single dark/rounded settings app to turn on and enroll the HasH-Arch auth
+methods — Password, PIN, TOTP 2FA, Face (Howdy), Fingerprint (fprintd) — and
+choose WHERE each applies (Login / Lock / Sudo), without ever editing PAM by
+hand.
+
+It runs as the user and is read-only by itself: it parses /etc/pam.d/{sddm,
+kde,sudo,login}, checks ~/.google_authenticator, fprintd-list and Howdy to show
+the current state.  Every PRIVILEGED change (the PAM edits) is delegated to
+`hash-security-helper` via pkexec — the GUI never runs as root.
+
+Pages:
+  Sign-in    Windows-Hello-style chooser (LANDING): a card per method with
+             status + a primary action (Set up / Re-enroll / Remove / Install)
+             + per-surface (Login/Lock/Sudo) toggles.  Camera/reader-absent
+             cards self-hide.
+  Matrix     methods x surfaces grid with toggles + status chips
+  Two-Factor TOTP enable / Set up (QR + secret + scratch codes) / Remove
+  Face       Howdy: detect camera, offer install (AUR), enroll/re-enroll/clear,
+             certainty setting; hidden when no camera
+  Fingerprint fprintd: detect reader, offer install, enroll/clear; hidden when
+             no reader
+  PIN        detect + explain (intentionally not enabled — lockout safety)
+  Policy     method order + faillock reset + TTY-fallback / test-first guidance
+
+Usage:
+  hash-security                 launch the GUI (Sign-in options)
+  hash-security --page signin|overview|totp|face|fingerprint|pin|policy
+  hash-security backend status  headless JSON of current methods x surfaces
+  hash-security --shot <png>    render the Sign-in page to a PNG and exit
+
+Live enrollment (howdy add / fprintd-enroll) needs real hardware and runs only
+through pkexec → hash-security-helper.  Install offers (Howdy via AUR, fprintd
+via pacman) also go through the helper.  No PAM file is touched by any of these
+— enabling a method in the auth stack stays a separate, explicit toggle that
+goes through the helper's atomic+validated enable/disable.  The GUI never runs
+as root.
+"""
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+SCRIPT = os.path.realpath(__file__)
+HELPER = os.path.join(os.path.dirname(SCRIPT), "hash-security-helper")
+if not os.path.exists(HELPER):
+    HELPER = shutil.which("hash-security-helper") or HELPER
+
+USER = os.environ.get("USER") or os.environ.get("LOGNAME") or "user"
+HOME = os.path.expanduser("~")
+GA_FILE = os.path.join(HOME, ".google_authenticator")
+
+# Surface -> PAM service file (mirrors the helper).  login (TTY) is read-only
+# here and never toggled.
+SURFACE_FILE = {"login": "sddm", "lock": "kde", "sudo": "sudo"}
+SURFACES = [("login", "Login"), ("lock", "Lock"), ("sudo", "Sudo")]
+METHODS = [("password", "Password"), ("pin", "PIN"), ("totp", "TOTP 2FA"),
+           ("face", "Face"), ("fingerprint", "Fingerprint")]
+TAG = "# hash-security"
+
+
+def run(cmd, timeout=20):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = str(e)
+        return _R()
+
+
+# ───────────────────────── read-only state detection ─────────────────────────
+def read_pam(svc):
+    try:
+        with open(os.path.join("/etc/pam.d", svc)) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def managed_methods(text):
+    """Methods currently enabled via our tagged lines in a PAM file."""
+    out = set()
+    for ln in text.splitlines():
+        if TAG not in ln:
+            continue
+        low = ln.lower()
+        if "pam_howdy" in low:
+            out.add("face")
+        elif "pam_fprintd" in low:
+            out.add("fingerprint")
+        elif "pam_google_authenticator" in low:
+            out.add("totp")
+    return out
+
+
+def totp_enrolled():
+    return os.path.exists(GA_FILE)
+
+
+def detect_camera():
+    return sorted(glob.glob("/dev/video*"))
+
+
+def detect_fprint_reader():
+    if not shutil.which("fprintd-list"):
+        return False
+    r = run(["fprintd-list", USER], timeout=8)
+    return "no devices" not in (r.stdout + r.stderr).lower()
+
+
+def fprint_enrolled():
+    if not shutil.which("fprintd-list"):
+        return False
+    r = run(["fprintd-list", USER], timeout=8)
+    return "fingerprints for user" in (r.stdout + r.stderr).lower()
+
+
+def howdy_present():
+    return bool(shutil.which("howdy"))
+
+
+def howdy_enrolled():
+    """True if Howdy has at least one model enrolled for this user.
+
+    `howdy list` prints the enrolled models (or a 'no models' message). We treat
+    any numbered model row as enrollment. Best-effort and read-only."""
+    if not shutil.which("howdy"):
+        return False
+    r = run(["howdy", "-U", USER, "list"], timeout=8)
+    out = (r.stdout + r.stderr).lower()
+    if "no face models" in out or "no models" in out:
+        return False
+    for ln in (r.stdout + r.stderr).splitlines():
+        if ln.strip()[:1].isdigit():
+            return True
+    return False
+
+
+def aur_helper():
+    """Detected AUR helper command, or None."""
+    for h in ("yay", "paru"):
+        if shutil.which(h):
+            return h
+    return None
+
+
+def faillock_count():
+    """Number of recent failed attempts for this user (best-effort).  Returns
+    int or None if faillock is unavailable."""
+    if not shutil.which("faillock"):
+        return None
+    r = run(["faillock", "--user", USER], timeout=8)
+    n = 0
+    for ln in r.stdout.splitlines():
+        s = ln.strip()
+        if s and s[0].isdigit():
+            n += 1
+    return n
+
+
+def gather_state():
+    """Full read-only snapshot used by Overview + headless `backend status`."""
+    cam = detect_camera()
+    reader = detect_fprint_reader()
+    surfaces = {}
+    for surf, svc in SURFACE_FILE.items():
+        text = read_pam(svc)
+        surfaces[surf] = {
+            "service": svc,
+            "exists": bool(text),
+            "enabled": sorted(managed_methods(text)),
+        }
+    return {
+        "user": USER,
+        "surfaces": surfaces,
+        "hardware": {
+            "camera": bool(cam), "camera_devices": cam,
+            "howdy": howdy_present(),
+            "fprintd": bool(shutil.which("fprintd-list")),
+            "fprint_reader": reader,
+            "google_authenticator": bool(shutil.which("google-authenticator")),
+            "aur_helper": aur_helper(),
+            "pkexec": bool(shutil.which("pkexec")),
+            "faillock": bool(shutil.which("faillock")),
+        },
+        "enrollment": {
+            "totp": totp_enrolled(),
+            "fingerprint": fprint_enrolled(),
+            "face": howdy_enrolled(),
+        },
+        "faillock_count": faillock_count(),
+    }
+
+
+def method_chip(method, state):
+    """Return (chip_label, kind) describing a method's status for the matrix.
+
+    kind: 'enrolled' | 'available' | 'nohw' | 'always'
+    """
+    hw = state["hardware"]
+    enr = state["enrollment"]
+    if method == "password":
+        return "always on", "always"
+    if method == "totp":
+        if enr["totp"]:
+            return "enrolled", "enrolled"
+        return ("available", "available") if hw["google_authenticator"] else \
+               ("not installed", "nohw")
+    if method == "face":
+        if not hw["camera"]:
+            return "no camera", "nohw"
+        if enr["face"]:
+            return "enrolled", "enrolled"
+        return "available", "available"
+    if method == "fingerprint":
+        if not hw["fprint_reader"]:
+            return "no reader", "nohw"
+        if enr["fingerprint"]:
+            return "enrolled", "enrolled"
+        return "available", "available"
+    if method == "pin":
+        return "detect + explain", "nohw"
+    return "", "available"
+
+
+# ─────────────────────────────── headless CLI ────────────────────────────────
+def cli(a):
+    if a and a[0] == "status":
+        print(json.dumps(gather_state(), indent=2))
+        return 0
+    print("usage: hash-security backend status", file=sys.stderr)
+    return 2
+
+
+# ════════════════════════════════════ GUI ════════════════════════════════════
+def gui(start_page="signin", shot=None):
+    from PyQt6.QtCore import (Qt, QProcess, QSize, QProcessEnvironment, QTimer)
+    from PyQt6.QtGui import (QPainter, QColor, QPainterPath, QIcon, QCursor,
+                             QKeySequence, QShortcut, QPixmap, QImage)
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QLabel, QPushButton, QLineEdit, QTextEdit,
+        QStackedWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QFrame,
+        QScrollArea, QSizePolicy)
+
+    ACCENT, DANGER, OK = "#56c5d8", "#e06c75", "#7fd6a0"
+    WARN = "#e0c46c"
+
+    def btn_qss(a=ACCENT):
+        return f"""
+            QPushButton{{ background:rgba(255,255,255,0.07); color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.10); border-radius:9px;
+                padding:7px 16px; font-size:13px; }}
+            QPushButton:hover{{ background:rgba(255,255,255,0.13); }}
+            QPushButton#primary{{ background:{a}; color:#06222a; font-weight:600; border:none; }}
+            QPushButton#primary:hover{{ background:#6fd6e7; }}
+            QPushButton#danger{{ background:{DANGER}; color:#2a0a0c; font-weight:600; border:none; }}
+            QPushButton:disabled{{ color:#7f8a8d; background:rgba(255,255,255,0.05); }}
+        """
+
+    def qenv(d):
+        qe = QProcessEnvironment()
+        for k, v in d.items():
+            qe.insert(k, v)
+        return qe
+
+    CHIP_COLORS = {
+        "enrolled": (OK, "#0c2418"),
+        "available": (ACCENT, "#06222a"),
+        "always": ("#9fb8bd", "#0d1419"),
+        "nohw": ("#6b7679", "#15191c"),
+    }
+
+    def chip(label, kind):
+        lab = QLabel(label)
+        fg, bg = CHIP_COLORS.get(kind, CHIP_COLORS["available"])
+        lab.setStyleSheet(
+            f"QLabel{{ color:{fg}; background:{bg}; border:1px solid {fg};"
+            f"border-radius:9px; padding:2px 9px; font-size:11px; font-weight:700; }}")
+        lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        return lab
+
+    # ── transaction window (mirrors hash-store) ──────────────────────────────
+    class Transaction(QWidget):
+        def __init__(self, parent, title, argv, on_done):
+            super().__init__(parent, Qt.WindowType.Window
+                             | Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setObjectName("txwin")
+            self.resize(620, 380)
+            self.on_done = on_done
+            v = QVBoxLayout(self)
+            v.setContentsMargins(18, 16, 18, 16)
+            t = QLabel(title)
+            t.setObjectName("txtitle")
+            self.log = QTextEdit(readOnly=True)
+            self.log.setObjectName("txlog")
+            self.btn = QPushButton("Please wait…")
+            self.btn.setEnabled(False)
+            self.btn.setObjectName("primary")
+            self.btn.clicked.connect(self.close)
+            v.addWidget(t)
+            v.addWidget(self.log, 1)
+            v.addWidget(self.btn)
+            self.setStyleSheet("""
+                #txwin{ background:#14161d; border:1px solid rgba(255,255,255,0.12);
+                        border-radius:16px; }
+                #txtitle{ color:#fff; font-size:15px; font-weight:600; }
+                #txlog{ background:#0b0d12; color:#cfe9ee; border:1px solid #222;
+                        border-radius:10px; font-family:monospace; font-size:12px; }
+            """ + btn_qss())
+            self.p = QProcess(self)
+            self.p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            self.p.setProcessEnvironment(qenv(dict(os.environ)))
+            self.p.readyReadStandardOutput.connect(self._read)
+            self.p.finished.connect(self._fin)
+            self._append("$ " + " ".join(argv) + "\n\n")
+            self.p.start(argv[0], argv[1:])
+
+        def _read(self):
+            self._append(bytes(self.p.readAllStandardOutput()).decode(errors="ignore"))
+
+        def _append(self, s):
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+            self.log.insertPlainText(s)
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+
+        def _fin(self, code, _st):
+            ok = code == 0
+            self._append("\n" + ("✓ Done." if ok else "✗ Failed (exit %d)." % code) + "\n")
+            self.btn.setText("Close")
+            self.btn.setEnabled(True)
+            if self.on_done:
+                self.on_done(ok)
+
+        def keyPressEvent(self, e):
+            if e.key() == Qt.Key.Key_Escape and self.btn.isEnabled():
+                self.close()
+            else:
+                super().keyPressEvent(e)
+
+    class TitleBar(QWidget):
+        def __init__(self, win):
+            super().__init__(win)
+            self.win, self._off = win, None
+            self.setFixedHeight(46)
+            h = QHBoxLayout(self)
+            h.setContentsMargins(18, 0, 12, 0)
+            ttl = QLabel("  HasH Security Center")
+            ttl.setObjectName("apptitle")
+            mn, cl = QPushButton("—"), QPushButton("✕")
+            for b in (mn, cl):
+                b.setFixedSize(30, 30)
+                b.setObjectName("winbtn")
+            mn.clicked.connect(win.showMinimized)
+            cl.clicked.connect(win.close)
+            h.addWidget(ttl)
+            h.addStretch(1)
+            h.addWidget(mn)
+            h.addWidget(cl)
+
+        def mousePressEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self._off = e.globalPosition().toPoint() - self.win.frameGeometry().topLeft()
+
+        def mouseMoveEvent(self, e):
+            if self._off is not None and (e.buttons() & Qt.MouseButton.LeftButton):
+                self.win.move(e.globalPosition().toPoint() - self._off)
+
+        def mouseReleaseEvent(self, e):
+            self._off = None
+
+    class Toggle(QPushButton):
+        """A compact on/off pill toggle for one method x surface cell."""
+        def __init__(self, on, enabled=True):
+            super().__init__("On" if on else "Off")
+            self.setCheckable(True)
+            self.setChecked(on)
+            self.setEnabled(enabled)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setFixedSize(58, 30)
+            self._sync()
+            self.toggled.connect(lambda _: self._sync())
+
+        def _sync(self):
+            self.setText("On" if self.isChecked() else "Off")
+            on = self.isChecked()
+            self.setStyleSheet(
+                "QPushButton{ border-radius:15px; font-size:12px; font-weight:700;"
+                + ("background:%s; color:#06222a; border:none;" % ACCENT if on else
+                   "background:rgba(255,255,255,0.06); color:#9fb0b4;"
+                   "border:1px solid rgba(255,255,255,0.12);")
+                + "} QPushButton:disabled{ background:rgba(255,255,255,0.03);"
+                  "color:#566; border:1px solid rgba(255,255,255,0.05); }")
+
+    # ── Overview matrix page ─────────────────────────────────────────────────
+    class OverviewPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self.state = None
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(4, 2, 4, 4)
+            outer.setSpacing(12)
+            hdr = QLabel("Security Overview")
+            hdr.setObjectName("pagetitle")
+            sub = QLabel("Methods × where they apply. Toggles edit PAM through a "
+                         "root helper (pkexec). TTY login stays password-only.")
+            sub.setObjectName("subtle")
+            sub.setWordWrap(True)
+            outer.addWidget(hdr)
+            outer.addWidget(sub)
+
+            self.card = QFrame()
+            self.card.setObjectName("card")
+            self.grid = QGridLayout(self.card)
+            self.grid.setContentsMargins(20, 20, 20, 20)
+            self.grid.setHorizontalSpacing(18)
+            self.grid.setVerticalSpacing(14)
+            outer.addWidget(self.card)
+            outer.addStretch(1)
+            self.refresh()
+
+        def _clear(self):
+            while self.grid.count():
+                it = self.grid.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def refresh(self):
+            self.state = gather_state()
+            self._clear()
+            # header row
+            self.grid.addWidget(self._h("Method"), 0, 0)
+            self.grid.addWidget(self._h("Status"), 0, 1)
+            for c, (_skey, slabel) in enumerate(SURFACES):
+                self.grid.addWidget(self._h(slabel), 0, 2 + c,
+                                    alignment=Qt.AlignmentFlag.AlignCenter)
+            row = 1
+            for mkey, mlabel in METHODS:
+                name = QLabel(mlabel)
+                name.setObjectName("mname")
+                self.grid.addWidget(name, row, 0)
+                clabel, kind = method_chip(mkey, self.state)
+                self.grid.addWidget(chip(clabel, kind), row, 1)
+                for c, (skey, _sl) in enumerate(SURFACES):
+                    self.grid.addWidget(self._cell(mkey, skey, kind), row, 2 + c,
+                                        alignment=Qt.AlignmentFlag.AlignCenter)
+                row += 1
+
+        def _h(self, t):
+            l = QLabel(t)
+            l.setObjectName("colhead")
+            return l
+
+        def _cell(self, mkey, skey, kind):
+            surf = self.state["surfaces"].get(skey, {})
+            enabled_methods = surf.get("enabled", [])
+            on = mkey in enabled_methods
+            if mkey == "password":
+                # always on, not toggleable
+                return chip("✓", "always")
+            toggleable = kind in ("enrolled", "available") and mkey != "pin"
+            if mkey == "totp":
+                toggleable = self.state["enrollment"]["totp"]  # must enrol first
+            t = Toggle(on, enabled=toggleable)
+            t.clicked.connect(lambda _=False, m=mkey, s=skey, tg=t: self._toggle(m, s, tg))
+            return t
+
+        def _toggle(self, method, surface, tg):
+            want_on = tg.isChecked()
+            sub = "enable" if want_on else "disable"
+            self.win.run_helper(
+                "%s %s on %s" % (sub.title(), method, surface),
+                ["pkexec", HELPER, sub, method, surface],
+                lambda ok: self.refresh())
+
+    # ── Sign-in options (Windows-Hello-style landing chooser) ────────────────
+    class MethodCard(QFrame):
+        """One method card: icon + name + status chip + description + a primary
+        action (Set up / Re-enroll / Remove / Install) + per-surface toggles."""
+        def __init__(self, win, page, mkey, title, glyph, desc):
+            super().__init__()
+            self.win, self.page, self.mkey = win, page, mkey
+            self.setObjectName("hcard")
+            v = QVBoxLayout(self)
+            v.setContentsMargins(18, 16, 18, 16)
+            v.setSpacing(10)
+
+            top = QHBoxLayout()
+            top.setSpacing(12)
+            ic = QLabel(glyph)
+            ic.setObjectName("hicon")
+            ic.setFixedWidth(40)
+            ic.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+            top.addWidget(ic)
+
+            tcol = QVBoxLayout()
+            tcol.setSpacing(2)
+            name = QLabel(title)
+            name.setObjectName("hname")
+            tcol.addWidget(name)
+            self.desc = QLabel(desc)
+            self.desc.setObjectName("subtle")
+            self.desc.setWordWrap(True)
+            tcol.addWidget(self.desc)
+            top.addLayout(tcol, 1)
+
+            self.chipholder = QHBoxLayout()
+            self.chipholder.setContentsMargins(0, 0, 0, 0)
+            chw = QWidget()
+            chw.setLayout(self.chipholder)
+            top.addWidget(chw, 0, Qt.AlignmentFlag.AlignTop)
+            v.addLayout(top)
+
+            # action row
+            self.actions = QHBoxLayout()
+            self.actions.setSpacing(8)
+            v.addLayout(self.actions)
+
+            # per-surface toggles row
+            self.surfrow = QHBoxLayout()
+            self.surfrow.setSpacing(8)
+            v.addLayout(self.surfrow)
+
+        def _clear_layout(self, lay):
+            while lay.count():
+                it = lay.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def render(self, state):
+            self._clear_layout(self.chipholder)
+            self._clear_layout(self.actions)
+            self._clear_layout(self.surfrow)
+            clabel, kind = method_chip(self.mkey, state)
+            self.chipholder.addWidget(chip(clabel, kind))
+
+            hw = state["hardware"]
+            enr = state["enrollment"]
+            buttons = []   # list of (text, objname, callback)
+            self.surf_enabled = (kind in ("enrolled", "always"))
+
+            if self.mkey == "password":
+                pass  # no actions; always-on
+            elif self.mkey == "totp":
+                if not hw["google_authenticator"]:
+                    buttons.append(("Install (google-authenticator)", "primary",
+                                    lambda: self.win.go("totp")))
+                elif enr["totp"]:
+                    buttons.append(("Re-run setup", "", lambda: self.win.go("totp")))
+                    buttons.append(("Remove", "danger", lambda: self.win.go("totp")))
+                else:
+                    buttons.append(("Set up", "primary", lambda: self.win.go("totp")))
+            elif self.mkey == "face":
+                if not hw["howdy"]:
+                    buttons.append(("Install Howdy", "primary", self.win.install_howdy))
+                elif enr["face"]:
+                    buttons.append(("Re-enroll", "", self.win.howdy_add))
+                    buttons.append(("Settings", "", lambda: self.win.go("face")))
+                    buttons.append(("Remove", "danger", self.win.howdy_clear))
+                else:
+                    buttons.append(("Set up", "primary", self.win.howdy_add))
+                    buttons.append(("Settings", "", lambda: self.win.go("face")))
+            elif self.mkey == "fingerprint":
+                if not hw["fprintd"]:
+                    buttons.append(("Install fprintd", "primary", self.win.install_fprintd))
+                elif enr["fingerprint"]:
+                    buttons.append(("Add another", "", self.win.fprint_enroll))
+                    buttons.append(("Remove", "danger", self.win.fprint_delete))
+                else:
+                    buttons.append(("Set up", "primary", self.win.fprint_enroll))
+            elif self.mkey == "pin":
+                buttons.append(("Why not yet?", "", lambda: self.win.go("pin")))
+
+            for text, oname, cb in buttons:
+                b = QPushButton(text)
+                if oname:
+                    b.setObjectName(oname)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(lambda _=False, f=cb: f())
+                self.actions.addWidget(b)
+            self.actions.addStretch(1)
+
+            # per-surface toggles — only meaningful once enrolled (or always-on)
+            lab = QLabel("Use for:")
+            lab.setObjectName("subtle")
+            self.surfrow.addWidget(lab)
+            for skey, slabel in SURFACES:
+                surf = state["surfaces"].get(skey, {})
+                on = self.mkey in surf.get("enabled", [])
+                if self.mkey == "password":
+                    pill = chip(slabel + " ✓", "always")
+                    self.surfrow.addWidget(pill)
+                    continue
+                box = QVBoxLayout()
+                box.setSpacing(2)
+                sl = QLabel(slabel)
+                sl.setObjectName("surflabel")
+                sl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                tog = Toggle(on, enabled=self.surf_enabled)
+                tog.clicked.connect(
+                    lambda _=False, m=self.mkey, s=skey, tg=tog: self.win.toggle_surface(m, s, tg))
+                box.addWidget(sl, 0, Qt.AlignmentFlag.AlignCenter)
+                box.addWidget(tog, 0, Qt.AlignmentFlag.AlignCenter)
+                bw = QWidget()
+                bw.setLayout(box)
+                self.surfrow.addWidget(bw)
+            self.surfrow.addStretch(1)
+
+    class SignInPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self.state = None
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(4, 2, 4, 4)
+            outer.setSpacing(10)
+            hdr = QLabel("Sign-in options")
+            hdr.setObjectName("pagetitle")
+            sub = QLabel("Choose how you sign in to HasH-Arch. Password always "
+                         "works as a fallback; everything else is optional and "
+                         "you decide where it applies. The TTY console stays "
+                         "password-only for recovery.")
+            sub.setObjectName("subtle")
+            sub.setWordWrap(True)
+            outer.addWidget(hdr)
+            outer.addWidget(sub)
+
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            inner = QWidget()
+            self.col = QVBoxLayout(inner)
+            self.col.setContentsMargins(0, 0, 6, 0)
+            self.col.setSpacing(12)
+            scroll.setWidget(inner)
+            outer.addWidget(scroll, 1)
+
+            # card specs in policy order: biometrics first, then password,
+            # then PIN/TOTP. Cards self-hide when their hardware is absent.
+            self.specs = [
+                ("face", "Face (Howdy)", "👤",
+                 "Look at the camera to sign in. Tried before your password, "
+                 "which always still works."),
+                ("fingerprint", "Fingerprint", "☝",
+                 "Touch the reader to sign in. Tried before your password, "
+                 "which always still works."),
+                ("password", "Password", "🔑",
+                 "Your account password. Always available — the guaranteed way in."),
+                ("pin", "PIN", "#⃣",
+                 "A short numeric code for quick unlocks (in addition to your "
+                 "password)."),
+                ("totp", "Two-Factor (TOTP)", "📱",
+                 "A one-time code from an authenticator app, layered on top of "
+                 "your password."),
+            ]
+            self.cards = {}
+            for mkey, title, glyph, desc in self.specs:
+                c = MethodCard(self.win, self, mkey, title, glyph, desc)
+                self.cards[mkey] = c
+                self.col.addWidget(c)
+            self.col.addStretch(1)
+            self.refresh()
+
+        def refresh(self):
+            self.state = gather_state()
+            hw = self.state["hardware"]
+            for mkey, card in self.cards.items():
+                # Hide hardware-absent cards (camera / reader) cleanly.
+                if mkey == "face" and not hw["camera"]:
+                    card.hide()
+                    continue
+                if mkey == "fingerprint" and not hw["fprint_reader"]:
+                    card.hide()
+                    continue
+                card.show()
+                card.render(self.state)
+
+    # ── TOTP page (P1, fully working) ────────────────────────────────────────
+    class TotpPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(4, 2, 4, 4)
+            outer.setSpacing(12)
+            hdr = QLabel("Two-Factor Authentication (TOTP)")
+            hdr.setObjectName("pagetitle")
+            outer.addWidget(hdr)
+            self.status = QLabel("")
+            self.status.setObjectName("subtle")
+            self.status.setWordWrap(True)
+            outer.addWidget(self.status)
+
+            self.card = QFrame()
+            self.card.setObjectName("card")
+            cv = QVBoxLayout(self.card)
+            cv.setContentsMargins(20, 18, 20, 18)
+            cv.setSpacing(12)
+            self.info = QLabel("")
+            self.info.setObjectName("subtle")
+            self.info.setWordWrap(True)
+            cv.addWidget(self.info)
+
+            self.secretBox = QTextEdit(readOnly=True)
+            self.secretBox.setObjectName("secret")
+            self.secretBox.setFixedHeight(150)
+            self.secretBox.hide()
+            cv.addWidget(self.secretBox)
+
+            self.qr = QLabel("")
+            self.qr.setObjectName("qr")
+            self.qr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.qr.hide()
+            cv.addWidget(self.qr)
+
+            btns = QHBoxLayout()
+            self.setupBtn = QPushButton("Set up TOTP")
+            self.setupBtn.setObjectName("primary")
+            self.setupBtn.clicked.connect(self.do_setup)
+            self.removeBtn = QPushButton("Remove TOTP")
+            self.removeBtn.setObjectName("danger")
+            self.removeBtn.clicked.connect(self.do_remove)
+            btns.addWidget(self.setupBtn)
+            btns.addWidget(self.removeBtn)
+            btns.addStretch(1)
+            cv.addLayout(btns)
+            cv.addStretch(1)
+            outer.addWidget(self.card)
+            outer.addStretch(1)
+            self.refresh()
+
+        def refresh(self):
+            enrolled = totp_enrolled()
+            has_tool = bool(shutil.which("google-authenticator"))
+            if enrolled:
+                self.status.setText("TOTP is enrolled (~/.google_authenticator "
+                                    "present). Enable it per-surface from Overview.")
+                self.info.setText("Your authenticator secret is set up. The SDDM "
+                                  "2FA fork relays the code prompt to the greeter. "
+                                  "Re-running setup replaces the secret.")
+                self.removeBtn.setEnabled(True)
+                self.setupBtn.setText("Re-run setup")
+            else:
+                self.status.setText("TOTP is not enrolled yet.")
+                self.info.setText("Set up a Time-based One-Time Password. You'll "
+                                  "scan a QR code with an authenticator app and "
+                                  "save the scratch codes shown below.")
+                self.removeBtn.setEnabled(False)
+                self.setupBtn.setText("Set up TOTP")
+            self.setupBtn.setEnabled(has_tool)
+            if not has_tool:
+                self.info.setText("`google-authenticator` is not installed. "
+                                  "Install it (libpam-google-authenticator) to "
+                                  "enrol TOTP.")
+
+        def do_setup(self):
+            """Run google-authenticator non-interactively; show secret + QR +
+            scratch codes in-GUI.  This runs as the USER (writes ~/.google_
+            authenticator) — no pkexec needed."""
+            tool = shutil.which("google-authenticator")
+            if not tool:
+                return
+            # -t TOTP, -d disallow reuse, -f force write, -r/-R rate limit,
+            # -w 3 window, -Q UTF8 emits a terminal QR we capture.
+            r = run([tool, "-t", "-d", "-f", "-r", "3", "-R", "30", "-w", "3",
+                     "-Q", "UTF8"], timeout=30)
+            out = r.stdout or r.stderr
+            self.secretBox.setPlainText(out.strip() or "(no output)")
+            self.secretBox.show()
+            # The UTF8 QR is in `out`; also try to render a PNG QR if qrencode
+            # is available for a crisper image.
+            self._maybe_png_qr()
+            self.refresh()
+
+        def _maybe_png_qr(self):
+            # Pull the otpauth:// URL out of ~/.google_authenticator's secret if
+            # qrencode exists, render a PNG QR for scanning.
+            if not shutil.which("qrencode"):
+                return
+            secret = ""
+            try:
+                with open(GA_FILE) as f:
+                    secret = f.readline().strip()
+            except OSError:
+                return
+            if not secret:
+                return
+            url = ("otpauth://totp/%s@%s?secret=%s&issuer=HasH-Arch"
+                   % (USER, os.uname().nodename, secret))
+            png = "/tmp/hash-security-qr-%d.png" % os.getpid()
+            r = run(["qrencode", "-o", png, "-s", "5", "-m", "2", url], timeout=10)
+            if r.returncode == 0 and os.path.exists(png):
+                pix = QPixmap(png)
+                if not pix.isNull():
+                    self.qr.setPixmap(pix.scaledToWidth(
+                        220, Qt.TransformationMode.SmoothTransformation))
+                    self.qr.show()
+
+        def do_remove(self):
+            try:
+                if os.path.exists(GA_FILE):
+                    os.rename(GA_FILE, GA_FILE + ".removed")
+            except OSError as e:
+                self.status.setText("Could not remove: %s" % e)
+            self.secretBox.hide()
+            self.qr.hide()
+            self.refresh()
+            # Also offer to disable TOTP on every surface (handled from Overview)
+
+    # ── Face (Howdy) detail page — install / enroll / clear / sensitivity ─────
+    class FacePage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(4, 2, 4, 4)
+            outer.setSpacing(12)
+            hdr = QLabel("Face unlock (Howdy)")
+            hdr.setObjectName("pagetitle")
+            outer.addWidget(hdr)
+            self.status = QLabel("")
+            self.status.setObjectName("subtle")
+            self.status.setWordWrap(True)
+            outer.addWidget(self.status)
+
+            card = QFrame()
+            card.setObjectName("card")
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(20, 18, 20, 18)
+            cv.setSpacing(12)
+            self.info = QLabel("")
+            self.info.setObjectName("subtle")
+            self.info.setWordWrap(True)
+            cv.addWidget(self.info)
+
+            self.btns = QHBoxLayout()
+            self.btns.setSpacing(8)
+            cv.addLayout(self.btns)
+
+            # sensitivity (certainty) row
+            self.sensrow = QHBoxLayout()
+            self.sensrow.setSpacing(8)
+            sl = QLabel("Sensitivity (certainty, lower = stricter):")
+            sl.setObjectName("subtle")
+            self.sensrow.addWidget(sl)
+            for val, lab in [("2.5", "Strict"), ("3.5", "Balanced"), ("4.5", "Lenient")]:
+                b = QPushButton(lab)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(lambda _=False, v=val: self.win.howdy_config("certainty", v))
+                self.sensrow.addWidget(b)
+            self.sensrow.addStretch(1)
+            cv.addLayout(self.sensrow)
+
+            note = QLabel("Face is a `sufficient` method tried before your "
+                          "password — the password always still works. Enable "
+                          "it per-surface from the Sign-in options page once "
+                          "enrolled. The TTY console is never affected. "
+                          "Live enrollment requires a camera; verify face login "
+                          "in a new session before relying on it.")
+            note.setObjectName("note")
+            note.setWordWrap(True)
+            cv.addWidget(note)
+            cv.addStretch(1)
+            outer.addWidget(card)
+            outer.addStretch(1)
+
+        def _clear(self):
+            while self.btns.count():
+                it = self.btns.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def refresh(self):
+            self._clear()
+            st = gather_state()
+            hw, enr = st["hardware"], st["enrollment"]
+            cams = ", ".join(hw["camera_devices"]) or "none"
+            if not hw["camera"]:
+                self.status.setText("No camera detected — face unlock is unavailable.")
+            elif not hw["howdy"]:
+                aur = hw["aur_helper"]
+                self.status.setText("Camera detected (%s). Howdy is not installed."
+                                    % cams)
+                if aur:
+                    self.info.setText("Howdy is an AUR package. Install it with the "
+                                      "detected helper (%s) — the root helper runs "
+                                      "the build as you, not as root." % aur)
+                    b = QPushButton("Install Howdy (%s)" % aur)
+                    b.setObjectName("primary")
+                    b.clicked.connect(self.win.install_howdy)
+                    self.btns.addWidget(b)
+                else:
+                    self.info.setText("Howdy is an AUR package and no AUR helper "
+                                      "(yay/paru) was found. Install it manually:\n"
+                                      "    yay -S howdy")
+                self.btns.addStretch(1)
+            else:
+                if enr["face"]:
+                    self.status.setText("Camera detected (%s). Howdy is installed and "
+                                        "a face is enrolled." % cams)
+                    self.info.setText("You can re-enroll, add another angle, or "
+                                      "clear your enrolled faces.")
+                    for text, oname, cb in [
+                            ("Re-enroll face", "primary", self.win.howdy_add),
+                            ("Clear faces", "danger", self.win.howdy_clear)]:
+                        b = QPushButton(text)
+                        b.setObjectName(oname)
+                        b.clicked.connect(lambda _=False, f=cb: f())
+                        self.btns.addWidget(b)
+                else:
+                    self.status.setText("Camera detected (%s). Howdy is installed; "
+                                        "no face enrolled yet." % cams)
+                    self.info.setText("Enroll your face. You'll be asked to look at "
+                                      "the camera while Howdy captures a model.")
+                    b = QPushButton("Enroll face")
+                    b.setObjectName("primary")
+                    b.clicked.connect(self.win.howdy_add)
+                    self.btns.addWidget(b)
+                self.btns.addStretch(1)
+            for i in range(self.sensrow.count()):
+                w = self.sensrow.itemAt(i).widget()
+                if w:
+                    w.setEnabled(hw["howdy"])
+
+    # ── Fingerprint (fprintd) detail page — install / enroll / clear ──────────
+    class FingerprintPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(4, 2, 4, 4)
+            outer.setSpacing(12)
+            hdr = QLabel("Fingerprint (fprintd)")
+            hdr.setObjectName("pagetitle")
+            outer.addWidget(hdr)
+            self.status = QLabel("")
+            self.status.setObjectName("subtle")
+            self.status.setWordWrap(True)
+            outer.addWidget(self.status)
+
+            card = QFrame()
+            card.setObjectName("card")
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(20, 18, 20, 18)
+            cv.setSpacing(12)
+            self.info = QLabel("")
+            self.info.setObjectName("subtle")
+            self.info.setWordWrap(True)
+            cv.addWidget(self.info)
+
+            self.btns = QHBoxLayout()
+            self.btns.setSpacing(8)
+            cv.addLayout(self.btns)
+
+            note = QLabel("Fingerprint is a `sufficient` method tried before your "
+                          "password — the password always still works. Enable it "
+                          "per-surface from Sign-in options once a finger is "
+                          "enrolled. The TTY console is never affected. Live "
+                          "enrollment requires a reader; verify in a new session "
+                          "before relying on it.")
+            note.setObjectName("note")
+            note.setWordWrap(True)
+            cv.addWidget(note)
+            cv.addStretch(1)
+            outer.addWidget(card)
+            outer.addStretch(1)
+
+        def _clear(self):
+            while self.btns.count():
+                it = self.btns.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def refresh(self):
+            self._clear()
+            st = gather_state()
+            hw, enr = st["hardware"], st["enrollment"]
+            if not hw["fprintd"]:
+                self.status.setText("fprintd is not installed.")
+                self.info.setText("fprintd is in the official repos. Install it to "
+                                  "use a fingerprint reader.")
+                b = QPushButton("Install fprintd")
+                b.setObjectName("primary")
+                b.clicked.connect(self.win.install_fprintd)
+                self.btns.addWidget(b)
+            elif not hw["fprint_reader"]:
+                self.status.setText("fprintd is installed but no reader was detected.")
+                self.info.setText("Connect a supported fingerprint reader and reopen "
+                                  "this page.")
+            else:
+                if enr["fingerprint"]:
+                    self.status.setText("Reader detected. A fingerprint is enrolled.")
+                    self.info.setText("You can add another finger or clear your "
+                                      "enrolled fingerprints.")
+                    for text, oname, cb in [
+                            ("Add another finger", "primary", self.win.fprint_enroll),
+                            ("Clear fingerprints", "danger", self.win.fprint_delete)]:
+                        b = QPushButton(text)
+                        b.setObjectName(oname)
+                        b.clicked.connect(lambda _=False, f=cb: f())
+                        self.btns.addWidget(b)
+                else:
+                    self.status.setText("Reader detected; no fingerprint enrolled yet.")
+                    self.info.setText("Enroll a finger. You'll touch the reader "
+                                      "several times so it can build a template.")
+                    b = QPushButton("Enroll fingerprint")
+                    b.setObjectName("primary")
+                    b.clicked.connect(self.win.fprint_enroll)
+                    self.btns.addWidget(b)
+            self.btns.addStretch(1)
+
+    # ── PIN page — explains why it is detect+explain (lockout-safety) ─────────
+    class PinPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(4, 2, 4, 4)
+            outer.setSpacing(12)
+            hdr = QLabel("PIN")
+            hdr.setObjectName("pagetitle")
+            outer.addWidget(hdr)
+            card = QFrame()
+            card.setObjectName("card")
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(20, 18, 20, 18)
+            cv.setSpacing(10)
+            row = QHBoxLayout()
+            row.addWidget(chip("not enabled (by design)", "nohw"),
+                          0, Qt.AlignmentFlag.AlignLeft)
+            row.addStretch(1)
+            cv.addLayout(row)
+            body = QLabel(
+                "A PIN would be a separate numeric credential for quick unlocks. "
+                "It would never replace your password.")
+            body.setObjectName("subtle")
+            body.setWordWrap(True)
+            cv.addWidget(body)
+            why = QLabel(
+                "Why it is not enabled here:\n"
+                "• A safe PIN needs a dedicated, well-tested PAM module "
+                "(e.g. pam_pin) or a separate pam_unix-backed store. Wiring an "
+                "untested credential into the live auth stack risks lockout.\n"
+                "• Until that path is tested end-to-end (and covered by "
+                "test-pam.py), the root helper deliberately REFUSES `enable pin` "
+                "rather than ship a path that could lock you out.\n"
+                "• Your existing methods — password (always), face, fingerprint "
+                "and TOTP — already cover quick and strong sign-in.\n\n"
+                "This is a lockout-safety decision, not a missing feature: PIN is "
+                "detect+explain on purpose.")
+            why.setObjectName("note")
+            why.setWordWrap(True)
+            cv.addWidget(why)
+            cv.addStretch(1)
+            outer.addWidget(card)
+            outer.addStretch(1)
+
+        def refresh(self):
+            pass
+
+    # ── Policy & order + Recovery page ────────────────────────────────────────
+    class PolicyPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(4, 2, 4, 4)
+            outer.setSpacing(12)
+            hdr = QLabel("Policy, order & recovery")
+            hdr.setObjectName("pagetitle")
+            outer.addWidget(hdr)
+
+            order = QFrame()
+            order.setObjectName("card")
+            ov = QVBoxLayout(order)
+            ov.setContentsMargins(20, 18, 20, 18)
+            ov.setSpacing(8)
+            ot = QLabel("How methods are tried")
+            ot.setObjectName("mname")
+            ov.addWidget(ot)
+            ob = QLabel(
+                "Face → Fingerprint → Password, then TOTP on top.\n\n"
+                "Biometrics are `sufficient`: a match signs you in immediately, "
+                "but if they fail (or no hardware), PAM falls through to your "
+                "password, which is always present. TOTP, when enabled, is a "
+                "second factor layered AFTER the password. faillock brackets the "
+                "stack so repeated failures are still counted.")
+            ob.setObjectName("subtle")
+            ob.setWordWrap(True)
+            ov.addWidget(ob)
+            outer.addWidget(order)
+
+            rec = QFrame()
+            rec.setObjectName("card")
+            rv = QVBoxLayout(rec)
+            rv.setContentsMargins(20, 18, 20, 18)
+            rv.setSpacing(10)
+            rt = QLabel("Recovery & lockout safety")
+            rt.setObjectName("mname")
+            rv.addWidget(rt)
+            self.fl = QLabel("")
+            self.fl.setObjectName("subtle")
+            self.fl.setWordWrap(True)
+            rv.addWidget(self.fl)
+            flrow = QHBoxLayout()
+            self.resetBtn = QPushButton("Reset faillock counter")
+            self.resetBtn.setObjectName("primary")
+            self.resetBtn.clicked.connect(self.win.faillock_reset)
+            flrow.addWidget(self.resetBtn)
+            flrow.addStretch(1)
+            rv.addLayout(flrow)
+            tty = QLabel(
+                "TTY fallback: the text console login (/etc/pam.d/login) is NEVER "
+                "edited by this app. If a graphical method ever misbehaves, switch "
+                "to a virtual terminal (Ctrl+Alt+F2…F6) and sign in with your "
+                "password to recover.\n\n"
+                "Always test in a new session before relying on it: after enabling "
+                "a method on Lock or Login, lock the screen (or open a fresh "
+                "session) and confirm sign-in works — while your current session is "
+                "still open as a safety net. Every PAM change is backed up and can "
+                "be rolled back (Overview → toggle off, or the helper's `restore`).")
+            tty.setObjectName("note")
+            tty.setWordWrap(True)
+            rv.addWidget(tty)
+            outer.addWidget(rec)
+            outer.addStretch(1)
+
+        def refresh(self):
+            st = gather_state()
+            n = st.get("faillock_count")
+            if n is None:
+                self.fl.setText("faillock is not available on this system.")
+                self.resetBtn.setEnabled(False)
+            else:
+                self.fl.setText("Recent failed attempts recorded for %s: %d. "
+                                "If you ever get locked out after too many "
+                                "failures, reset the counter here (asks for "
+                                "admin) or from a TTY." % (USER, n))
+                self.resetBtn.setEnabled(True)
+
+    class Win(QWidget):
+        def __init__(self):
+            super().__init__(None, Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setWindowTitle("HasH Security Center")
+            scr = (QApplication.screenAt(QCursor.pos())
+                   or QApplication.primaryScreen()).geometry()
+            W = max(860, int(scr.height() * 0.86))
+            Hh = max(560, int(scr.height() * 0.66))
+            self.resize(W, Hh)
+            self.move(scr.center().x() - W // 2, scr.center().y() - Hh // 2)
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(1, 1, 1, 1)
+            root.setSpacing(0)
+            root.addWidget(TitleBar(self))
+
+            body = QHBoxLayout()
+            body.setContentsMargins(14, 4, 14, 14)
+            body.setSpacing(14)
+
+            self.stack = QStackedWidget()
+            state0 = gather_state()
+            hw = state0["hardware"]
+
+            self.pages = {}
+            self.pages["signin"] = SignInPage(self)
+            self.pages["overview"] = OverviewPage(self)
+            self.pages["totp"] = TotpPage(self)
+            self.pages["face"] = FacePage(self)
+            self.pages["fingerprint"] = FingerprintPage(self)
+            self.pages["pin"] = PinPage(self)
+            self.pages["policy"] = PolicyPage(self)
+
+            # sidebar — hide hardware-absent pages cleanly
+            side = QVBoxLayout()
+            side.setSpacing(6)
+            self.nav = {}
+            specs = [("signin", "Sign-in options", "system-users"),
+                     ("overview", "Matrix", "security-high"),
+                     ("totp", "Two-Factor", "smartphone"),
+                     ("face", "Face", "camera-web"),
+                     ("fingerprint", "Fingerprint", "fingerprint"),
+                     ("pin", "PIN", "dialpad"),
+                     ("policy", "Policy & recovery", "preferences-system-privacy")]
+            self._visible = []
+            for key, label, icon in specs:
+                if key == "face" and not hw["camera"]:
+                    continue
+                if key == "fingerprint" and not hw["fprint_reader"]:
+                    continue
+                b = QPushButton("  " + label)
+                b.setCheckable(True)
+                b.setObjectName("nav")
+                b.setIcon(QIcon.fromTheme(icon))
+                b.setIconSize(QSize(20, 20))
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(lambda _, k=key: self.go(k))
+                side.addWidget(b)
+                self.nav[key] = b
+                self.stack.addWidget(self.pages[key])
+                self._visible.append(key)
+            side.addStretch(1)
+            exitb = QPushButton("  ⏻  Exit")
+            exitb.setObjectName("exitbtn")
+            exitb.setIcon(QIcon.fromTheme("application-exit"))
+            exitb.setIconSize(QSize(18, 18))
+            exitb.setCursor(Qt.CursorShape.PointingHandCursor)
+            exitb.clicked.connect(self.close)
+            side.addWidget(exitb)
+            brand = QLabel("HasH-Arch")
+            brand.setObjectName("brand")
+            side.addWidget(brand)
+            sw = QWidget()
+            sw.setObjectName("sidebar")
+            sw.setLayout(side)
+            sw.setFixedWidth(184)
+            body.addWidget(sw)
+            body.addWidget(self.stack, 1)
+            root.addLayout(body, 1)
+            self.setStyleSheet(app_qss())
+
+            QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.close)
+            if start_page not in self._visible:
+                start_page2 = "signin"
+            else:
+                start_page2 = start_page
+            self.go(start_page2)
+
+        # ── privileged-action wrappers (all via pkexec → helper) ─────────────
+        def _enroll_done(self, ok):
+            # Re-read state everywhere after any enroll/install/clear.
+            for pg in self.pages.values():
+                if hasattr(pg, "refresh"):
+                    pg.refresh()
+
+        def install_howdy(self):
+            self.run_helper("Install Howdy",
+                            ["pkexec", HELPER, "install", "howdy"],
+                            self._enroll_done)
+
+        def install_fprintd(self):
+            self.run_helper("Install fprintd",
+                            ["pkexec", HELPER, "install", "fprintd"],
+                            self._enroll_done)
+
+        def howdy_add(self):
+            self.run_helper("Enroll face (look at the camera)",
+                            ["pkexec", HELPER, "howdy-add", USER],
+                            self._enroll_done)
+
+        def howdy_clear(self):
+            self.run_helper("Clear enrolled faces",
+                            ["pkexec", HELPER, "howdy-clear", USER],
+                            self._enroll_done)
+
+        def howdy_config(self, key, value):
+            self.run_helper("Howdy: set %s = %s" % (key, value),
+                            ["pkexec", HELPER, "howdy-config", key, value],
+                            self._enroll_done)
+
+        def fprint_enroll(self):
+            self.run_helper("Enroll fingerprint (touch the reader)",
+                            ["pkexec", HELPER, "fprint-enroll", USER],
+                            self._enroll_done)
+
+        def fprint_delete(self):
+            self.run_helper("Clear fingerprints",
+                            ["pkexec", HELPER, "fprint-delete", USER],
+                            self._enroll_done)
+
+        def faillock_reset(self):
+            self.run_helper("Reset faillock counter",
+                            ["pkexec", HELPER, "faillock-reset", USER],
+                            self._enroll_done)
+
+        def toggle_surface(self, method, surface, tg):
+            """Enable/disable a method on a surface (shared by Sign-in cards and
+            the Matrix). Refreshes all pages so chips/toggles stay in sync."""
+            sub = "enable" if tg.isChecked() else "disable"
+            self.run_helper(
+                "%s %s on %s" % (sub.title(), method, surface),
+                ["pkexec", HELPER, sub, method, surface],
+                self._enroll_done)
+
+        def go(self, key):
+            if key not in self.pages:
+                key = "overview"
+            self.stack.setCurrentWidget(self.pages[key])
+            for k, b in self.nav.items():
+                b.setChecked(k == key)
+            pg = self.pages[key]
+            if hasattr(pg, "refresh"):
+                pg.refresh()
+
+        def run_helper(self, title, argv, on_done):
+            self._tx = Transaction(self, title, argv, on_done)
+            g = self.geometry()
+            self._tx.move(g.center().x() - 310, g.center().y() - 190)
+            self._tx.show()
+
+        def paintEvent(self, _e):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1, 20, 20)
+            p.fillPath(path, QColor(0x12, 0x14, 0x1a))
+            p.setPen(QColor(255, 255, 255, 30))
+            p.drawPath(path)
+
+    def app_qss():
+        return f"""
+            #sidebar{{ background:rgba(255,255,255,0.03); border-radius:14px; }}
+            #apptitle{{ color:#fff; font-size:15px; font-weight:700; }}
+            QPushButton#winbtn{{ background:transparent; color:#9fb0b4; border:none;
+                border-radius:8px; font-size:14px; }}
+            QPushButton#winbtn:hover{{ background:rgba(255,255,255,0.12); color:#fff; }}
+            QPushButton#nav{{ text-align:left; background:transparent; color:#c6d2d5;
+                border:none; border-radius:10px; padding:10px 12px; font-size:14px; }}
+            QPushButton#nav:hover{{ background:rgba(255,255,255,0.07); }}
+            QPushButton#nav:checked{{ background:{ACCENT}; color:#06222a; font-weight:700; }}
+            QPushButton#exitbtn{{ text-align:left; background:rgba(224,108,117,0.10);
+                color:#e6a3a9; border:1px solid rgba(224,108,117,0.25);
+                border-radius:10px; padding:9px 12px; font-size:13px; font-weight:600; }}
+            QPushButton#exitbtn:hover{{ background:{DANGER}; color:#2a0a0c;
+                border:1px solid {DANGER}; }}
+            #pagetitle{{ color:#fff; font-size:22px; font-weight:800; }}
+            #subtle{{ color:#9fb0b4; font-size:13px; }}
+            #note{{ color:{WARN}; font-size:12px; }}
+            #colhead{{ color:#7f8d90; font-size:12px; font-weight:700;
+                text-transform:uppercase; letter-spacing:1px; }}
+            #mname{{ color:#f3f7f8; font-size:15px; font-weight:700; }}
+            #card{{ background:#0d1016; border:1px solid rgba(255,255,255,0.07);
+                border-radius:16px; }}
+            #hcard{{ background:#0d1016; border:1px solid rgba(255,255,255,0.08);
+                border-radius:16px; }}
+            #hcard:hover{{ border:1px solid rgba(86,197,216,0.35); }}
+            #hicon{{ font-size:26px; }}
+            #hname{{ color:#f3f7f8; font-size:16px; font-weight:800; }}
+            #surflabel{{ color:#7f8d90; font-size:11px; font-weight:700; }}
+            #brand{{ color:rgba(255,255,255,0.30); font-size:11px;
+                qproperty-alignment:'AlignCenter'; padding:4px; }}
+            #secret{{ background:#0b0d12; color:#cfe9ee; border:1px solid #222;
+                border-radius:10px; font-family:monospace; font-size:11px; }}
+            #qr{{ background:#fff; border-radius:10px; padding:8px; }}
+            QScrollBar:vertical{{ background:transparent; width:10px; }}
+            QScrollBar::handle:vertical{{ background:rgba(255,255,255,0.18);
+                border-radius:5px; min-height:30px; }}
+            QScrollBar::add-line,QScrollBar::sub-line{{ height:0; width:0; }}
+        """ + btn_qss()
+
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("HasH Security Center")
+    w = Win()
+    w.show()
+    if shot:
+        def _grab():
+            w.go("signin")
+            QTimer.singleShot(500, lambda: (w.grab().save(shot), os._exit(0)))
+        QTimer.singleShot(1200, _grab)
+    return app.exec()
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] == "backend":
+        return cli(a[1:])
+    page = "signin"
+    if "--page" in a:
+        i = a.index("--page")
+        if i + 1 < len(a):
+            page = a[i + 1]
+    shot = None
+    if "--shot" in a:
+        i = a.index("--shot")
+        shot = a[i + 1] if i + 1 < len(a) else "/tmp/hash-security.png"
+    return gui(page, shot)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

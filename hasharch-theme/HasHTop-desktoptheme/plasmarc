@@ -1,0 +1,17 @@
+[Theme]
+name=HasHTop
+
+[Wallpaper]
+defaultWallpaperTheme=HasH
+defaultFileSuffix=.jpg
+defaultWidth=3840
+defaultHeight=1920
+
+[Settings]
+FallbackTheme=HasH
+
+[AdaptiveTransparency]
+enabled=true
+
+[BlurBehindEffect]
+enabled=true

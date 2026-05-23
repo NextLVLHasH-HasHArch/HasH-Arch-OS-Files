@@ -1,0 +1,54 @@
+[kcminputrc][Mouse]
+cursorTheme=HasH-cursors
+
+[kdeglobals][General]
+ColorScheme=HasH
+
+[kdeglobals][Icons]
+Theme=HasH-Icons
+
+[kdeglobals][KDE]
+ColorScheme=HasH
+LookAndFeelPackage=HasHTop
+widgetStyle=kvantum-dark
+
+[kwinrc][Windows]
+BorderlessMaximizedWindows=false
+
+# Rounded Corners (ShapeCorners) — keep desktop windows rounded, but go FLUSH
+# when maximized/fullscreen (no rounding, no accent outline). The upstream
+# defaults enabled rounding without these, which broke the top edge of maximized
+# windows (Dolphin etc.). Baked in here so the HasH look can never re-introduce it.
+[kwinrc][Round-Corners]
+DisableRoundMaximize=true
+DisableOutlineMaximize=true
+DisableRoundFullScreen=true
+DisableOutlineFullScreen=true
+
+[kwinrc][org.kde.kdecoration2]
+library=org.kde.kwin.aurorae
+theme=__aurorae__svg__HasH-Dark
+
+[plasmarc][Theme]
+name=HasHTop
+
+[KSplash]
+Theme=HasHTop
+
+[Wallpaper]
+Image=HasH
+
+[kscreenlockerrc][Greeter]
+WallpaperPlugin=org.kde.image
+
+[kscreenlockerrc][Greeter][Wallpaper][org.kde.image][General]
+Image=file:///usr/share/wallpapers/HasH/contents/images/2560x1440.jpg
+
+[gtk-3.0/settings.ini][Settings]
+gtk-theme-name=HasH-Dark
+
+[.gtkrc-2.0]
+gtk-theme-name=HasH-Dark
+
+[kvantum.kvconfig][General]
+theme=HasH

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Assemble each HasH-Arch component into its own git repo under ~/HasH-Arch/,
+# commit it, and (if gh is authenticated) create + push a separate GitHub repo
+# per component. Run `gh auth login` first if you want it to push.
+#
+#   hash-export-repos            # build repos + commit locally, print push cmds
+#   hash-export-repos --push     # also create+push each repo on GitHub via gh
+set -uo pipefail
+H="$HOME"; OUT="$H/HasH-Arch"; PUSH="${1:-}"
+mkdir -p "$OUT"
+GH_USER="$(gh api user --jq .login 2>/dev/null || echo '<your-gh-user>')"
+
+# repo-name | space-separated source paths (files or dirs)
+COMPONENTS=(
+"hasharch-kickoff|$H/.local/share/plasma/plasmoids/com.hash.kickoff"
+"hasharch-wallpaper|$H/.local/share/plasma/wallpapers/com.hash.matrixrain"
+"hasharch-iosfolders|$H/.local/share/plasma/plasmoids/com.hash.iosfolders"
+"hasharch-wallpaperguard|$H/.local/share/kwin/scripts/wallpaperguard"
+"hasharch-software-center|$H/.local/bin/hash-store $H/.local/bin/hash-update-notifier $H/.config/autostart/hash-update-notifier.desktop"
+"hasharch-tools|$H/.local/bin/hash-cat $H/.local/bin/hash-folders $H/.local/bin/hash-desktop $H/.local/bin/hash-allapps $H/.local/bin/hash-blackarch.sh $H/.local/bin/hash-launcher-menu.sh $H/.local/bin/build-desktop-groups.py $H/.local/bin/cava-wallpaper.sh $H/.local/bin/hash-weather-sync.sh $H/.local/bin/hash-visualizer-settings.sh $H/.local/bin/hash-uninstaller $H/.local/bin/hash-obs-tray.sh $H/.local/bin/hash-export-repos"
+"hasharch-system|$H/.config/systemd/user/cava-wallpaper.service $H/.config/systemd/user/cava-wallpaper.timer $H/.config/systemd/user/hash-weather-sync.service $H/.config/systemd/user/hash-weather-sync.timer $H/.config/systemd/user/hash-obs-tray.service $H/.config/systemd/user/hash-obs-tray.path $H/.config/systemd/user/hash-allapps.service $H/.config/systemd/user/hash-allapps.path $H/.config/cava/wallpaper.conf $H/.local/share/kio/servicemenus/open-with-vscode.desktop $H/Documents/HasH/HasH-Arch.md $H/Documents/HasH/SDDM-2FA-popup-patch.md"
+)
+
+DESC_kickoff="HasH-Arch launcher — a Kickoff fork: rounded popup, curated Main groups, All Apps (all installed, categorized), in-launcher Settings."
+DESC_wallpaper="HasH-Arch live wallpaper — GPU weather shader (real moon phase, ✕ stars, clouds) + cava audio visualizer."
+DESC_iosfolders="HasH-Arch iOS-style desktop folders — one per launcher category, plus custom folders."
+DESC_wallpaperguard="KWin script: per-screen wallpaper pause on fullscreen + live dock geometry reporting."
+DESC_softwarecenter="HasH Software Center — PyQt6 graphical package manager (pacman/AUR/flatpak) + tray update notifier."
+DESC_tools="HasH-Arch command-line tools: category manager, desktop-folder generators, BlackArch handling, weather/visualizer helpers."
+DESC_system="HasH-Arch system glue: systemd user units (cava feed, weather sync, OBS tray, All-Apps watcher), cava config, KIO service menus, docs + the SDDM 2FA patch."
+
+for entry in "${COMPONENTS[@]}"; do
+    name="${entry%%|*}"; srcs="${entry#*|}"
+    repo="$OUT/$name"
+    echo "=== $name ==="
+    rm -rf "$repo"; mkdir -p "$repo"
+    for s in $srcs; do
+        [ -e "$s" ] && cp -r "$s" "$repo/" || echo "  (missing: $s)"
+    done
+    key="$(echo "$name" | sed 's/hasharch-//; s/-//g')"
+    desc_var="DESC_${key}"; desc="${!desc_var:-HasH-Arch component.}"
+    cat > "$repo/README.md" <<EOF
+# $name
+
+$desc
+
+Part of **HasH-Arch** — a customised KDE Plasma 6 desktop (BlackArch/Arch fork)
+maintained by NextLVLHasH & Opus 4.7.
+
+## Install
+Copy the contents into the matching location on a Plasma 6 system:
+$(for s in $srcs; do echo "- \`${s/#$H/~}\`"; done)
+EOF
+    cat > "$repo/.gitignore" <<'EOF'
+*.pyc
+__pycache__/
+*.bak
+EOF
+    ( cd "$repo" && git init -q && git add -A && \
+      git commit -q -m "$name: initial import from HasH-Arch
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>" )
+    if [ "$PUSH" = "--push" ] && command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+        ( cd "$repo"
+          if gh repo view "$GH_USER/$name" >/dev/null 2>&1; then
+              git remote add origin "https://github.com/$GH_USER/$name.git" 2>/dev/null
+              git push -u origin master --force 2>&1 | tail -1      # refresh existing repo
+          else
+              gh repo create "$name" --public --source=. --push --description "$desc" 2>&1 | tail -2
+          fi )
+    else
+        echo "  ready. push with:"
+        echo "    cd $repo && gh repo create $name --public --source=. --push"
+    fi
+done
+
+echo
+echo "All components assembled under $OUT/"
+[ "$PUSH" != "--push" ] && echo "Run 'gh auth login' then 'hash-export-repos --push' to create + push all repos as $GH_USER."

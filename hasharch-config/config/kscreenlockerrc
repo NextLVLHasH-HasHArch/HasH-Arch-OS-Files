@@ -1,0 +1,23 @@
+[Daemon]
+Autolock=true
+LockGrace=60
+Timeout=20
+
+[Greeter]
+Theme=HasHTop
+WallpaperPlugin=com.hash.matrixrain
+
+[Greeter][Wallpaper][com.hash.matrixrain][General]
+cachedPlace=Bolton, GB
+cachedTemperature=20
+fixedLatitude=53.58333
+fixedLongitude=-2.43333
+forceCondition=sun
+locationName=Bolton, GB
+mode=weather
+showClock=true
+showInfo=true
+units=metric
+
+[Greeter][Wallpaper][org.kde.image][General]
+Image=file:///usr/share/wallpapers/HasH/contents/images/2560x1440.jpg

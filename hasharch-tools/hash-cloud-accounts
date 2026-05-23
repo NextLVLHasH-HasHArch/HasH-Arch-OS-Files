@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+"""HasH Cloud Accounts  (hash-cloud-accounts)
+
+A first-boot wizard to connect your cloud storage and have it auto-mount as a
+drive on every login.  Cloud sign-in is OAuth in a browser, so it CAN'T run
+during the Calamares install — the installer's "Cloud storage" packagechooser
+only installs the tooling (rclone + fuse3 + native KIO helpers).  This wizard
+does the actual sign-in afterwards.
+
+Flow
+  * A searchable, popularity-ordered provider list (Google Drive, OneDrive,
+    iCloud, SharePoint, Dropbox first; then Mega, Nextcloud, Box, pCloud).
+  * Picking a provider launches `rclone config create <remote> <backend>`, which
+    runs rclone's own interactive / OAuth flow (the browser opens for OAuth
+    providers; WebDAV/iCloud collect a URL/Apple-ID in the same terminal pane).
+  * On success it writes a per-remote systemd USER mount unit
+    (hash-cloud-<remote>.service) that runs `rclone mount` to
+    ~/CloudStorage/<provider> and is enabled so it mounts on every login.
+
+Engine : rclone — OAuth sign-in + FUSE mount.  Tokens live in
+         ~/.config/rclone/rclone.conf (CONTAINS SECRETS — never commit).
+Mounts : rclone mount <remote>: ~/CloudStorage/<provider> --vfs-cache-mode writes
+Login  : one systemd USER unit per remote (hash-cloud-<remote>.service).
+
+Usage
+    hash-cloud-accounts                 launch the wizard
+    hash-cloud-accounts --autostart     first-login mode: open only if NO remotes
+                                        are configured yet, then never nag again
+    hash-cloud-accounts list            headless: print configured remotes (JSON)
+    hash-cloud-accounts --shot <png>    render a screenshot and exit
+
+The Calamares "Cloud storage" packagechooser ships an autostart .desktop
+(hash-cloud-accounts.desktop, X-KDE → Exec=hash-cloud-accounts --autostart) that
+opens this once on first login if no remote exists, then removes itself.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+RCLONE = shutil.which("rclone") or "/usr/bin/rclone"
+HAS_RCLONE = bool(shutil.which("rclone"))
+HAS_FUSE = bool(shutil.which("fusermount3") or shutil.which("fusermount"))
+RCLONE_CONF = os.path.join(HOME, ".config", "rclone", "rclone.conf")
+SYSTEMD_USER = os.path.join(HOME, ".config", "systemd", "user")
+MOUNT_ROOT = os.path.join(HOME, "CloudStorage")
+AUTOSTART = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+    "autostart", "hash-cloud-accounts.desktop")
+
+VFS_CACHE_MODE = "writes"
+VFS_CACHE_MAX = "5G"
+
+# Providers offered by the wizard, in POPULARITY order (most-used first).
+#   key     : short id; also the default remote name and mount folder name.
+#   name    : display name (and what the search box matches).
+#   backend : rclone backend `type` for `rclone config create`.
+#   oauth   : rclone opens the browser for an OAuth token (no extra fields).
+#   webdav  : collect a WebDAV URL + login (SharePoint, Nextcloud).
+#   icloud  : Apple ID + password + 2FA (rclone's iclouddrive backend).
+#   icon    : freedesktop icon name (falls back to a generic cloud folder).
+PROVIDERS = [
+    {"key": "google-drive", "name": "Google Drive", "backend": "drive",
+     "oauth": True, "icon": "folder-google-drive",
+     "blurb": "Google Drive / Google One — your full cloud quota as a drive."},
+    {"key": "onedrive", "name": "OneDrive", "backend": "onedrive",
+     "oauth": True, "icon": "folder-onedrive",
+     "blurb": "Microsoft OneDrive — personal or business."},
+    {"key": "icloud", "name": "iCloud", "backend": "iclouddrive",
+     "icloud": True, "icon": "com.apple.iCloud",
+     "blurb": "Apple iCloud Drive — sign in with your Apple ID (needs 2FA). "
+              "Requires rclone >= 1.66."},
+    {"key": "sharepoint", "name": "SharePoint", "backend": "webdav",
+     "webdav": True, "vendor": "sharepoint", "icon": "folder-cloud",
+     "blurb": "Microsoft SharePoint document library, over WebDAV."},
+    {"key": "dropbox", "name": "Dropbox", "backend": "dropbox",
+     "oauth": True, "icon": "folder-dropbox",
+     "blurb": "Dropbox cloud storage."},
+    {"key": "mega", "name": "Mega", "backend": "mega",
+     "userpass": True, "icon": "folder-cloud",
+     "blurb": "MEGA encrypted cloud storage (email + password)."},
+    {"key": "nextcloud", "name": "Nextcloud", "backend": "webdav",
+     "webdav": True, "vendor": "nextcloud", "icon": "folder-cloud",
+     "blurb": "Nextcloud / ownCloud over WebDAV (URL + login)."},
+    {"key": "box", "name": "Box", "backend": "box",
+     "oauth": True, "icon": "folder-cloud",
+     "blurb": "Box.com cloud storage."},
+    {"key": "pcloud", "name": "pCloud", "backend": "pcloud",
+     "oauth": True, "icon": "folder-cloud",
+     "blurb": "pCloud storage."},
+]
+
+
+def run(cmd, timeout=60):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = str(e)
+        return _R()
+
+
+# ───────────────────────────── rclone remotes ────────────────────────────────
+def list_remotes():
+    """[{name, type}] of every remote in rclone's config (empty if none)."""
+    if not HAS_RCLONE:
+        return []
+    r = run([RCLONE, "config", "dump"])
+    try:
+        data = json.loads(r.stdout) if r.stdout.strip() else {}
+    except Exception:
+        data = {}
+    out = [{"name": n, "type": c.get("type", "")} for n, c in data.items()]
+    out.sort(key=lambda x: x["name"].lower())
+    return out
+
+
+def remote_names():
+    return {r["name"] for r in list_remotes()}
+
+
+def has_remotes():
+    return bool(list_remotes())
+
+
+def has_backend(backend):
+    """True if the installed rclone exposes `backend` (e.g. iclouddrive)."""
+    if not HAS_RCLONE:
+        return False
+    r = run([RCLONE, "config", "providers"], timeout=20)
+    try:
+        provs = json.loads(r.stdout) if r.stdout.strip() else []
+    except Exception:
+        provs = []
+    if provs:
+        return any(isinstance(p, dict) and p.get("Name") == backend for p in provs)
+    h = run([RCLONE, "help", "backends"], timeout=20)
+    return backend in (h.stdout or "")
+
+
+def unique_name(base):
+    """A remote name not already in use (base, base2, base3, ...)."""
+    existing = remote_names()
+    if base not in existing:
+        return base
+    i = 2
+    while "%s%d" % (base, i) in existing:
+        i += 1
+    return "%s%d" % (base, i)
+
+
+# ───────────────────────── mount point + systemd unit ────────────────────────
+def mount_point(provider_key):
+    return os.path.join(MOUNT_ROOT, provider_key)
+
+
+def unit_name(remote):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", remote)
+    return "hash-cloud-%s.service" % safe
+
+
+def unit_path(remote):
+    return os.path.join(SYSTEMD_USER, unit_name(remote))
+
+
+def write_unit(remote, mp):
+    """Create the per-remote systemd USER mount unit (auto-mount on login)."""
+    os.makedirs(SYSTEMD_USER, exist_ok=True)
+    os.makedirs(mp, exist_ok=True)
+    fm = (shutil.which("fusermount3") or shutil.which("fusermount")
+          or "/usr/bin/fusermount3")
+    body = f"""[Unit]
+Description=HasH Cloud — mount cloud remote '{remote}' at {mp}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStartPre=-/usr/bin/mkdir -p {mp}
+ExecStart={RCLONE} mount {remote}: {mp} \\
+    --vfs-cache-mode {VFS_CACHE_MODE} \\
+    --vfs-cache-max-size {VFS_CACHE_MAX} \\
+    --poll-interval 15s --dir-cache-time 30s --vfs-refresh
+ExecStop={fm} -u {mp}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+    with open(unit_path(remote), "w") as f:
+        f.write(body)
+    run(["systemctl", "--user", "daemon-reload"], timeout=20)
+    return unit_path(remote)
+
+
+def enable_unit(remote):
+    """Enable + start the mount unit so it mounts now and on every login."""
+    run(["systemctl", "--user", "enable", "--now", unit_name(remote)], timeout=30)
+
+
+# ──────────────────────── rclone config create argv ──────────────────────────
+def config_create_argv(provider, remote, fields):
+    """Build the `rclone config create` argv for a provider.
+
+    OAuth providers need NO extra fields — rclone opens the browser and captures
+    the token.  WebDAV/iCloud/userpass providers take the credentials collected
+    in the form (passwords are handed to rclone, which obscures them on write).
+    """
+    argv = [RCLONE, "config", "create", remote, provider["backend"]]
+    if provider.get("webdav"):
+        argv += ["url", fields.get("url", ""),
+                 "vendor", provider.get("vendor", "other"),
+                 "user", fields.get("user", ""),
+                 "pass", fields.get("pass", "")]
+    elif provider.get("icloud"):
+        argv += ["apple_id", fields.get("user", ""),
+                 "password", fields.get("pass", "")]
+    elif provider.get("userpass"):
+        argv += ["user", fields.get("user", ""),
+                 "pass", fields.get("pass", "")]
+    return argv
+
+
+# ─────────────────────────────── headless CLI ────────────────────────────────
+def cli(a):
+    if a and a[0] == "list":
+        print(json.dumps(list_remotes(), indent=2))
+        return 0
+    print(__doc__)
+    return 0
+
+
+def autostart_should_run():
+    """First-login mode: only open if no remote is configured yet."""
+    return not has_remotes()
+
+
+def drop_autostart():
+    """Run-once: delete our autostart entry so we never nag again."""
+    try:
+        os.remove(AUTOSTART)
+    except OSError:
+        pass
+
+
+# ════════════════════════════════════ GUI ════════════════════════════════════
+def gui(autostart=False, shot=None):
+    # In first-login (autostart) mode, if the user already set up a remote we
+    # just retire the autostart entry and exit without showing anything.
+    if autostart and not autostart_should_run():
+        drop_autostart()
+        return 0
+
+    from PyQt6.QtCore import (Qt, QProcess, QProcessEnvironment, QSize, QTimer)
+    from PyQt6.QtGui import QIcon, QCursor
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QLabel, QPushButton, QLineEdit, QFrame,
+        QHBoxLayout, QVBoxLayout, QStackedWidget, QScrollArea, QTextEdit,
+        QCheckBox)
+
+    ACCENT, DANGER, OK = "#56c5d8", "#e06c75", "#7fd684"
+
+    def btn_qss(a=ACCENT):
+        return f"""
+            QPushButton{{ background:rgba(255,255,255,0.07); color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.10); border-radius:9px;
+                padding:7px 16px; font-size:13px; }}
+            QPushButton:hover{{ background:rgba(255,255,255,0.13); }}
+            QPushButton#primary{{ background:{a}; color:#06222a;
+                font-weight:600; border:none; }}
+            QPushButton#primary:hover{{ background:#6fd6e7; }}
+            QPushButton:disabled{{ color:#7f8a8d;
+                background:rgba(255,255,255,0.05); }}
+        """
+
+    def qenv(d):
+        qe = QProcessEnvironment.systemEnvironment()
+        for k, v in d.items():
+            qe.insert(k, v)
+        return qe
+
+    def icon_for(item):
+        for nm in (item.get("icon", "folder-cloud"), "folder-cloud",
+                   "network-server"):
+            ic = QIcon.fromTheme(nm)
+            if not ic.isNull():
+                return ic
+        return QIcon.fromTheme("folder")
+
+    # ── live process window for `rclone config create` (OAuth / interactive) ──
+    class ProcWin(QWidget):
+        def __init__(self, parent, title, argv, on_done):
+            super().__init__(parent, Qt.WindowType.Window
+                             | Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setObjectName("txwin")
+            self.resize(700, 470)
+            self._on_done = on_done
+            self._done = False
+            v = QVBoxLayout(self)
+            v.setContentsMargins(18, 16, 18, 16)
+            t = QLabel(title)
+            t.setObjectName("txtitle")
+            t.setWordWrap(True)
+            self.log = QTextEdit(readOnly=True)
+            self.log.setObjectName("txlog")
+            self.btn = QPushButton("Cancel")
+            self.btn.setObjectName("primary")
+            self.btn.clicked.connect(self._btn)
+            v.addWidget(t)
+            v.addWidget(self.log, 1)
+            v.addWidget(self.btn)
+            self.setStyleSheet("""
+                #txwin{ background:#14161d;
+                        border:1px solid rgba(255,255,255,0.12);
+                        border-radius:16px; }
+                #txtitle{ color:#fff; font-size:15px; font-weight:600; }
+                #txlog{ background:#0b0d12; color:#cfe9ee; border:1px solid #222;
+                        border-radius:10px; font-family:monospace;
+                        font-size:12px; }
+            """ + btn_qss())
+            self.p = QProcess(self)
+            self.p.setProcessChannelMode(
+                QProcess.ProcessChannelMode.MergedChannels)
+            # Force rclone to auto-open the browser for OAuth.
+            self.p.setProcessEnvironment(qenv({"RCLONE_CONFIG_IS_LOCAL": "true"}))
+            self.p.readyReadStandardOutput.connect(self._read)
+            self.p.finished.connect(self._fin)
+            self._append("$ " + " ".join(self._mask(argv)) + "\n\n")
+            self.p.start(argv[0], argv[1:])
+
+        @staticmethod
+        def _mask(argv):
+            out, mask_next = [], False
+            for a in argv:
+                if mask_next:
+                    out.append("********")
+                    mask_next = False
+                    continue
+                out.append(a)
+                if a in ("pass", "password"):
+                    mask_next = True
+            return out
+
+        def _read(self):
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+            self.log.insertPlainText(
+                bytes(self.p.readAllStandardOutput()).decode(errors="ignore"))
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+
+        def _append(self, s):
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+            self.log.insertPlainText(s)
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+
+        def _btn(self):
+            if self._done:
+                self.close()
+            else:
+                self.p.kill()
+                self.close()
+
+        def _fin(self, code, _st):
+            self._done = True
+            ok = code == 0
+            self._append("\n" + ("OK — connected." if ok
+                                 else "Failed (exit %d)." % code) + "\n")
+            self.btn.setText("Close")
+            if callable(self._on_done):
+                self._on_done(ok)
+
+    class Toast(QLabel):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.setObjectName("toast")
+            self.setStyleSheet(
+                "#toast{ background:#0e1117; color:#e8eef0; padding:10px 16px;"
+                " border:1px solid rgba(255,255,255,0.14); border-radius:10px; }")
+            self.hide()
+
+        def show_msg(self, text):
+            self.setText(text)
+            self.adjustSize()
+            pw = self.parent()
+            self.move((pw.width() - self.width()) // 2, pw.height() - 70)
+            self.show()
+            QTimer.singleShot(3200, self.hide)
+
+    class ProviderRow(QFrame):
+        def __init__(self, provider, on_pick):
+            super().__init__()
+            self.provider = provider
+            self.setObjectName("provrow")
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            h = QHBoxLayout(self)
+            h.setContentsMargins(14, 12, 14, 12)
+            h.setSpacing(14)
+            ic = QLabel()
+            ic.setPixmap(icon_for(provider).pixmap(QSize(40, 40)))
+            ic.setFixedSize(40, 40)
+            txt = QVBoxLayout()
+            txt.setSpacing(2)
+            nm = QLabel(provider["name"])
+            nm.setObjectName("provname")
+            bl = QLabel(provider["blurb"])
+            bl.setObjectName("provsub")
+            bl.setWordWrap(True)
+            txt.addWidget(nm)
+            txt.addWidget(bl)
+            h.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+            h.addLayout(txt, 1)
+            self.setStyleSheet(
+                "#provrow{ background:#0d1016;"
+                " border:1px solid rgba(255,255,255,0.08); border-radius:12px; }"
+                f"#provrow:hover{{ border:1px solid {ACCENT}; }}"
+                "#provname{ color:#fff; font-size:15px; font-weight:700; }"
+                "#provsub{ color:#94a3a6; font-size:12px; }")
+            self._on_pick = on_pick
+
+        def mousePressEvent(self, _e):
+            self._on_pick(self.provider)
+
+    class Window(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("HasH Cloud Accounts")
+            scr = (QApplication.screenAt(QCursor.pos())
+                   or QApplication.primaryScreen()).geometry()
+            self.resize(min(720, scr.width() - 80),
+                        min(760, scr.height() - 80))
+            self.setStyleSheet("""
+                QWidget{ background:#0a0c10; color:#e8eef0;
+                    font-family:'Inter','Noto Sans',sans-serif; }
+                QLabel#h1{ font-size:21px; font-weight:800; color:#fff; }
+                QLabel#sub{ color:#94a3a6; font-size:13px; }
+                QLineEdit{ background:#0e1117; color:#e8eef0;
+                    border:1px solid rgba(255,255,255,0.12); border-radius:10px;
+                    padding:9px 12px; font-size:14px; }
+                QLineEdit:focus{ border:1px solid %s; }
+                QLabel#warn{ color:#e0b072; }
+                QFrame#card{ background:#0d1016;
+                    border:1px solid rgba(255,255,255,0.08); border-radius:14px; }
+                QScrollArea{ border:none; }
+                QScrollBar:vertical{ background:transparent; width:10px; }
+                QScrollBar::handle:vertical{ background:rgba(255,255,255,0.18);
+                    border-radius:5px; min-height:30px; }
+                QScrollBar::add-line,QScrollBar::sub-line{ height:0; }
+            """ % ACCENT + btn_qss())
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(26, 24, 26, 24)
+            root.setSpacing(14)
+            self.stack = QStackedWidget()
+            root.addWidget(self.stack, 1)
+            self.stack.addWidget(self._list_page())
+            self.stack.addWidget(self._connect_page())
+            self.toast = Toast(self)
+            self._refresh_list()
+
+        # ── page 0: searchable, popularity-ordered provider list ──
+        def _list_page(self):
+            w = QWidget()
+            v = QVBoxLayout(w)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(12)
+            title = QLabel("Connect your cloud storage")
+            title.setObjectName("h1")
+            v.addWidget(title)
+            sub = QLabel("Pick a provider to sign in. It'll mount as a drive at "
+                         "~/CloudStorage/<provider> and re-mount on every login.")
+            sub.setObjectName("sub")
+            sub.setWordWrap(True)
+            v.addWidget(sub)
+
+            if not HAS_RCLONE:
+                warn = QLabel("rclone isn't installed — install it from the HasH "
+                              "Software Center (rclone + fuse3) to add accounts.")
+                warn.setObjectName("warn")
+                warn.setWordWrap(True)
+                v.addWidget(warn)
+
+            self.search = QLineEdit()
+            self.search.setPlaceholderText("Search providers…  (e.g. drive, "
+                                           "onedrive, dropbox)")
+            self.search.setClearButtonEnabled(True)
+            self.search.textChanged.connect(self._filter)
+            v.addWidget(self.search)
+
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            holder = QWidget()
+            self.rows_lay = QVBoxLayout(holder)
+            self.rows_lay.setContentsMargins(0, 0, 6, 0)
+            self.rows_lay.setSpacing(10)
+            self._rows = []
+            for p in PROVIDERS:  # already in popularity order
+                row = ProviderRow(p, self._pick)
+                self._rows.append(row)
+                self.rows_lay.addWidget(row)
+            self.nomatch = QLabel("No providers match your search.")
+            self.nomatch.setObjectName("sub")
+            self.nomatch.hide()
+            self.rows_lay.addWidget(self.nomatch)
+            self.rows_lay.addStretch(1)
+            scroll.setWidget(holder)
+            v.addWidget(scroll, 1)
+
+            bar = QHBoxLayout()
+            self.statusLbl = QLabel("")
+            self.statusLbl.setObjectName("sub")
+            done = QPushButton("Done")
+            done.clicked.connect(self.close)
+            bar.addWidget(self.statusLbl, 1)
+            bar.addWidget(done)
+            v.addLayout(bar)
+            return w
+
+        def _filter(self, text):
+            q = text.strip().lower()
+            visible = 0
+            for row in self._rows:
+                p = row.provider
+                hit = (not q or q in p["name"].lower() or q in p["key"].lower()
+                       or q in p["backend"].lower())
+                row.setVisible(hit)
+                visible += int(hit)
+            self.nomatch.setVisible(visible == 0)
+
+        def _refresh_list(self):
+            n = len(list_remotes())
+            self.statusLbl.setText(
+                "No cloud accounts configured yet." if n == 0
+                else "%d cloud account%s configured." % (n, "" if n == 1 else "s"))
+
+        # ── page 1: name + credentials + connect ──
+        def _connect_page(self):
+            w = QWidget()
+            v = QVBoxLayout(w)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(12)
+            self.cTitle = QLabel("Connect")
+            self.cTitle.setObjectName("h1")
+            v.addWidget(self.cTitle)
+
+            card = QFrame()
+            card.setObjectName("card")
+            fl = QVBoxLayout(card)
+            fl.setContentsMargins(18, 16, 18, 16)
+            fl.setSpacing(10)
+
+            fl.addWidget(QLabel("Account name (used for the folder and the mount "
+                                "service):"))
+            self.nameEdit = QLineEdit()
+            fl.addWidget(self.nameEdit)
+
+            # WebDAV/iCloud/userpass credential fields (shown per provider).
+            self.urlEdit = QLineEdit()
+            self.urlEdit.setPlaceholderText(
+                "WebDAV URL  e.g. https://cloud.example.com/remote.php/dav/files/USER/")
+            self.userEdit = QLineEdit()
+            self.userEdit.setPlaceholderText("Username / email / Apple ID")
+            self.passEdit = QLineEdit()
+            self.passEdit.setPlaceholderText("Password / app password")
+            self.passEdit.setEchoMode(QLineEdit.EchoMode.Password)
+            for wgt in (self.urlEdit, self.userEdit, self.passEdit):
+                fl.addWidget(wgt)
+
+            self.autoChk = QCheckBox(
+                "Mount on login (systemd user service) — recommended")
+            self.autoChk.setChecked(True)
+            fl.addWidget(self.autoChk)
+
+            self.note = QLabel("")
+            self.note.setObjectName("sub")
+            self.note.setWordWrap(True)
+            fl.addWidget(self.note)
+            v.addWidget(card)
+
+            bar = QHBoxLayout()
+            back = QPushButton("← Back")
+            back.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+            self.connectBtn = QPushButton("Connect & sign in")
+            self.connectBtn.setObjectName("primary")
+            self.connectBtn.clicked.connect(self._do_connect)
+            bar.addWidget(back)
+            bar.addStretch(1)
+            bar.addWidget(self.connectBtn)
+            v.addLayout(bar)
+            v.addStretch(1)
+            return w
+
+        def toast_msg(self, t):
+            self.toast.show_msg(t)
+
+        def _pick(self, p):
+            if not HAS_RCLONE:
+                self.toast_msg("Install rclone first (HasH Software Center).")
+                return
+            if p.get("icloud") and not has_backend("iclouddrive"):
+                self.toast_msg("This rclone build lacks the iclouddrive backend "
+                               "— needs rclone >= 1.66. Update rclone, then retry.")
+                return
+            self.sel = p
+            self.cTitle.setText("Connect %s" % p["name"])
+            self.nameEdit.setText(unique_name(p["key"]))
+            webdav = bool(p.get("webdav"))
+            icloud = bool(p.get("icloud"))
+            userpass = bool(p.get("userpass"))
+            self.urlEdit.setVisible(webdav)
+            self.userEdit.setVisible(webdav or icloud or userpass)
+            self.passEdit.setVisible(webdav or icloud or userpass)
+            if icloud:
+                self.userEdit.setPlaceholderText("Apple ID  e.g. you@icloud.com")
+                self.passEdit.setPlaceholderText("Apple ID password")
+                self.note.setText(
+                    "Apple sends a 6-digit 2FA code to your trusted devices — "
+                    "enter it in the sign-in window when asked. Your password is "
+                    "handed to rclone (which obscures it), never stored in plain.")
+                self.connectBtn.setText("Sign in to iCloud")
+            elif webdav:
+                self.userEdit.setPlaceholderText("Username")
+                self.passEdit.setPlaceholderText("Password / app password")
+                self.note.setText("Enter your %s WebDAV URL and login." % p["name"])
+                self.connectBtn.setText("Connect")
+            elif userpass:
+                self.userEdit.setPlaceholderText("Email")
+                self.passEdit.setPlaceholderText("Password")
+                self.note.setText("Enter your %s email and password." % p["name"])
+                self.connectBtn.setText("Connect")
+            else:  # OAuth
+                self.note.setText(
+                    "Sign-in opens your browser automatically (OAuth). Approve "
+                    "access, then return here — no terminal needed.")
+                self.connectBtn.setText("Connect & sign in")
+            self.stack.setCurrentIndex(1)
+
+        def _do_connect(self):
+            p = self.sel
+            name = self.nameEdit.text().strip()
+            if not re.match(r"^[A-Za-z0-9_-]+$", name):
+                self.toast_msg("Use only letters, numbers, _ and - in the name.")
+                return
+            if name in remote_names():
+                self.toast_msg("An account named '%s' already exists." % name)
+                return
+            fields = {}
+            if p.get("webdav"):
+                if not self.urlEdit.text().strip():
+                    self.toast_msg("Enter the WebDAV URL.")
+                    return
+                fields = {"url": self.urlEdit.text().strip(),
+                          "user": self.userEdit.text().strip(),
+                          "pass": self.passEdit.text()}
+            elif p.get("icloud") or p.get("userpass"):
+                if not self.userEdit.text().strip() or not self.passEdit.text():
+                    self.toast_msg("Enter your username and password.")
+                    return
+                fields = {"user": self.userEdit.text().strip(),
+                          "pass": self.passEdit.text()}
+            self._pending = {"provider": p, "name": name,
+                             "auto": self.autoChk.isChecked()}
+            argv = config_create_argv(p, name, fields)
+            title = ("Signing in to %s — approve access in your browser"
+                     % p["name"]) if p.get("oauth") else \
+                    ("Connecting %s" % p["name"])
+            self.proc = ProcWin(self, title, argv, self._connected)
+            g = self.geometry()
+            self.proc.move(g.center().x() - 350, g.center().y() - 235)
+            self.proc.show()
+
+        def _connected(self, ok):
+            if not ok:
+                self.toast_msg("Sign-in failed or cancelled.")
+                return
+            d = self._pending
+            name = d["name"]
+            mp = mount_point(d["provider"]["key"])
+            # Re-point this remote's mount at ~/CloudStorage/<provider>.
+            if d["auto"]:
+                write_unit(name, mp)
+                enable_unit(name)
+                self.toast_msg("Connected '%s' — mounting at %s" % (name, mp))
+            else:
+                os.makedirs(mp, exist_ok=True)
+                self.toast_msg("Connected '%s'." % name)
+            self._refresh_list()
+            self.stack.setCurrentIndex(0)
+
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("HasH Cloud Accounts")
+    app.setDesktopFileName("hash-cloud-accounts")
+    app.setWindowIcon(QIcon.fromTheme("hash-accounts"))
+    w = Window()
+    w.show()
+    # First-login mode: once the wizard is open, retire the autostart entry so
+    # it never nags again (whether or not the user finishes connecting).
+    if autostart:
+        drop_autostart()
+    if shot:
+        def _grab():
+            w.grab().save(shot)
+            os._exit(0)
+        QTimer.singleShot(2200, _grab)
+    return app.exec()
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] in ("list",):
+        return cli(a)
+    autostart = "--autostart" in a
+    shot = None
+    if "--shot" in a:
+        i = a.index("--shot")
+        shot = a[i + 1] if i + 1 < len(a) else "/tmp/hash-cloud-accounts-shot.png"
+    return gui(autostart=autostart, shot=shot)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,20 @@
+#!/bin/sh
+# HasH GPU hard-patch: pick the correct VA-API driver for the detected GPU so
+# browsers and media players get HARDWARE video decode out of the box, on every
+# install (NVIDIA/AMD/Intel). A flags file can't set an env var session-wide, so
+# we write a systemd environment.d drop-in that every user session imports.
+# Run once at boot by hash-gpu-env.service.
+set -eu
+out=/etc/environment.d/10-hash-vaapi.conf
+gpu=$(lspci -nn 2>/dev/null | grep -iE 'vga|3d|display' || true)
+case "$gpu" in
+    *NVIDIA*|*GeForce*)
+        # nvidia-vaapi-driver bridges VA-API -> NVDEC; 'direct' backend on 525+.
+        printf 'LIBVA_DRIVER_NAME=nvidia\nNVD_BACKEND=direct\n' > "$out" ;;
+    *' AMD '*|*Radeon*|*ATI*)
+        printf 'LIBVA_DRIVER_NAME=radeonsi\n' > "$out" ;;
+    *Intel*)
+        printf 'LIBVA_DRIVER_NAME=iHD\n' > "$out" ;;
+    *)
+        : ;;   # unknown GPU — leave VA-API to auto-detect, write nothing
+esac

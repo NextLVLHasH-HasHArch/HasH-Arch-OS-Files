@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""HasH-Arch launcher category manager — drives the "add group / add app via
+right-click" feature. Edits groups.json, re-tags app .desktop files, regenerates
+the custom plasma-applications.menu and rebuilds the menu cache.
+
+  hash-cat list-groups          # newline list of group names (for the QML filter)
+  hash-cat add-group            # kdialog: prompt name -> new group
+  hash-cat add-app [group]      # kdialog: pick app (+ group) -> tag into group
+  hash-cat regen                # rebuild menu + sycoca
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+CFG = os.path.join(HOME, ".local/share/com.hash.kickoff/groups.json")
+USR_APPS = os.path.join(HOME, ".local/share/applications")
+SYS_APPS = ["/usr/share/applications",
+            "/var/lib/flatpak/exports/share/applications",
+            os.path.join(HOME, ".local/share/flatpak/exports/share/applications"),
+            USR_APPS]
+
+
+def _run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def load():
+    if os.path.exists(CFG):
+        return json.load(open(CFG))
+    return {"groups": []}
+
+
+def save(d):
+    os.makedirs(os.path.dirname(CFG), exist_ok=True)
+    json.dump(d, open(CFG, "w"), indent=2)
+
+
+def slugify(name):
+    return re.sub(r"[^a-z0-9]+", "", name.lower()) or "group"
+
+
+def tag_of(slug):
+    return "X-HasH-" + slug.capitalize()
+
+
+def kd(*args):
+    return subprocess.run(["kdialog", *args], capture_output=True, text=True)
+
+
+def regen():
+    # refresh the desktop iOS folders first (fast) so they update right away
+    subprocess.run([os.path.join(HOME, ".local/bin/hash-folders")],
+                   capture_output=True, text=True)
+    subprocess.run([os.path.join(HOME, ".local/bin/hash-launcher-menu.sh")],
+                   capture_output=True, text=True)
+    subprocess.run(["kbuildsycoca6"], capture_output=True, text=True)
+
+
+# ---------- commands ----------
+def cmd_list_groups():
+    for g in load().get("groups", []):
+        print(g["name"])
+
+
+def cmd_add_group():
+    r = kd("--title", "New Group", "--inputbox", "Name of the new application group:")
+    name = r.stdout.strip()
+    if r.returncode != 0 or not name:
+        return
+    d = load()
+    slug = slugify(name)
+    if any(g["slug"] == slug for g in d["groups"]):
+        kd("--error", "A group called '%s' already exists." % name); return
+    # let the user pick an icon name (optional)
+    ic = kd("--title", "Group icon", "--inputbox",
+            "Icon name (freedesktop), or leave blank:", "applications-other")
+    icon = ic.stdout.strip() or "applications-other"
+    d["groups"].append({"name": name, "slug": slug, "icon": icon, "cats": []})
+    save(d)
+    regen()
+    # give the new category an iOS folder widget on the desktop
+    subprocess.run([os.path.join(HOME, ".local/bin/hash-desktop"), "ensure-widgets"],
+                   capture_output=True)
+    kd("--passivepopup", "Added group '%s'. Open it from the Applications tab." % name, "4")
+
+
+def _list_apps():
+    apps = {}
+    for d in SYS_APPS:
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".desktop") or fn in apps:
+                continue
+            f = _parse(os.path.join(d, fn))
+            if f.get("NoDisplay", "").lower() == "true" or "X-BlackArch" in f.get("Categories", ""):
+                continue
+            name = f.get("Name")
+            if name:
+                apps[fn] = name
+    return apps
+
+
+def _parse(path):
+    f = {}
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            ine = False
+            for ln in fh:
+                ln = ln.rstrip("\n")
+                if ln.startswith("["):
+                    ine = ln.strip() == "[Desktop Entry]"; continue
+                if ine and "=" in ln:
+                    k, v = ln.split("=", 1); f.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+    return f
+
+
+def _find_source(base):
+    for d in SYS_APPS:
+        p = os.path.join(d, base)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def cmd_add_app(group=None):
+    groups = load().get("groups", [])
+    if not group:
+        menu = []
+        for g in groups:
+            menu += [g["slug"], g["name"]]
+        r = kd("--title", "Add app — choose group", "--menu", "Add an app to which group?", *menu)
+        if r.returncode != 0 or not r.stdout.strip():
+            return
+        slug = r.stdout.strip()
+    else:
+        slug = slugify(group)
+    g = next((x for x in groups if x["slug"] == slug), None)
+    if not g:
+        kd("--error", "No such group."); return
+    apps = _list_apps()
+    items = sorted(apps.items(), key=lambda kv: kv[1].lower())
+    menu = []
+    for base, name in items:
+        menu += [base, name]
+    r = kd("--title", "Add to %s" % g["name"], "--menu", "Choose an application:", *menu)
+    base = r.stdout.strip()
+    if r.returncode != 0 or not base:
+        return
+    _tag(base, tag_of(slug))
+    regen()
+    kd("--passivepopup", "Added '%s' to %s." % (apps.get(base, base), g["name"]), "4")
+
+
+def _strip_tag(body, tag):
+    def repl(m):
+        cats = [c for c in m.group(1).split(";") if c and c != tag]
+        return "Categories=" + ";".join(cats) + (";" if cats else "")
+    return re.sub(r"^Categories=(.*)$", repl, body, count=1, flags=re.M)
+
+
+def _untag(base, tag):
+    """Remove `tag` from an app's override; revert to the system file if nothing
+    custom is left."""
+    target = os.path.join(USR_APPS, base)
+    if not os.path.exists(target):
+        return
+    body = _strip_tag(open(target, encoding="utf-8", errors="ignore").read(), tag)
+    sys = next((os.path.join(d, base) for d in SYS_APPS[:-1]
+                if os.path.exists(os.path.join(d, base))), None)
+    if sys and "X-HasH-" not in body and "NoDisplay=true" not in body:
+        os.remove(target)          # fully revert to the packaged .desktop
+    else:
+        open(target, "w", encoding="utf-8").write(body)
+    subprocess.run(["update-desktop-database", USR_APPS], capture_output=True)
+
+
+def _apps_in_group(slug):
+    """Apps currently tagged into a group (basename -> Name)."""
+    tag = tag_of(slug)
+    out = {}
+    if os.path.isdir(USR_APPS):
+        for fn in sorted(os.listdir(USR_APPS)):
+            if not fn.endswith(".desktop"):
+                continue
+            p = os.path.join(USR_APPS, fn)
+            if tag in open(p, encoding="utf-8", errors="ignore").read():
+                out[fn] = _parse(p).get("Name", fn)
+    return out
+
+
+def _pick_group(prompt):
+    groups = load().get("groups", [])
+    menu = []
+    for g in groups:
+        menu += [g["slug"], g["name"]]
+    r = kd("--menu", prompt, *menu)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def cmd_remove_app(group=None):
+    slug = slugify(group) if group else _pick_group("Remove an app from which group?")
+    if not slug:
+        return
+    apps = _apps_in_group(slug)
+    if not apps:
+        kd("--msgbox", "That group has no manually-added apps to remove."); return
+    menu = []
+    for base, name in sorted(apps.items(), key=lambda kv: kv[1].lower()):
+        menu += [base, name]
+    r = kd("--title", "Remove app", "--menu", "Choose an app to remove from the group:", *menu)
+    base = r.stdout.strip()
+    if r.returncode != 0 or not base:
+        return
+    _untag(base, tag_of(slug))
+    regen()
+    kd("--passivepopup", "Removed '%s' from the group." % apps.get(base, base), "4")
+
+
+def cmd_remove_group(slug=None):
+    if not slug:
+        slug = _pick_group("Remove which group?")
+    if not slug:
+        return
+    d = load()
+    g = next((x for x in d["groups"] if x["slug"] == slug), None)
+    if not g:
+        return
+    if kd("--warningyesno", "Remove the group '%s'? Its apps go back to auto-sorting."
+          % g["name"]).returncode != 0:
+        return
+    for base in list(_apps_in_group(slug)):       # untag its apps first
+        _untag(base, tag_of(slug))
+    d["groups"] = [x for x in d["groups"] if x["slug"] != slug]
+    save(d)
+    try:
+        os.remove(os.path.join(HOME, ".local/share/desktop-directories/hash-%s.directory" % slug))
+    except OSError:
+        pass
+    regen()
+    kd("--passivepopup", "Removed group '%s'." % g["name"], "4")
+
+
+def _tag(base, tag):
+    """Ensure a user .desktop override for `base` carries category `tag`."""
+    target = os.path.join(USR_APPS, base)
+    if not os.path.exists(target):
+        src = _find_source(base)
+        if not src:
+            return
+        os.makedirs(USR_APPS, exist_ok=True)
+        body = open(src, encoding="utf-8", errors="ignore").read()
+    else:
+        body = open(target, encoding="utf-8", errors="ignore").read()
+    if re.search(r"^Categories=", body, re.M):
+        if tag not in body:
+            body = re.sub(r"^Categories=(.*)$",
+                          lambda m: "Categories=%s%s;" % (m.group(1) + (";" if not m.group(1).endswith(";") else ""), tag),
+                          body, count=1, flags=re.M)
+    else:
+        body = body.replace("[Desktop Entry]", "[Desktop Entry]\nCategories=%s;" % tag, 1)
+    open(target, "w", encoding="utf-8").write(body)
+    subprocess.run(["update-desktop-database", USR_APPS], capture_output=True)
+
+
+def cmd_sync_flatpaks():
+    """Auto-tag every installed flatpak into the group matching its freedesktop
+    category. Non-interactive (for the install trigger). Apps already carrying any
+    X-HasH-* tag are left alone (respects manual/right-click choices)."""
+    groups = load().get("groups", [])
+    gmap = [(g["slug"], set(g.get("cats", []))) for g in groups]
+    appids = [l.strip() for l in _run(
+        ["flatpak", "list", "--app", "--columns=application"]).stdout.splitlines() if l.strip()]
+    tagged = 0
+    for appid in appids:
+        base = appid + ".desktop"
+        src = _find_source(base)
+        if not src:
+            continue
+        ov = os.path.join(USR_APPS, base)
+        if os.path.exists(ov) and "X-HasH-" in open(ov, encoding="utf-8", errors="ignore").read():
+            continue   # already categorised (manually or before)
+        cats = set(c for c in _parse(src).get("Categories", "").split(";") if c)
+        target = next((slug for slug, gc in gmap if cats & gc), None)
+        if target:
+            _tag(base, tag_of(target))
+            tagged += 1
+    if tagged:
+        regen()
+    print("sync-flatpaks: tagged %d flatpak(s)" % tagged)
+
+
+def _norm_desktop(s):
+    s = s.split("/")[-1]                    # basename if a path
+    if ":" in s:
+        s = s.split(":")[-1]                # strip "applications:" etc.
+    if not s.endswith(".desktop"):
+        s += ".desktop"
+    return s
+
+
+PROMOTED = os.path.join(HOME, ".local/share/com.hash.kickoff/promoted.txt")
+
+
+def _add_promoted(base):
+    os.makedirs(os.path.dirname(PROMOTED), exist_ok=True)
+    cur = set()
+    if os.path.exists(PROMOTED):
+        cur = set(l.strip() for l in open(PROMOTED) if l.strip())
+    cur.add(base)
+    open(PROMOTED, "w").write("\n".join(sorted(cur)) + "\n")
+
+
+def cmd_promote(desktop, slug):
+    """Promote a Places/BlackArch tool into an Applications group: un-hide it
+    (drop the NoDisplay override), tag it into the group, and remember it so
+    hash-blackarch won't re-hide it."""
+    base = _norm_desktop(desktop)
+    ov = os.path.join(USR_APPS, base)
+    if os.path.exists(ov) and "NoDisplay=true" in open(ov, encoding="utf-8", errors="ignore").read():
+        os.remove(ov)                       # un-hide (revert to packaged .desktop)
+    _tag(base, tag_of(slugify_passthrough(slug)))
+    _add_promoted(base)
+    # rebuild the BlackArch hide/Places set (now excluding this app) + the menu
+    subprocess.run([os.path.join(HOME, ".local/bin/hash-blackarch.sh")], capture_output=True)
+    regen()
+
+
+def cmd_tag_app(desktop, slug):
+    _tag(_norm_desktop(desktop), tag_of(slugify_passthrough(slug)))
+    regen()
+
+
+def cmd_untag_app(desktop, slug):
+    _untag(_norm_desktop(desktop), tag_of(slugify_passthrough(slug)))
+    regen()
+
+
+def slugify_passthrough(s):
+    # callers pass a real slug already; keep it if it matches a group, else slugify
+    slugs = {g["slug"] for g in load().get("groups", [])}
+    return s if s in slugs else slugify(s)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "list-groups":
+        cmd_list_groups()
+    elif cmd == "add-group":
+        cmd_add_group()
+    elif cmd == "add-app":
+        cmd_add_app(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "remove-app":
+        cmd_remove_app(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "remove-group":
+        cmd_remove_group(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "sync-flatpaks":
+        cmd_sync_flatpaks()
+    elif cmd == "promote" and len(sys.argv) > 3:
+        cmd_promote(sys.argv[2], sys.argv[3])
+    elif cmd == "tag-app" and len(sys.argv) > 3:
+        cmd_tag_app(sys.argv[2], sys.argv[3])
+    elif cmd == "untag-app" and len(sys.argv) > 3:
+        cmd_untag_app(sys.argv[2], sys.argv[3])
+    elif cmd == "regen":
+        regen()
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""HasH-Arch desktop-folders helper.
+
+Two jobs:
+  * CUSTOM iOS folders — desktop folders NOT tied to a launcher category, stored
+    in custom.json. Users add individual apps to them from the All Apps tab.
+  * WIDGETS — make sure every launcher category AND every custom folder has an
+    iOS-folder widget on the desktop (adds the missing ones via plasmashell).
+
+Commands:
+  ensure-widgets               add a desktop widget for any category/custom folder lacking one
+  new-and-add <desktopfile>    prompt (kdialog) for a folder name, create it + add the app
+  add <desktopfile> <folder>   add an app to an existing custom folder
+  remove <desktopfile> <slug>  remove an app from a custom folder
+  list-custom                  print custom folder names (one per line)
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+IOS_DIR = os.path.join(HOME, ".local/share/com.hash.iosfolders")
+CUSTOM = os.path.join(IOS_DIR, "custom.json")
+GROUPS = os.path.join(HOME, ".local/share/com.hash.kickoff/groups.json")
+DIRS = ["/usr/share/applications", os.path.join(HOME, ".local/share/applications"),
+        "/var/lib/flatpak/exports/share/applications",
+        os.path.join(HOME, ".var/app/com.valvesoftware.Steam/.local/share/applications"),
+        os.path.join(HOME, ".local/share/flatpak/exports/share/applications")]
+APPLETSRC = os.path.join(HOME, ".config/plasma-org.kde.plasma.desktop-appletsrc")
+
+
+def slugify(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "folder"
+
+
+def load_custom():
+    try:
+        return json.load(open(CUSTOM))
+    except Exception:
+        return {"folders": []}
+
+
+def save_custom(d):
+    os.makedirs(IOS_DIR, exist_ok=True)
+    with open(CUSTOM, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2)
+
+
+def parse(p):
+    f = {}
+    try:
+        with open(p, encoding="utf-8", errors="ignore") as fh:
+            ine = False
+            for ln in fh:
+                ln = ln.rstrip("\n")
+                if ln.startswith("["):
+                    ine = ln.strip() == "[Desktop Entry]"
+                    continue
+                if ine and "=" in ln:
+                    k, v = ln.split("=", 1)
+                    f.setdefault(k.strip(), v.strip())
+    except OSError:
+        return None
+    return f
+
+
+def find_desktop(arg):
+    if os.path.isabs(arg) and os.path.exists(arg):
+        return arg
+    base = arg if arg.endswith(".desktop") else arg + ".desktop"
+    for d in DIRS:
+        p = os.path.join(d, base)
+        if os.path.exists(p):
+            return p
+    return arg
+
+
+def app_entry(path):
+    f = parse(path) or {}
+    return {"name": f.get("Name") or os.path.basename(path),
+            "icon": f.get("Icon", "application-x-executable"),
+            "file": path, "source": path, "custom": True}
+
+
+def rebuild():
+    subprocess.run([os.path.join(HOME, ".local/bin/hash-folders")], capture_output=True)
+
+
+def kdialog(*a):
+    return subprocess.run(["kdialog", *a], capture_output=True, text=True)
+
+
+# ---- widgets ---------------------------------------------------------------
+def placed_groups():
+    """lower-cased group= values of iОЅfolder widgets already on the desktop."""
+    try:
+        txt = open(APPLETSRC, encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return set()
+    out, applet = set(), None
+    for ln in txt.splitlines():
+        m = re.match(r'^\[Containments\]\[\d+\]\[Applets\]\[(\d+)\]', ln)
+        if m:
+            applet = m.group(1)
+        elif ln.startswith("group=") and applet:
+            out.add(ln.split("=", 1)[1].strip().lower())
+    return out
+
+
+def add_widget(group_label):
+    js = ('var ds=desktops(); if(ds.length){var d=ds[0];'
+          'var w=d.addWidget("com.hash.iosfolders");'
+          'w.currentConfigGroup=["General"]; w.writeConfig("group","%s"); w.reloadConfig();}'
+          % str(group_label).replace('"', '\\"'))
+    subprocess.run(["qdbus6", "org.kde.plasmashell", "/PlasmaShell",
+                    "org.kde.PlasmaShell.evaluateScript", js], capture_output=True, text=True)
+
+
+def ensure_widgets():
+    have = placed_groups()
+    want = []
+    try:
+        for g in json.load(open(GROUPS)).get("groups", []):
+            want.append((g["name"], g["slug"]))
+    except Exception:
+        pass
+    for f in load_custom().get("folders", []):
+        want.append((f["name"], f["slug"]))
+    added = 0
+    for name, slug in want:
+        if name.lower() in have or slug.lower() in have:
+            continue
+        add_widget(slug)
+        have.add(slug.lower())
+        added += 1
+    print("ensure-widgets: added %d widget(s)" % added)
+
+
+# ---- custom folders --------------------------------------------------------
+def get_folder(d, key):
+    for f in d["folders"]:
+        if f["slug"] == key or f["name"].lower() == key.lower() or f["slug"] == slugify(key):
+            return f
+    return None
+
+
+def cmd_new_and_add(arg):
+    path = find_desktop(arg)
+    r = kdialog("--title", "New desktop folder", "--inputbox",
+                "Name for the new desktop folder:")
+    name = r.stdout.strip()
+    if r.returncode != 0 or not name:
+        return
+    d = load_custom()
+    f = get_folder(d, name)
+    if not f:
+        f = {"name": name, "slug": slugify(name), "icon": "folder", "items": []}
+        d["folders"].append(f)
+    if not any(i["file"] == path for i in f["items"]):
+        f["items"].append(app_entry(path))
+    save_custom(d)
+    rebuild()
+    ensure_widgets()
+
+
+def cmd_add(arg, folder):
+    path = find_desktop(arg)
+    d = load_custom()
+    f = get_folder(d, folder)
+    if not f:
+        f = {"name": folder, "slug": slugify(folder), "icon": "folder", "items": []}
+        d["folders"].append(f)
+    if not any(i["file"] == path for i in f["items"]):
+        f["items"].append(app_entry(path))
+    save_custom(d)
+    rebuild()
+    ensure_widgets()
+
+
+def cmd_remove(arg, folder):
+    path = find_desktop(arg)
+    d = load_custom()
+    f = get_folder(d, folder)
+    if f:
+        f["items"] = [i for i in f["items"] if i["file"] != path]
+        save_custom(d)
+        rebuild()
+
+
+def cmd_list_custom():
+    for f in load_custom().get("folders", []):
+        print(f["name"])
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        print(__doc__)
+        return
+    c = a[0]
+    if c == "ensure-widgets":
+        ensure_widgets()
+    elif c == "new-and-add" and len(a) > 1:
+        cmd_new_and_add(a[1])
+    elif c == "add" and len(a) > 2:
+        cmd_add(a[1], a[2])
+    elif c == "remove" and len(a) > 2:
+        cmd_remove(a[1], a[2])
+    elif c == "list-custom":
+        cmd_list_custom()
+    else:
+        print("unknown:", c, file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

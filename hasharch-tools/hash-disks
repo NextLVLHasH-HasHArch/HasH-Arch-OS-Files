@@ -1,0 +1,1603 @@
+#!/usr/bin/env python3
+"""HasH-Arch Disks  (hash-disks)
+
+A comprehensive disk-management tool for HasH-Arch — mount and manage drives,
+partitions and USB sticks, inspect per-device detail and SMART health, format
+and (re)partition non-system disks, relabel and power-off removable media,
+make NTFS drives writable as you, and mount SMB/NFS network shares — all in the
+HasH dark/rounded style, without ever touching `fstab` or `udisksctl` by hand.
+
+Engine:
+  udisks2 (`udisksctl mount/unmount/power-off`) for on-demand, no-root removable
+  media; `lsblk -O` to enumerate; `blkid`/UUID for stable identifiers;
+  `smartctl` for health. Every PRIVILEGED or DESTRUCTIVE op goes through
+  `hash-disks-helper` via `pkexec` (backed up + validated; the helper
+  INDEPENDENTLY refuses the disk backing / or /boot). The GUI is NEVER run as root.
+
+Usage:
+  hash-disks                 launch the GUI
+  hash-disks backend drives  headless JSON dump of enumerated drives
+  hash-disks --shot <png>    launch, grab a screenshot to <png>, exit
+  hash-disks --page <n>      launch on page n (0 Drives .. 4 Shares)
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+SCRIPT = os.path.realpath(__file__)
+HELPER = os.path.join(os.path.dirname(SCRIPT), "hash-disks-helper")
+ASKPASS = "/usr/bin/ksshaskpass" if os.path.exists("/usr/bin/ksshaskpass") else ""
+HAS_UDISKS = bool(shutil.which("udisksctl"))
+HAS_NTFS3G = bool(shutil.which("mount.ntfs-3g") or shutil.which("ntfs-3g"))
+HAS_SMART = bool(shutil.which("smartctl"))
+HAS_CIFS = bool(shutil.which("mount.cifs"))
+HAS_NFS = bool(shutil.which("mount.nfs") or shutil.which("mount.nfs4"))
+HOME = os.path.expanduser("~")
+DRIVES_DIR = os.path.join(HOME, "Drives")
+CRED_DIR = "/etc/hash-disks/creds"
+
+
+def run(cmd, timeout=30):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = str(e)
+        return _R()
+
+
+# ───────────────────────────── enumeration backend ───────────────────────────
+PROTECTED_MOUNTS = {"/", "/boot", "/boot/efi", "/efi"}
+DATA_FS = {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "jfs", "reiserfs",
+           "ntfs", "ntfs3", "vfat", "exfat", "fat", "fat32", "msdos", "hfsplus",
+           "udf", "iso9660"}
+# Filesystems the Format dialog can create (user-facing name -> helper token).
+FORMAT_FS = [("NTFS (Windows, recommended for media)", "ntfs"),
+             ("exFAT (cross-platform, large files)", "exfat"),
+             ("ext4 (Linux)", "ext4"),
+             ("FAT32 (universal, <4 GB files)", "fat32"),
+             ("Btrfs (Linux, snapshots)", "btrfs")]
+
+
+def _human(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if n < 1024 or unit == "PB":
+            return ("%.0f %s" if unit == "B" or n >= 100 else "%.1f %s") % (n, unit)
+        n /= 1024.0
+    return ""
+
+
+def _blkid_uuid_map():
+    out = {}
+    r = run(["blkid", "-o", "export"])
+    if r.returncode != 0:
+        return out
+    dev = uuid = None
+    for line in r.stdout.splitlines():
+        if line.startswith("DEVNAME="):
+            dev = line.split("=", 1)[1]
+        elif line.startswith("UUID="):
+            uuid = line.split("=", 1)[1]
+        elif line == "":
+            if dev and uuid:
+                out[dev] = uuid
+            dev = uuid = None
+    if dev and uuid:
+        out[dev] = uuid
+    return out
+
+
+def _fstab_uuids():
+    managed, present = set(), set()
+    try:
+        with open("/etc/fstab") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if s.startswith("UUID="):
+                    u = s.split()[0].split("=", 1)[1]
+                    present.add(u)
+                    if "# hash-disks" in line:
+                        managed.add(u)
+    except OSError:
+        pass
+    return present, managed
+
+
+def system_disks():
+    """The whole-disk device(s) backing /, /boot, /boot/efi — never offered for
+    destructive ops in the GUI (the helper enforces this independently too)."""
+    disks = set()
+    for tgt in ("/", "/boot", "/boot/efi"):
+        r = run(["findmnt", "-n", "-o", "SOURCE", "--target", tgt])
+        src = r.stdout.strip().splitlines()[0].strip() if r.stdout.strip() else ""
+        if not src:
+            continue
+        if src.startswith("UUID="):
+            rr = run(["blkid", "-U", src.split("=", 1)[1]])
+            src = rr.stdout.strip() or src
+        if not src.startswith("/dev/"):
+            continue
+        real = os.path.realpath(src)
+        rs = run(["lsblk", "-s", "-no", "NAME,TYPE", real])
+        found = False
+        if rs.returncode == 0:
+            for ln in rs.stdout.splitlines():
+                f = ln.split()
+                if len(f) >= 2 and f[1] == "disk":
+                    disks.add("/dev/" + f[0].lstrip("`|-\\ ").strip())
+                    found = True
+        if not found:
+            rp = run(["lsblk", "-no", "PKNAME", real])
+            pk = rp.stdout.strip().splitlines()
+            if pk and pk[0].strip():
+                disks.add("/dev/" + pk[0].strip())
+    return disks
+
+
+def _walk(node, parent_disk, rows):
+    name = node.get("name", "")
+    dev = "/dev/" + name if name and not name.startswith("/dev/") else name
+    typ = node.get("type", "")
+    fstype = node.get("fstype") or ""
+    mountpoint = node.get("mountpoint") or ""
+    mountpoints = node.get("mountpoints") or []
+    if not mountpoint:
+        mountpoint = next((m for m in mountpoints if m), "") or ""
+    label = node.get("label") or node.get("partlabel") or ""
+    size = node.get("size")
+    uuid = node.get("uuid") or ""
+    fsavail = node.get("fsavail")
+    fsused = node.get("fsused")
+    fssize = node.get("fssize")
+    fsuse_pct = node.get("fsuse%") or ""
+    rm = bool(node.get("rm")) or bool(node.get("hotplug"))
+    ro = bool(node.get("ro"))
+    partn = node.get("partn") or node.get("partnum") or ""
+
+    if typ in ("part", "crypt", "lvm", "rom", "loop") or (typ == "disk" and fstype):
+        row = {
+            "device": dev, "name": name, "type": typ, "fstype": fstype,
+            "label": label, "size": size, "size_h": _human(size),
+            "mountpoint": mountpoint, "uuid": uuid, "removable": rm, "ro": ro,
+            "fsavail": fsavail, "fsused": fsused, "fssize": fssize,
+            "fsuse_pct": fsuse_pct, "model": node.get("model") or "",
+            "serial": node.get("serial") or "", "ptype": node.get("pttype") or "",
+            "parttype": node.get("parttype") or "", "partn": partn,
+            "parent": parent_disk,
+            "protected": os.path.normpath(mountpoint) in PROTECTED_MOUNTS,
+            "mounted": bool(mountpoint),
+            "is_data": fstype.lower() in DATA_FS,
+        }
+        rows.append(row)
+    for ch in node.get("children", []) or []:
+        _walk(ch, parent_disk if typ != "disk" else dev, rows)
+
+
+def get_drives():
+    """Enumerate partitions/volumes from `lsblk -J -O`, enriched with blkid UUIDs,
+    fstab state and the parent disk's model/serial/size/table-type."""
+    r = run(["lsblk", "-b", "-J", "-O"])
+    data = {}
+    if r.returncode == 0 and r.stdout.strip():
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            data = {}
+    rows = []
+    diskinfo = {}
+    for dev in data.get("blockdevices", []) or []:
+        dname = "/dev/" + dev.get("name", "")
+        diskinfo[dname] = {
+            "model": dev.get("model") or "", "serial": dev.get("serial") or "",
+            "size": dev.get("size"), "size_h": _human(dev.get("size")),
+            "ptype": dev.get("pttype") or "", "removable": bool(dev.get("rm")) or bool(dev.get("hotplug")),
+            "rota": dev.get("rota"), "tran": dev.get("tran") or "",
+        }
+        _walk(dev, dname, rows)
+
+    uuid_map = _blkid_uuid_map()
+    present, managed = _fstab_uuids()
+    sysd = system_disks()
+    disks = {}
+    for row in rows:
+        if not row["uuid"]:
+            row["uuid"] = uuid_map.get(row["device"], "")
+        row["in_fstab"] = row["uuid"] in present
+        row["fstab_managed"] = row["uuid"] in managed
+        disk = row["parent"]
+        row["on_system_disk"] = disk in sysd
+        disks.setdefault(disk, {"disk": disk, "parts": [],
+                                "info": diskinfo.get(disk, {}),
+                                "is_system": disk in sysd})
+        disks[disk]["parts"].append(row)
+    return list(disks.values())
+
+
+def flat_drives():
+    out = []
+    for d in get_drives():
+        for p in d["parts"]:
+            out.append(p)
+    return out
+
+
+# ──────────────────────── runtime mount/unmount (udisks) ──────────────────────
+def udisks_mount(device):
+    return ["udisksctl", "mount", "-b", device]
+
+
+def udisks_unmount(device):
+    return ["udisksctl", "unmount", "-b", device]
+
+
+# ─────────────────────────────── headless CLI ────────────────────────────────
+def cli(a):
+    if a and a[0] == "drives":
+        print(json.dumps(get_drives(), indent=2))
+        return 0
+    if a and a[0] == "system-disks":
+        print(json.dumps(sorted(system_disks()), indent=2))
+        return 0
+    print("unknown backend command", file=sys.stderr)
+    return 2
+
+
+# ════════════════════════════════════ GUI ════════════════════════════════════
+def gui(shot=None, page=0):
+    from PyQt6.QtCore import (Qt, QProcess, QSize, QTimer, QProcessEnvironment)
+    from PyQt6.QtGui import (QPainter, QColor, QPainterPath, QIcon, QCursor)
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout,
+        QFrame, QScrollArea, QStackedWidget, QComboBox, QCheckBox, QMessageBox,
+        QInputDialog, QTextEdit, QSizePolicy, QLineEdit, QDialog, QGridLayout,
+        QFormLayout, QDialogButtonBox)
+
+    ACCENT, DANGER, OK, WARN = "#56c5d8", "#e06c75", "#7ec699", "#e5c07b"
+
+    def btn_qss(a=ACCENT):
+        return f"""
+            QPushButton{{ background:rgba(255,255,255,0.07); color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.10); border-radius:9px;
+                padding:7px 16px; font-size:13px; }}
+            QPushButton:hover{{ background:rgba(255,255,255,0.13); }}
+            QPushButton#primary{{ background:{a}; color:#06222a; font-weight:600; border:none; }}
+            QPushButton#primary:hover{{ background:#6fd6e7; }}
+            QPushButton#danger{{ background:{DANGER}; color:#2a0a0c; font-weight:600; border:none; }}
+            QPushButton#danger:hover{{ background:#ea7d85; }}
+            QPushButton:disabled{{ color:#7f8a8d; background:rgba(255,255,255,0.05); }}
+        """
+
+    def qenv(d):
+        qe = QProcessEnvironment()
+        for k, v in d.items():
+            qe.insert(k, v)
+        return qe
+
+    def tx_env():
+        e = dict(os.environ)
+        if ASKPASS:
+            e["SUDO_ASKPASS"] = ASKPASS
+        return e
+
+    def dlg_qss():
+        return ("""
+            QDialog{ background:#14161d; }
+            QLabel{ color:#e8eef0; font-size:13px; }
+            QLabel#dlgtitle{ color:#fff; font-size:16px; font-weight:700; }
+            QLabel#dlgwarn{ color:%s; font-size:12px; }
+            QLabel#dlgdanger{ color:%s; font-size:13px; font-weight:600; }
+            QComboBox,QLineEdit{ background:#0e1117; color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.12); border-radius:10px;
+                padding:7px 11px; font-size:13px; }
+            QCheckBox{ color:#c6d2d5; font-size:12px; }
+        """ % (WARN, DANGER)) + btn_qss()
+
+    # ───────────────────────── titlebar (draggable) ──────────────────────────
+    class TitleBar(QWidget):
+        def __init__(self, win):
+            super().__init__(win)
+            self.win, self._off = win, None
+            self.setFixedHeight(46)
+            h = QHBoxLayout(self)
+            h.setContentsMargins(18, 0, 12, 0)
+            ttl = QLabel("  HasH Disks")
+            ttl.setObjectName("apptitle")
+            mn, cl = QPushButton("—"), QPushButton("✕")
+            for b in (mn, cl):
+                b.setFixedSize(30, 30)
+                b.setObjectName("winbtn")
+            mn.clicked.connect(win.showMinimized)
+            cl.clicked.connect(win.close)
+            h.addWidget(ttl)
+            h.addStretch(1)
+            h.addWidget(mn)
+            h.addWidget(cl)
+
+        def mousePressEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self._off = e.globalPosition().toPoint() - self.win.frameGeometry().topLeft()
+
+        def mouseMoveEvent(self, e):
+            if self._off is not None and (e.buttons() & Qt.MouseButton.LeftButton):
+                self.win.move(e.globalPosition().toPoint() - self._off)
+
+        def mouseReleaseEvent(self, e):
+            self._off = None
+
+    # ────────────────── transaction window (pkexec / udisks) ─────────────────
+    class Transaction(QWidget):
+        def __init__(self, parent, title, argv, env, on_done=None):
+            super().__init__(None)
+            self.on_done = on_done
+            self.setObjectName("txwin")
+            self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.resize(620, 380)
+            v = QVBoxLayout(self)
+            v.setContentsMargins(18, 16, 18, 16)
+            t = QLabel(title)
+            t.setObjectName("txtitle")
+            self.log = QTextEdit(readOnly=True)
+            self.log.setObjectName("txlog")
+            self.btn = QPushButton("Please wait…")
+            self.btn.setEnabled(False)
+            self.btn.setObjectName("primary")
+            self.btn.clicked.connect(self.close)
+            v.addWidget(t)
+            v.addWidget(self.log, 1)
+            v.addWidget(self.btn)
+            self.setStyleSheet("""
+                #txwin{ background:#14161d; border:1px solid rgba(255,255,255,0.12);
+                        border-radius:16px; }
+                #txtitle{ color:#fff; font-size:15px; font-weight:600; }
+                #txlog{ background:#0b0d12; color:#cfe9ee; border:1px solid #222;
+                        border-radius:10px; font-family:monospace; font-size:12px; }
+            """ + btn_qss())
+            self.p = QProcess(self)
+            self.p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            self.p.setProcessEnvironment(qenv(env))
+            self.p.readyReadStandardOutput.connect(self._read)
+            self.p.finished.connect(self._fin)
+            self._append("$ " + " ".join(argv) + "\n\n")
+            self.p.start(argv[0], argv[1:])
+
+        def _read(self):
+            self._append(bytes(self.p.readAllStandardOutput()).decode(errors="ignore"))
+
+        def _append(self, s):
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+            self.log.insertPlainText(s)
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+
+        def _fin(self, code, _st):
+            ok = code == 0
+            self._append("\n" + ("✓ Done." if ok else "✗ Failed (exit %d)." % code) + "\n")
+            self.btn.setText("Close")
+            self.btn.setEnabled(True)
+            if self.on_done:
+                self.on_done(ok)
+
+    # ─────────────────── typed-confirmation (destructive guard) ───────────────
+    def confirm_typed(parent, title, body, phrase):
+        """A hard, typed-confirmation dialog: the user must type <phrase> exactly
+        to enable the destructive button. Returns True only if confirmed."""
+        d = QDialog(parent)
+        d.setWindowTitle(title)
+        d.setStyleSheet(dlg_qss())
+        d.setMinimumWidth(440)
+        v = QVBoxLayout(d)
+        v.setContentsMargins(20, 18, 20, 18)
+        v.setSpacing(10)
+        t = QLabel(title)
+        t.setObjectName("dlgtitle")
+        v.addWidget(t)
+        msg = QLabel(body)
+        msg.setWordWrap(True)
+        v.addWidget(msg)
+        warn = QLabel("This DESTROYS all data on the volume and cannot be undone.")
+        warn.setObjectName("dlgdanger")
+        warn.setWordWrap(True)
+        v.addWidget(warn)
+        ask = QLabel("Type  <b>%s</b>  to confirm:" % phrase)
+        ask.setWordWrap(True)
+        v.addWidget(ask)
+        edit = QLineEdit()
+        v.addWidget(edit)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        go = QPushButton("Erase")
+        go.setObjectName("danger")
+        go.setEnabled(False)
+        row.addWidget(cancel)
+        row.addWidget(go)
+        v.addLayout(row)
+        edit.textChanged.connect(lambda s: go.setEnabled(s == phrase))
+        cancel.clicked.connect(d.reject)
+        go.clicked.connect(d.accept)
+        return d.exec() == QDialog.DialogCode.Accepted
+
+    # ───────────────────────────── a drive card ──────────────────────────────
+    class DriveCard(QFrame):
+        def __init__(self, page, part):
+            super().__init__()
+            self.page, self.part = page, part
+            self.setObjectName("card")
+            self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            v = QVBoxLayout(self)
+            v.setContentsMargins(16, 13, 16, 14)
+            v.setSpacing(8)
+
+            head = QHBoxLayout()
+            label = part["label"] or part["device"].split("/")[-1]
+            icon = QLabel()
+            stock = "drive-removable-media" if part["removable"] else "drive-harddisk"
+            if part["fstype"].lower() in ("iso9660", "udf"):
+                stock = "media-optical"
+            icon.setPixmap(QIcon.fromTheme(stock).pixmap(QSize(34, 34)))
+            head.addWidget(icon)
+
+            tb = QVBoxLayout()
+            tb.setSpacing(1)
+            name = QLabel(label)
+            name.setObjectName("cardname")
+            meta = "%s · %s · %s" % (part["device"], part["fstype"] or "no fs",
+                                     part["size_h"] or "?")
+            sub = QLabel(meta)
+            sub.setObjectName("cardmeta")
+            tb.addWidget(name)
+            tb.addWidget(sub)
+            head.addLayout(tb, 1)
+
+            badge = QLabel(self._state_text())
+            badge.setObjectName("badgeOn" if part["mounted"] else "badgeOff")
+            head.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+            v.addLayout(head)
+
+            if part["mounted"] and part.get("fssize"):
+                bar = self._usage_bar()
+                if bar:
+                    v.addWidget(bar)
+
+            mp = part["mountpoint"]
+            if mp:
+                where = QLabel("Mounted at  " + mp)
+                where.setObjectName("cardwhere")
+                v.addWidget(where)
+
+            act = QHBoxLayout()
+            act.setSpacing(8)
+            if part["protected"]:
+                lk = QLabel("System volume — managed by the OS")
+                lk.setObjectName("cardlocked")
+                act.addWidget(lk)
+                act.addStretch(1)
+            else:
+                if part["mounted"]:
+                    b = QPushButton("Unmount")
+                    b.clicked.connect(lambda: page.do_unmount(part))
+                    act.addWidget(b)
+                else:
+                    b = QPushButton("Mount now")
+                    b.setObjectName("primary")
+                    b.clicked.connect(lambda: page.do_mount(part))
+                    act.addWidget(b)
+                act.addStretch(1)
+                if part["uuid"]:
+                    boot = QCheckBox("Mount on boot")
+                    boot.setChecked(part["in_fstab"])
+                    boot.toggled.connect(lambda on: page.toggle_boot(part, on))
+                    act.addWidget(boot)
+                if part["fstype"].lower().startswith("ntfs"):
+                    fix = QPushButton("Make writable as me")
+                    fix.setToolTip("Remount NTFS read/write owned by you "
+                                   "(uid/gid), clearing the dirty flag (ntfs-3g)")
+                    fix.clicked.connect(lambda: page.ntfs_fix(part))
+                    act.addWidget(fix)
+                det = QPushButton("Details")
+                det.clicked.connect(lambda: page.win.show_detail(part))
+                act.addWidget(det)
+            v.addLayout(act)
+
+        def mouseDoubleClickEvent(self, _e):
+            self.page.win.show_detail(self.part)
+
+        def _state_text(self):
+            if self.part["protected"]:
+                return "system"
+            if self.part["ro"]:
+                return "read-only"
+            return "mounted" if self.part["mounted"] else "not mounted"
+
+        def _usage_bar(self):
+            try:
+                size = float(self.part["fssize"])
+                used = float(self.part.get("fsused") or 0)
+            except (TypeError, ValueError):
+                return None
+            if size <= 0:
+                return None
+            pct = max(0.0, min(1.0, used / size))
+            wrap = QWidget()
+            wl = QVBoxLayout(wrap)
+            wl.setContentsMargins(0, 2, 0, 0)
+            wl.setSpacing(3)
+            track = QFrame()
+            track.setObjectName("bartrack")
+            track.setFixedHeight(8)
+            tl = QHBoxLayout(track)
+            tl.setContentsMargins(0, 0, 0, 0)
+            fill = QFrame()
+            fill.setObjectName("barfill" if pct < 0.9 else "barfull")
+            fill.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            tl.addWidget(fill, max(1, int(pct * 1000)))
+            spacer = QWidget()
+            spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            tl.addWidget(spacer, max(1, int((1 - pct) * 1000)))
+            wl.addWidget(track)
+            txt = QLabel("%s used of %s  ·  %s free" % (
+                _human(used), _human(size),
+                _human(self.part.get("fsavail") or (size - used))))
+            txt.setObjectName("barlabel")
+            wl.addWidget(txt)
+            return wrap
+
+    # ─────────────────── shared transaction launcher mixin ────────────────────
+    class TxPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self._tx = None
+
+        def _run(self, title, argv, env=None, after=None):
+            def done(ok):
+                self.win.refresh_all()
+                if after:
+                    after(ok)
+            self._tx = Transaction(self.win, title, argv, env or dict(os.environ),
+                                   on_done=done)
+            g = self.win.geometry()
+            self._tx.move(g.center().x() - 310, g.center().y() - 190)
+            self._tx.show()
+
+    # ───────────────────────────── the Drives page ───────────────────────────
+    class DrivesPage(TxPage):
+        def __init__(self, win):
+            super().__init__(win)
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(10)
+            top = QHBoxLayout()
+            self.title = QLabel("Drives")
+            self.title.setObjectName("pgtitle")
+            top.addWidget(self.title)
+            top.addStretch(1)
+            ref = QPushButton("Refresh")
+            ref.clicked.connect(self.reload)
+            top.addWidget(ref)
+            outer.addLayout(top)
+
+            self.scroll = QScrollArea()
+            self.scroll.setObjectName("scroll")
+            self.scroll.setWidgetResizable(True)
+            self.host = QWidget()
+            self.col = QVBoxLayout(self.host)
+            self.col.setContentsMargins(2, 2, 8, 2)
+            self.col.setSpacing(12)
+            self.scroll.setWidget(self.host)
+            outer.addWidget(self.scroll, 1)
+            self.reload()
+
+        def _clear(self):
+            while self.col.count():
+                it = self.col.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def reload(self):
+            self._clear()
+            groups = get_drives()
+            shown = 0
+            for g in groups:
+                parts = [p for p in g["parts"] if p["fstype"] or p["mounted"]]
+                if not parts:
+                    continue
+                disk = g["disk"]
+                info = g.get("info", {})
+                tag = info.get("model") or ""
+                if g.get("is_system"):
+                    tag = (tag + "  ·  system disk").strip(" ·")
+                hdr = QLabel(disk + (("  ·  " + tag) if tag else ""))
+                hdr.setObjectName("diskhdr")
+                self.col.addWidget(hdr)
+                for p in parts:
+                    self.col.addWidget(DriveCard(self, p))
+                    shown += 1
+            if not shown:
+                empty = QLabel("No mountable partitions found.")
+                empty.setObjectName("cardmeta")
+                self.col.addWidget(empty)
+            self.col.addStretch(1)
+
+        # ── actions ──
+        def do_mount(self, part):
+            if part["removable"] and HAS_UDISKS:
+                self._run("Mounting %s" % part["device"], udisks_mount(part["device"]))
+                return
+            self._mount_at(part)
+
+        def _mount_at(self, part):
+            label = part["label"] or part["device"].split("/")[-1]
+            options = ["~/Drives/%s" % label, "/mnt/%s" % label]
+            choice, ok = QInputDialog.getItem(
+                self.win, "Mount point",
+                "Where should %s be mounted?" % part["device"], options, 0, True)
+            if not ok or not choice:
+                return
+            mp = os.path.expanduser(choice.strip())
+            fstype = part["fstype"] or "auto"
+            opts = ""
+            if fstype.lower().startswith("ntfs"):
+                fstype = "ntfs-3g"
+                opts = "rw,uid=%d,gid=%d,umask=022" % (os.getuid(), os.getgid())
+            argv = ["pkexec", HELPER, "mount", part["device"], mp, fstype, opts]
+            self._run("Mounting %s at %s" % (part["device"], mp), argv, tx_env())
+
+        def do_unmount(self, part):
+            if part["removable"] and HAS_UDISKS:
+                self._run("Unmounting %s" % part["device"],
+                          udisks_unmount(part["device"]))
+                return
+            argv = ["pkexec", HELPER, "unmount", part["mountpoint"]]
+            self._run("Unmounting %s" % part["mountpoint"], argv, tx_env())
+
+        def toggle_boot(self, part, on):
+            if not part["uuid"]:
+                QMessageBox.warning(self.win, "No UUID",
+                                    "This volume has no UUID; cannot add to fstab.")
+                return
+            label = part["label"] or part["device"].split("/")[-1]
+            if on:
+                default = part["mountpoint"] or os.path.join(DRIVES_DIR, label)
+                mp, ok = QInputDialog.getText(
+                    self.win, "Mount on boot",
+                    "Mount %s at this path on every boot\n(nofail is always added, "
+                    "so a missing drive never blocks boot):" % part["device"],
+                    text=default)
+                if not ok or not mp.strip():
+                    return
+                mp = os.path.expanduser(mp.strip())
+                fstype = part["fstype"] or "auto"
+                opts = "defaults"
+                if fstype.lower().startswith("ntfs"):
+                    fstype = "ntfs-3g"
+                    opts = "uid=%d,gid=%d,umask=022" % (os.getuid(), os.getgid())
+                argv = ["pkexec", HELPER, "fstab-add", part["uuid"], mp, fstype, opts]
+                self._run("Adding %s to fstab (UUID, nofail)" % part["device"],
+                          argv, tx_env())
+            else:
+                argv = ["pkexec", HELPER, "fstab-remove", part["uuid"]]
+                self._run("Removing %s from fstab" % part["device"], argv, tx_env())
+
+        def ntfs_fix(self, part):
+            if not HAS_NTFS3G:
+                if QMessageBox.question(
+                        self.win, "ntfs-3g missing",
+                        "The 'ntfs-3g' package is needed to make NTFS drives "
+                        "writable.\n\nOpen HasH Software Center to install it?"
+                        ) == QMessageBox.StandardButton.Yes:
+                    subprocess.Popen(["hash-store"]) if shutil.which("hash-store") else None
+                return
+            label = part["label"] or part["device"].split("/")[-1]
+            mp = part["mountpoint"] or os.path.join(DRIVES_DIR, label)
+            argv = ["pkexec", HELPER, "ntfs-fix", part["device"], mp,
+                    str(os.getuid()), str(os.getgid())]
+            self._run("Making %s writable as you (ntfs-3g, uid=%d)"
+                      % (part["device"], os.getuid()), argv, tx_env())
+
+    # ───────────────────────────── per-device detail ──────────────────────────
+    class DetailPage(TxPage):
+        def __init__(self, win):
+            super().__init__(win)
+            self.part = None
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(10)
+            top = QHBoxLayout()
+            back = QPushButton("‹ Back")
+            back.clicked.connect(lambda: win.go(0))
+            top.addWidget(back)
+            self.title = QLabel("Device")
+            self.title.setObjectName("pgtitle")
+            top.addWidget(self.title)
+            top.addStretch(1)
+            outer.addLayout(top)
+            self.scroll = QScrollArea()
+            self.scroll.setObjectName("scroll")
+            self.scroll.setWidgetResizable(True)
+            self.host = QWidget()
+            self.col = QVBoxLayout(self.host)
+            self.col.setContentsMargins(2, 2, 8, 2)
+            self.col.setSpacing(12)
+            self.scroll.setWidget(self.host)
+            outer.addWidget(self.scroll, 1)
+
+        def _clear(self):
+            while self.col.count():
+                it = self.col.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def _kv_card(self, title, pairs):
+            card = QFrame()
+            card.setObjectName("card")
+            v = QVBoxLayout(card)
+            v.setContentsMargins(16, 13, 16, 14)
+            h = QLabel(title)
+            h.setObjectName("cardname")
+            v.addWidget(h)
+            grid = QGridLayout()
+            grid.setColumnStretch(1, 1)
+            for i, (k, val) in enumerate(pairs):
+                kl = QLabel(k)
+                kl.setObjectName("kvk")
+                vl = QLabel(str(val) if val not in (None, "") else "—")
+                vl.setObjectName("kvv")
+                vl.setWordWrap(True)
+                vl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                grid.addWidget(kl, i, 0)
+                grid.addWidget(vl, i, 1)
+            v.addLayout(grid)
+            return card
+
+        def show(self, part):
+            self.part = part
+            self._clear()
+            label = part["label"] or part["device"].split("/")[-1]
+            self.title.setText(label)
+            # Re-fetch the parent disk info from a fresh enumeration.
+            diskinfo, sibs = {}, []
+            for g in get_drives():
+                if g["disk"] == part["parent"]:
+                    diskinfo = g.get("info", {})
+                    sibs = g["parts"]
+            self.col.addWidget(self._kv_card("Disk", [
+                ("Device", part["parent"]),
+                ("Model", diskinfo.get("model")),
+                ("Serial", diskinfo.get("serial")),
+                ("Size", diskinfo.get("size_h")),
+                ("Bus", diskinfo.get("tran")),
+                ("Rotational", "Yes (HDD)" if diskinfo.get("rota") else "No (SSD/flash)"),
+                ("Partition table", (diskinfo.get("ptype") or "?").upper()),
+                ("Removable", "Yes" if diskinfo.get("removable") else "No"),
+                ("System disk", "Yes — protected" if part.get("on_system_disk") else "No"),
+            ]))
+            self.col.addWidget(self._kv_card("This volume", [
+                ("Device", part["device"]),
+                ("Type", part["type"]),
+                ("Filesystem", part["fstype"] or "none"),
+                ("Label", part["label"]),
+                ("UUID", part["uuid"]),
+                ("Partition type", part.get("parttype")),
+                ("Size", part["size_h"]),
+                ("Mounted at", part["mountpoint"] or "not mounted"),
+                ("Used / free", ("%s / %s" % (_human(part.get("fsused")),
+                                              _human(part.get("fsavail"))))
+                 if part.get("fssize") else "—"),
+                ("Read-only", "Yes" if part["ro"] else "No"),
+                ("In fstab", "Yes (auto-mount)" if part["in_fstab"] else "No"),
+            ]))
+
+            # Sibling partitions on the same disk
+            if sibs:
+                card = QFrame()
+                card.setObjectName("card")
+                v = QVBoxLayout(card)
+                v.setContentsMargins(16, 13, 16, 14)
+                h = QLabel("Partitions on %s" % part["parent"])
+                h.setObjectName("cardname")
+                v.addWidget(h)
+                for s in sibs:
+                    line = QLabel("%s · %s · %s%s" % (
+                        s["device"], s["fstype"] or "no fs", s["size_h"] or "?",
+                        ("  ·  mounted at " + s["mountpoint"]) if s["mounted"] else ""))
+                    line.setObjectName("cardmeta")
+                    v.addWidget(line)
+                self.col.addWidget(card)
+
+            # Actions: relabel / format / eject — guarded
+            act = QFrame()
+            act.setObjectName("card")
+            av = QVBoxLayout(act)
+            av.setContentsMargins(16, 13, 16, 14)
+            ah = QLabel("Actions")
+            ah.setObjectName("cardname")
+            av.addWidget(ah)
+            row = QHBoxLayout()
+            if part.get("on_system_disk"):
+                warn = QLabel("This volume is on the system disk — format, "
+                              "relabel and partitioning are disabled for safety.")
+                warn.setObjectName("cardlocked")
+                warn.setWordWrap(True)
+                av.addWidget(warn)
+            else:
+                if part["fstype"]:
+                    rl = QPushButton("Relabel")
+                    rl.clicked.connect(lambda: self.relabel(part))
+                    row.addWidget(rl)
+                fm = QPushButton("Format…")
+                fm.setObjectName("danger")
+                fm.clicked.connect(lambda: self.win.format_page.start(part))
+                row.addWidget(fm)
+                if HAS_SMART:
+                    hl = QPushButton("Health (SMART)")
+                    hl.clicked.connect(lambda: self.win.health_page.scan_to(part["parent"]))
+                    row.addWidget(hl)
+                if diskinfo.get("removable") and HAS_UDISKS:
+                    ej = QPushButton("Power off / eject")
+                    ej.clicked.connect(lambda: self.power_off(part["parent"]))
+                    row.addWidget(ej)
+                row.addStretch(1)
+            av.addLayout(row)
+            self.col.addWidget(act)
+            self.col.addStretch(1)
+
+        def relabel(self, part):
+            fs = part["fstype"].lower()
+            cur = part["label"]
+            new, ok = QInputDialog.getText(
+                self.win, "Relabel %s" % part["device"],
+                "New filesystem label (letters, digits, space . _ - ):", text=cur)
+            if not ok:
+                return
+            new = new.strip()
+            argv = ["pkexec", HELPER, "relabel", part["device"], fs, new]
+            self._run("Relabelling %s to '%s'" % (part["device"], new), argv,
+                      tx_env(), after=lambda ok2: self.win.go(0))
+
+        def power_off(self, disk):
+            if QMessageBox.question(
+                    self.win, "Power off",
+                    "Unmount and power off %s so it is safe to unplug?" % disk
+                    ) != QMessageBox.StandardButton.Yes:
+                return
+            argv = ["pkexec", HELPER, "power-off", disk]
+            self._run("Powering off %s" % disk, argv, tx_env(),
+                      after=lambda ok: self.win.go(0))
+
+    # ───────────────────────────── Format page ────────────────────────────────
+    class FormatPage(TxPage):
+        def __init__(self, win):
+            super().__init__(win)
+            self.part = None
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(10)
+            top = QHBoxLayout()
+            self.title = QLabel("Format & Partition")
+            self.title.setObjectName("pgtitle")
+            top.addWidget(self.title)
+            top.addStretch(1)
+            outer.addLayout(top)
+            self.scroll = QScrollArea()
+            self.scroll.setObjectName("scroll")
+            self.scroll.setWidgetResizable(True)
+            self.host = QWidget()
+            self.col = QVBoxLayout(self.host)
+            self.col.setContentsMargins(2, 2, 8, 2)
+            self.col.setSpacing(12)
+            self.scroll.setWidget(self.host)
+            outer.addWidget(self.scroll, 1)
+            self.reload()
+
+        def _clear(self):
+            while self.col.count():
+                it = self.col.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def reload(self):
+            self._clear()
+            note = QLabel("Pick a partition to format, or a whole disk to "
+                          "(re)partition. The system disk (backing / or /boot) is "
+                          "hidden — it can never be formatted or repartitioned here.")
+            note.setObjectName("cardmeta")
+            note.setWordWrap(True)
+            self.col.addWidget(note)
+            any_shown = False
+            for g in get_drives():
+                if g.get("is_system"):
+                    continue
+                disk = g["disk"]
+                info = g.get("info", {})
+                hdr = QLabel(disk + (("  ·  " + info.get("model", "")) if info.get("model") else "")
+                             + (("  ·  " + (info.get("ptype") or "").upper()) if info.get("ptype") else ""))
+                hdr.setObjectName("diskhdr")
+                self.col.addWidget(hdr)
+                # whole-disk partitioning controls
+                dctl = QFrame()
+                dctl.setObjectName("card")
+                dl = QHBoxLayout(dctl)
+                dl.setContentsMargins(16, 10, 16, 10)
+                dl.addWidget(QLabel("Whole disk %s (%s)" % (disk, info.get("size_h") or "?")))
+                dl.addStretch(1)
+                ngpt = QPushButton("New GPT table")
+                ngpt.setObjectName("danger")
+                ngpt.clicked.connect(lambda _, d=disk: self.new_table(d, "gpt"))
+                dl.addWidget(ngpt)
+                npart = QPushButton("Add partition")
+                npart.clicked.connect(lambda _, d=disk: self.add_partition(d))
+                dl.addWidget(npart)
+                self.col.addWidget(dctl)
+                for p in g["parts"]:
+                    self.col.addWidget(self._part_row(p))
+                    any_shown = True
+            if not any_shown:
+                e = QLabel("No non-system disks available.")
+                e.setObjectName("cardmeta")
+                self.col.addWidget(e)
+            self.col.addStretch(1)
+
+        def _part_row(self, part):
+            card = QFrame()
+            card.setObjectName("card")
+            h = QHBoxLayout(card)
+            h.setContentsMargins(16, 10, 16, 10)
+            label = part["label"] or part["device"].split("/")[-1]
+            txt = QLabel("%s · %s · %s%s" % (
+                part["device"], part["fstype"] or "no fs", part["size_h"] or "?",
+                ("  ·  mounted" if part["mounted"] else "")))
+            h.addWidget(txt)
+            h.addStretch(1)
+            if part["fstype"]:
+                rl = QPushButton("Relabel")
+                rl.clicked.connect(lambda: self.win.detail_page.relabel(part))
+                h.addWidget(rl)
+            fm = QPushButton("Format…")
+            fm.setObjectName("danger")
+            fm.clicked.connect(lambda: self.start(part))
+            h.addWidget(fm)
+            if part.get("partn"):
+                de = QPushButton("Delete")
+                de.setObjectName("danger")
+                de.clicked.connect(lambda: self.del_partition(part))
+                h.addWidget(de)
+            return card
+
+        # ── DESTRUCTIVE: format a partition ──
+        def start(self, part):
+            self.win.go(2)
+            if part.get("on_system_disk"):
+                QMessageBox.critical(self.win, "Refused",
+                                     "%s is on the system disk and cannot be "
+                                     "formatted." % part["device"])
+                return
+            d = QDialog(self.win)
+            d.setWindowTitle("Format %s" % part["device"])
+            d.setStyleSheet(dlg_qss())
+            d.setMinimumWidth(440)
+            v = QVBoxLayout(d)
+            v.setContentsMargins(20, 18, 20, 18)
+            v.setSpacing(10)
+            t = QLabel("Format %s" % part["device"])
+            t.setObjectName("dlgtitle")
+            v.addWidget(t)
+            form = QFormLayout()
+            fsbox = QComboBox()
+            for human, tok in FORMAT_FS:
+                fsbox.addItem(human, tok)
+            form.addRow("Filesystem:", fsbox)
+            labedit = QLineEdit(part["label"] or "")
+            labedit.setPlaceholderText("e.g. Media")
+            form.addRow("Label:", labedit)
+            v.addLayout(form)
+            hint = QLabel("NTFS is recommended for a media drive shared with "
+                          "Windows. After formatting you can mount it writable as "
+                          "you from the Drives page.")
+            hint.setObjectName("dlgwarn")
+            hint.setWordWrap(True)
+            v.addWidget(hint)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            cancel = QPushButton("Cancel")
+            nxt = QPushButton("Continue…")
+            nxt.setObjectName("danger")
+            row.addWidget(cancel)
+            row.addWidget(nxt)
+            v.addLayout(row)
+            cancel.clicked.connect(d.reject)
+
+            def proceed():
+                fstok = fsbox.currentData()
+                label = labedit.text().strip()
+                d.accept()
+                phrase = label if label else "ERASE"
+                body = ("You are about to ERASE <b>%s</b> (%s, %s) and create a "
+                        "fresh <b>%s</b> filesystem%s." % (
+                            part["device"], part["fstype"] or "no fs",
+                            part["size_h"] or "?", fstok,
+                            (" labelled '%s'" % label) if label else ""))
+                if not confirm_typed(self.win, "Erase %s" % part["device"],
+                                     body, phrase):
+                    return
+                argv = ["pkexec", HELPER, "format", part["device"], fstok, label,
+                        str(os.getuid()), str(os.getgid())]
+                self._run("Formatting %s as %s" % (part["device"], fstok),
+                          argv, tx_env(), after=lambda ok: self.reload())
+            nxt.clicked.connect(proceed)
+            d.exec()
+
+        # ── DESTRUCTIVE: whole-disk new table ──
+        def new_table(self, disk, kind):
+            body = ("You are about to create a brand-new <b>%s</b> partition "
+                    "table on <b>%s</b>. Every existing partition and all data on "
+                    "the disk will be lost." % (kind.upper(), disk))
+            if not confirm_typed(self.win, "Wipe %s" % disk, body,
+                                 disk.split("/")[-1]):
+                return
+            argv = ["pkexec", HELPER, "part-table", disk, kind]
+            self._run("New %s table on %s" % (kind.upper(), disk), argv, tx_env(),
+                      after=lambda ok: self.reload())
+
+        def add_partition(self, disk):
+            d = QDialog(self.win)
+            d.setWindowTitle("Add partition on %s" % disk)
+            d.setStyleSheet(dlg_qss())
+            v = QVBoxLayout(d)
+            v.setContentsMargins(20, 18, 20, 18)
+            t = QLabel("Add a partition on %s" % disk)
+            t.setObjectName("dlgtitle")
+            v.addWidget(t)
+            form = QFormLayout()
+            start = QLineEdit("0%")
+            end = QLineEdit("100%")
+            form.addRow("Start (e.g. 0%, 1MiB):", start)
+            form.addRow("End (e.g. 100%, 50%):", end)
+            v.addLayout(form)
+            note = QLabel("Creates an empty partition (no filesystem). Format it "
+                          "afterwards. Resize of existing partitions is deferred.")
+            note.setObjectName("dlgwarn")
+            note.setWordWrap(True)
+            v.addWidget(note)
+            bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                  QDialogButtonBox.StandardButton.Cancel)
+            v.addWidget(bb)
+            bb.accepted.connect(d.accept)
+            bb.rejected.connect(d.reject)
+            if d.exec() != QDialog.DialogCode.Accepted:
+                return
+            body = ("Create a new partition on <b>%s</b> from %s to %s?" %
+                    (disk, start.text(), end.text()))
+            if not confirm_typed(self.win, "Modify partition table on %s" % disk,
+                                 body, disk.split("/")[-1]):
+                return
+            argv = ["pkexec", HELPER, "part-new", disk, start.text().strip(),
+                    end.text().strip(), "primary"]
+            self._run("Creating partition on %s" % disk, argv, tx_env(),
+                      after=lambda ok: self.reload())
+
+        def del_partition(self, part):
+            disk = part["parent"]
+            num = part.get("partn")
+            body = ("Delete partition <b>%s</b> (number %s) from <b>%s</b>? All "
+                    "data on it is lost." % (part["device"], num, disk))
+            if not confirm_typed(self.win, "Delete %s" % part["device"], body,
+                                 part["device"].split("/")[-1]):
+                return
+            argv = ["pkexec", HELPER, "part-del", disk, str(num)]
+            self._run("Deleting %s" % part["device"], argv, tx_env(),
+                      after=lambda ok: self.reload())
+
+    # ───────────────────────────── Health (SMART) page ────────────────────────
+    class HealthPage(TxPage):
+        def __init__(self, win):
+            super().__init__(win)
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(10)
+            top = QHBoxLayout()
+            self.title = QLabel("Health")
+            self.title.setObjectName("pgtitle")
+            top.addWidget(self.title)
+            top.addStretch(1)
+            outer.addLayout(top)
+            self.scroll = QScrollArea()
+            self.scroll.setObjectName("scroll")
+            self.scroll.setWidgetResizable(True)
+            self.host = QWidget()
+            self.col = QVBoxLayout(self.host)
+            self.col.setContentsMargins(2, 2, 8, 2)
+            self.col.setSpacing(12)
+            self.scroll.setWidget(self.host)
+            outer.addWidget(self.scroll, 1)
+            self.reload()
+
+        def _clear(self):
+            while self.col.count():
+                it = self.col.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def reload(self):
+            self._clear()
+            if not HAS_SMART:
+                card = QFrame()
+                card.setObjectName("card")
+                v = QVBoxLayout(card)
+                v.setContentsMargins(16, 14, 16, 14)
+                msg = QLabel("SMART health needs the 'smartmontools' package, "
+                             "which isn't installed.")
+                msg.setObjectName("cardname")
+                msg.setWordWrap(True)
+                v.addWidget(msg)
+                if shutil.which("hash-store"):
+                    b = QPushButton("Install smartmontools…")
+                    b.setObjectName("primary")
+                    b.clicked.connect(lambda: subprocess.Popen(["hash-store"]))
+                    v.addWidget(b, 0, Qt.AlignmentFlag.AlignLeft)
+                self.col.addWidget(card)
+                self.col.addStretch(1)
+                return
+            # one card per whole disk
+            disks = []
+            for g in get_drives():
+                disks.append((g["disk"], g.get("info", {})))
+            seen = set()
+            for disk, info in disks:
+                if disk in seen:
+                    continue
+                seen.add(disk)
+                self.col.addWidget(self._disk_card(disk, info))
+            if not seen:
+                e = QLabel("No disks detected.")
+                e.setObjectName("cardmeta")
+                self.col.addWidget(e)
+            self.col.addStretch(1)
+
+        def scan_to(self, disk):
+            self.win.go(3)
+
+        def _disk_card(self, disk, info):
+            card = QFrame()
+            card.setObjectName("card")
+            v = QVBoxLayout(card)
+            v.setContentsMargins(16, 13, 16, 14)
+            head = QHBoxLayout()
+            name = QLabel("%s  ·  %s" % (disk, info.get("model") or "disk"))
+            name.setObjectName("cardname")
+            head.addWidget(name)
+            head.addStretch(1)
+            b = QPushButton("Check health")
+            b.setObjectName("primary")
+            out = QTextEdit(readOnly=True)
+            out.setObjectName("smartout")
+            out.setVisible(False)
+            out.setMinimumHeight(150)
+            summary = QLabel("")
+            summary.setObjectName("badgeOff")
+            summary.setVisible(False)
+            b.clicked.connect(lambda: self._check(disk, out, summary, b))
+            head.addWidget(b)
+            v.addLayout(head)
+            v.addWidget(summary)
+            v.addWidget(out)
+            return card
+
+        def _check(self, disk, out, summary, btn):
+            btn.setEnabled(False)
+            btn.setText("Checking…")
+            r = run(["pkexec", HELPER, "smart", disk], timeout=40)
+            btn.setEnabled(True)
+            btn.setText("Re-check")
+            text = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+            out.setVisible(True)
+            out.setPlainText(text.strip() or "No SMART data returned.")
+            self._summarise(text, summary)
+
+        def _summarise(self, text, summary):
+            health = "UNKNOWN"
+            temp = poh = realloc = ""
+            for ln in text.splitlines():
+                low = ln.lower()
+                if "overall-health" in low or "smart health status" in low:
+                    if "passed" in low or ": ok" in low:
+                        health = "PASSED"
+                    elif "failed" in low:
+                        health = "FAILED"
+                if "temperature_celsius" in low or "airflow_temperature" in low \
+                        or low.startswith("temperature:"):
+                    nums = [w for w in ln.replace("(", " ").split() if w.isdigit()]
+                    if nums:
+                        temp = nums[-1] + " °C"
+                if "power_on_hours" in low:
+                    nums = [w for w in ln.split() if w.isdigit()]
+                    if nums:
+                        poh = nums[-1] + " h"
+                if "reallocated_sector" in low:
+                    nums = [w for w in ln.split() if w.isdigit()]
+                    if nums:
+                        realloc = nums[-1]
+            bits = ["Health: " + health]
+            if temp:
+                bits.append("Temp " + temp)
+            if poh:
+                bits.append("On " + poh)
+            if realloc:
+                bits.append("Reallocated " + realloc)
+            summary.setText("   ".join(bits))
+            summary.setObjectName("badgeOn" if health == "PASSED" else
+                                  ("badgeBad" if health == "FAILED" else "badgeOff"))
+            summary.setVisible(True)
+            summary.style().unpolish(summary)
+            summary.style().polish(summary)
+
+    # ───────────────────────────── Network shares page ────────────────────────
+    class SharesPage(TxPage):
+        def __init__(self, win):
+            super().__init__(win)
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(10)
+            top = QHBoxLayout()
+            self.title = QLabel("Network shares")
+            self.title.setObjectName("pgtitle")
+            top.addWidget(self.title)
+            top.addStretch(1)
+            add = QPushButton("Add a share")
+            add.setObjectName("primary")
+            add.clicked.connect(self.add_share)
+            top.addWidget(add)
+            outer.addLayout(top)
+            self.scroll = QScrollArea()
+            self.scroll.setObjectName("scroll")
+            self.scroll.setWidgetResizable(True)
+            self.host = QWidget()
+            self.col = QVBoxLayout(self.host)
+            self.col.setContentsMargins(2, 2, 8, 2)
+            self.col.setSpacing(12)
+            self.scroll.setWidget(self.host)
+            outer.addWidget(self.scroll, 1)
+            self.reload()
+
+        def _clear(self):
+            while self.col.count():
+                it = self.col.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+
+        def reload(self):
+            self._clear()
+            avail = []
+            if HAS_CIFS:
+                avail.append("SMB/CIFS")
+            if HAS_NFS:
+                avail.append("NFS")
+            if avail:
+                note = QLabel("Mount SMB/Windows or NFS shares. Credentials are "
+                              "saved root-only with 600 permissions. fstab entries "
+                              "get nofail + _netdev so a missing network never "
+                              "blocks boot.\n\nAvailable: " + ", ".join(avail))
+            else:
+                note = QLabel("Install 'cifs-utils' (SMB) and/or 'nfs-utils' (NFS) "
+                              "to mount network shares.")
+            note.setObjectName("cardmeta")
+            note.setWordWrap(True)
+            self.col.addWidget(note)
+            if not avail and shutil.which("hash-store"):
+                b = QPushButton("Open Software Center…")
+                b.setObjectName("primary")
+                b.clicked.connect(lambda: subprocess.Popen(["hash-store"]))
+                self.col.addWidget(b, 0, Qt.AlignmentFlag.AlignLeft)
+            # show currently-mounted network filesystems
+            for src, mp, fstype in self._mounted_net():
+                card = QFrame()
+                card.setObjectName("card")
+                h = QHBoxLayout(card)
+                h.setContentsMargins(16, 12, 16, 12)
+                h.addWidget(QLabel("%s\n%s · mounted at %s" % (src, fstype.upper(), mp)))
+                h.addStretch(1)
+                um = QPushButton("Unmount")
+                um.clicked.connect(lambda _, m=mp: self._run(
+                    "Unmounting %s" % m, ["pkexec", HELPER, "unmount", m],
+                    tx_env(), after=lambda ok: self.reload()))
+                h.addWidget(um)
+                self.col.addWidget(card)
+            self.col.addStretch(1)
+
+        def _mounted_net(self):
+            out = []
+            try:
+                with open("/proc/mounts") as f:
+                    for ln in f:
+                        p = ln.split()
+                        if len(p) >= 3 and p[2] in ("cifs", "smb3", "nfs", "nfs4"):
+                            out.append((p[0], p[1], p[2]))
+            except OSError:
+                pass
+            return out
+
+        def add_share(self):
+            d = QDialog(self.win)
+            d.setWindowTitle("Add a network share")
+            d.setStyleSheet(dlg_qss())
+            d.setMinimumWidth(460)
+            v = QVBoxLayout(d)
+            v.setContentsMargins(20, 18, 20, 18)
+            v.setSpacing(8)
+            t = QLabel("Add a network share")
+            t.setObjectName("dlgtitle")
+            v.addWidget(t)
+            form = QFormLayout()
+            kind = QComboBox()
+            if HAS_CIFS:
+                kind.addItem("SMB / Windows (cifs)", "cifs")
+            if HAS_NFS:
+                kind.addItem("NFS", "nfs")
+            if kind.count() == 0:
+                kind.addItem("SMB / Windows (cifs)", "cifs")
+                kind.addItem("NFS", "nfs")
+            remote = QLineEdit()
+            remote.setPlaceholderText("//server/share  or  server:/export")
+            mp = QLineEdit(os.path.join(HOME, "Network"))
+            user = QLineEdit()
+            pw = QLineEdit()
+            pw.setEchoMode(QLineEdit.EchoMode.Password)
+            persist = QCheckBox("Also mount on boot (fstab, nofail + _netdev)")
+            form.addRow("Type:", kind)
+            form.addRow("Remote:", remote)
+            form.addRow("Mount at:", mp)
+            form.addRow("Username:", user)
+            form.addRow("Password:", pw)
+            v.addLayout(form)
+            v.addWidget(persist)
+
+            def upd():
+                cifs = kind.currentData() == "cifs"
+                user.setEnabled(cifs)
+                pw.setEnabled(cifs)
+                remote.setPlaceholderText("//server/share" if cifs else "server:/export")
+            kind.currentIndexChanged.connect(upd)
+            upd()
+            bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                  QDialogButtonBox.StandardButton.Cancel)
+            v.addWidget(bb)
+            bb.accepted.connect(d.accept)
+            bb.rejected.connect(d.reject)
+            if d.exec() != QDialog.DialogCode.Accepted:
+                return
+            ktok = kind.currentData()
+            rem = remote.text().strip()
+            mpath = os.path.expanduser(mp.text().strip())
+            if not rem or not mpath:
+                QMessageBox.warning(self.win, "Missing", "Remote and mount point "
+                                    "are required.")
+                return
+            opts = ""
+            credfile = ""
+            if ktok == "cifs" and user.text().strip():
+                # Save creds via helper to a root-only 600 file, then mount.
+                safe = "".join(c for c in rem if c.isalnum())[:40] or "share"
+                credfile = os.path.join(CRED_DIR, safe + ".cred")
+                self._run("Saving credentials (600, root-only)",
+                          ["pkexec", HELPER, "save-creds", credfile,
+                           user.text().strip(), pw.text(), ""], tx_env(),
+                          after=lambda ok: self._do_mount(ktok, rem, mpath, opts,
+                                                          credfile, persist.isChecked()))
+                return
+            self._do_mount(ktok, rem, mpath, opts, credfile, persist.isChecked())
+
+        def _do_mount(self, ktok, rem, mpath, opts, credfile, persist):
+            argv = ["pkexec", HELPER, "net-mount", ktok, rem, mpath, opts, credfile]
+            def after(ok):
+                self.reload()
+                if ok and persist:
+                    fopts = ("credentials=%s" % credfile) if credfile else ""
+                    self._run("Saving %s to fstab (_netdev, nofail)" % rem,
+                              ["pkexec", HELPER, "net-fstab-add", ktok, rem,
+                               mpath, fopts], tx_env(), after=lambda o: self.reload())
+            self._run("Mounting %s at %s" % (rem, mpath), argv, tx_env(), after=after)
+
+    # ──────────────────────────────── main window ────────────────────────────
+    class Disks(QWidget):
+        def __init__(self, start_page=0):
+            super().__init__()
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setWindowTitle("HasH Disks")
+            scr = (QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()).geometry()
+            W = max(900, int(scr.height() * 0.86))
+            H = max(600, int(scr.height() * 0.72))
+            self.resize(W, H)
+            self.move(scr.center().x() - W // 2, scr.center().y() - H // 2)
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(1, 1, 1, 1)
+            root.setSpacing(0)
+            root.addWidget(TitleBar(self))
+
+            body = QHBoxLayout()
+            body.setContentsMargins(14, 4, 14, 14)
+            body.setSpacing(14)
+
+            side = QVBoxLayout()
+            side.setSpacing(6)
+            self.nav = []
+            self.stack = QStackedWidget()
+            self.drives = DrivesPage(self)
+            self.detail_page = DetailPage(self)
+            self.format_page = FormatPage(self)
+            self.health_page = HealthPage(self)
+            self.shares_page = SharesPage(self)
+            # Order matters: index used by go()/nav buttons.
+            self.pages = [self.drives, self.detail_page, self.format_page,
+                          self.health_page, self.shares_page]
+            for p in self.pages:
+                self.stack.addWidget(p)
+            # nav buttons (detail page is reachable via a card, no nav button)
+            specs = [("Drives", "drive-harddisk", 0),
+                     ("Format & Partition", "drive-multidisk", 2),
+                     ("Health", "utilities-system-monitor", 3),
+                     ("Network shares", "network-server", 4)]
+            for label, icon, idx in specs:
+                b = QPushButton("  " + label)
+                b.setCheckable(True)
+                b.setChecked(idx == start_page)
+                b.setObjectName("nav")
+                b.setIcon(QIcon.fromTheme(icon))
+                b.setIconSize(QSize(20, 20))
+                b.clicked.connect(lambda _, n=idx: self.go(n))
+                side.addWidget(b)
+                self.nav.append((idx, b))
+            side.addStretch(1)
+            tip = QLabel("Removable media mounts without a password.\n\n"
+                         "Format / partition / relabel always ask for typed "
+                         "confirmation and can never touch the system disk.")
+            tip.setObjectName("tip")
+            tip.setWordWrap(True)
+            side.addWidget(tip)
+            self.statusLbl = QLabel("")
+            self.statusLbl.setObjectName("brand")
+            side.addWidget(self.statusLbl)
+            brand = QLabel("HasH-Arch")
+            brand.setObjectName("brand")
+            side.addWidget(brand)
+            sw = QWidget()
+            sw.setObjectName("sidebar")
+            sw.setLayout(side)
+            sw.setFixedWidth(206)
+            body.addWidget(sw)
+            body.addWidget(self.stack, 1)
+            root.addLayout(body, 1)
+            self.setStyleSheet(app_qss())
+            self.go(start_page)
+
+        def status(self, t):
+            self.statusLbl.setText(t)
+
+        def go(self, n):
+            for idx, b in self.nav:
+                b.setChecked(idx == n)
+            self.stack.setCurrentIndex(n)
+
+        def show_detail(self, part):
+            self.detail_page.show(part)
+            self.go(1)
+
+        def refresh_all(self):
+            self.drives.reload()
+            self.format_page.reload()
+            self.shares_page.reload()
+            if self.detail_page.part:
+                # refresh the detail view against fresh data if still showing it
+                if self.stack.currentIndex() == 1:
+                    for p in flat_drives():
+                        if p["device"] == self.detail_page.part["device"]:
+                            self.detail_page.show(p)
+                            break
+
+        def paintEvent(self, _e):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1, 20, 20)
+            p.fillPath(path, QColor(0x12, 0x14, 0x1a))
+            p.setPen(QColor(255, 255, 255, 30))
+            p.drawPath(path)
+
+    def app_qss():
+        return f"""
+            #sidebar{{ background:rgba(255,255,255,0.03); border-radius:14px; }}
+            #apptitle{{ color:#fff; font-size:15px; font-weight:700; }}
+            QPushButton#winbtn{{ background:transparent; color:#9fb0b4; border:none;
+                border-radius:8px; font-size:14px; }}
+            QPushButton#winbtn:hover{{ background:rgba(255,255,255,0.12); color:#fff; }}
+            QPushButton#nav{{ text-align:left; background:transparent; color:#c6d2d5;
+                border:none; border-radius:10px; padding:10px 12px; font-size:14px; }}
+            QPushButton#nav:hover{{ background:rgba(255,255,255,0.07); }}
+            QPushButton#nav:checked{{ background:{ACCENT}; color:#06222a; font-weight:700; }}
+            #brand{{ color:rgba(255,255,255,0.30); font-size:11px;
+                qproperty-alignment:'AlignCenter'; padding:4px; }}
+            #tip{{ color:rgba(255,255,255,0.34); font-size:11px; padding:4px 8px; }}
+            #pgtitle{{ color:#fff; font-size:20px; font-weight:800; }}
+            #diskhdr{{ color:{ACCENT}; font-size:12px; font-weight:700; padding:4px 2px 0 2px; }}
+            #card{{ background:#0d1016; border:1px solid rgba(255,255,255,0.07);
+                border-radius:14px; }}
+            #cardname{{ color:#fff; font-size:16px; font-weight:700; }}
+            #cardmeta{{ color:#8f9da1; font-size:12px; }}
+            #cardwhere{{ color:#aeb9bc; font-size:12px; }}
+            #cardlocked{{ color:#8f9da1; font-size:12px; font-style:italic; }}
+            #kvk{{ color:#8f9da1; font-size:12px; padding:2px 16px 2px 0; }}
+            #kvv{{ color:#e8eef0; font-size:12px; }}
+            #badgeOn{{ color:{OK}; background:rgba(126,198,153,0.12); border-radius:8px;
+                padding:3px 10px; font-size:11px; font-weight:600; }}
+            #badgeOff{{ color:#8f9da1; background:rgba(255,255,255,0.05); border-radius:8px;
+                padding:3px 10px; font-size:11px; font-weight:600; }}
+            #badgeBad{{ color:{DANGER}; background:rgba(224,108,117,0.14); border-radius:8px;
+                padding:3px 10px; font-size:11px; font-weight:700; }}
+            #bartrack{{ background:rgba(255,255,255,0.07); border-radius:4px; }}
+            #barfill{{ background:{ACCENT}; border-radius:4px; }}
+            #barfull{{ background:{DANGER}; border-radius:4px; }}
+            #barlabel{{ color:#8f9da1; font-size:11px; }}
+            #smartout{{ background:#0b0d12; color:#cfe9ee; border:1px solid #222;
+                border-radius:10px; font-family:monospace; font-size:11px; }}
+            QComboBox,QLineEdit{{ background:#0e1117; color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.12); border-radius:10px;
+                padding:7px 11px; font-size:13px; }}
+            QCheckBox{{ color:#c6d2d5; font-size:12px; }}
+            QScrollArea#scroll{{ background:transparent; border:none; }}
+            QScrollArea#scroll > QWidget > QWidget{{ background:transparent; }}
+            QScrollBar:vertical{{ background:transparent; width:10px; }}
+            QScrollBar::handle:vertical{{ background:rgba(255,255,255,0.18);
+                border-radius:5px; min-height:30px; }}
+            QScrollBar::add-line,QScrollBar::sub-line{{ height:0; }}
+            QMessageBox,QInputDialog,QDialog{{ background:#14161d; }}
+            QMessageBox QLabel,QInputDialog QLabel{{ color:#e8eef0; }}
+        """ + btn_qss()
+
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("HasH Disks")
+    w = Disks(start_page=page)
+    w.show()
+    if shot:
+        def _grab():
+            w.grab().save(shot)
+            os._exit(0)
+        QTimer.singleShot(1500, _grab)
+    return app.exec()
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] == "backend":
+        return cli(a[1:])
+    shot = None
+    page = 0
+    if "--shot" in a:
+        i = a.index("--shot")
+        shot = a[i + 1] if i + 1 < len(a) else "/tmp/hash-disks-shot.png"
+    if "--page" in a:
+        i = a.index("--page")
+        try:
+            page = int(a[i + 1])
+        except (IndexError, ValueError):
+            page = 0
+    return gui(shot, page)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

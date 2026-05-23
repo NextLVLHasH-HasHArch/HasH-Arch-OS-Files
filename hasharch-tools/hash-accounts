@@ -1,0 +1,1534 @@
+#!/usr/bin/env python3
+"""HasH-Accounts  (hash-accounts)
+
+A fancy settings page to sign into online services and set up cloud storage with
+a guided, few-click flow — so your cloud quota (e.g. Google One 5 TB) shows up as
+usable storage on the desktop (a drive in Dolphin), not just a website.
+
+Engine : rclone — handles the OAuth browser sign-in and mounts a remote as a
+         FUSE filesystem.  Tokens live in ~/.config/rclone/rclone.conf
+         (CONTAINS SECRETS — never commit).
+Mounts : rclone mount <remote>: ~/Cloud/<name> --vfs-cache-mode writes --daemon
+Login  : one systemd USER unit per remote (hash-cloud-<name>.service).
+Places : ~/Cloud/<name> is added to Dolphin Places (user-places.xbel).
+
+Usage:
+    hash-accounts                 launch the GUI
+    hash-accounts --add           launch on the Add-account wizard
+    hash-accounts --settings      launch on the Settings page
+    hash-accounts backend <cmd>   headless JSON: remotes|about <r>|mounts|providers
+    hash-accounts --shot <png>    render a screenshot and exit
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+RCLONE = shutil.which("rclone") or "/usr/bin/rclone"
+HAS_RCLONE = bool(shutil.which("rclone"))
+HAS_FUSE = bool(shutil.which("fusermount3") or shutil.which("fusermount"))
+RCLONE_CONF = os.path.join(HOME, ".config", "rclone", "rclone.conf")
+SYSTEMD_USER = os.path.join(HOME, ".config", "systemd", "user")
+PLACES = os.path.join(HOME, ".local", "share", "user-places.xbel")
+CONFIG = os.path.join(HOME, ".config", "hash-accounts.json")
+ASKPASS = "/usr/bin/ksshaskpass" if os.path.exists("/usr/bin/ksshaskpass") else ""
+
+# Providers offered by the wizard.  `rtype` is the rclone backend `type`.
+# `oauth` means rclone needs the browser-OAuth dance (config create handles it).
+PROVIDERS = [
+    {"key": "drive",     "name": "Google Drive",  "rtype": "drive",
+     "icon": "folder-google-drive", "oauth": True,
+     "blurb": "Google Drive / Google One — your full cloud quota as a drive."},
+    {"key": "onedrive",  "name": "OneDrive",      "rtype": "onedrive",
+     "icon": "folder-onedrive", "oauth": True,
+     "blurb": "Microsoft OneDrive — personal or business."},
+    {"key": "dropbox",   "name": "Dropbox",       "rtype": "dropbox",
+     "icon": "folder-dropbox", "oauth": True,
+     "blurb": "Dropbox cloud storage."},
+    {"key": "nextcloud", "name": "Nextcloud",     "rtype": "webdav",
+     "icon": "folder-cloud", "oauth": False,
+     "blurb": "Nextcloud / ownCloud via WebDAV (URL + login)."},
+    {"key": "icloud",    "name": "iCloud Drive",  "rtype": "iclouddrive",
+     "icon": "com.apple.iCloud", "oauth": False, "icloud": True,
+     "blurb": "Apple iCloud Drive — sign in with your Apple ID (needs 2FA). "
+              "Requires rclone ≥ 1.66 with the iclouddrive backend."},
+]
+PROV_BY_RTYPE = {p["rtype"]: p for p in PROVIDERS}
+
+
+def has_backend(rtype):
+    """True if the installed rclone exposes backend `rtype` (e.g. iclouddrive).
+
+    rclone >= 1.66 ships the iclouddrive backend.  We ask rclone itself rather
+    than hard-coding a version so it works on any build.
+    """
+    if not HAS_RCLONE:
+        return False
+    r = run([RCLONE, "config", "providers"], timeout=20)
+    try:
+        provs = json.loads(r.stdout) if r.stdout.strip() else []
+    except Exception:
+        provs = []
+    if provs:
+        return any(isinstance(p, dict) and p.get("Name") == rtype for p in provs)
+    # Fallback: older rclone may not have `config providers` as JSON — try help.
+    h = run([RCLONE, "help", "backends"], timeout=20)
+    return rtype in (h.stdout or "")
+
+DEFAULTS = {
+    "mount_root": os.path.join(HOME, "Cloud"),
+    "vfs_cache_max": "5G",
+    "vfs_cache_mode": "writes",
+    "auto_mount": True,
+}
+
+
+def run(cmd, timeout=60, env=None):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, env=env)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = str(e)
+        return _R()
+
+
+# ───────────────────────────── settings persistence ──────────────────────────
+def load_settings():
+    s = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            s.update(json.load(f))
+    except Exception:
+        pass
+    return s
+
+
+def save_settings(s):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w") as f:
+        json.dump(s, f, indent=2)
+
+
+def mount_root():
+    return load_settings().get("mount_root") or DEFAULTS["mount_root"]
+
+
+def mount_point(name):
+    return os.path.join(mount_root(), name)
+
+
+# ───────────────────────────── rclone remotes/info ───────────────────────────
+def list_remotes():
+    """[{name, type, provider, icon}] from rclone config."""
+    if not HAS_RCLONE:
+        return []
+    r = run([RCLONE, "config", "dump"])
+    out = []
+    try:
+        data = json.loads(r.stdout) if r.stdout.strip() else {}
+    except Exception:
+        data = {}
+    for name, conf in data.items():
+        rtype = conf.get("type", "")
+        prov = PROV_BY_RTYPE.get(rtype)
+        out.append({
+            "name": name,
+            "type": rtype,
+            "provider": prov["name"] if prov else rtype or "Remote",
+            "icon": prov["icon"] if prov else "folder-cloud",
+        })
+    out.sort(key=lambda x: x["name"].lower())
+    return out
+
+
+def remote_about(name):
+    """{used, total, free, used_str, total_str, ok} via `rclone about`."""
+    if not HAS_RCLONE:
+        return {"ok": False, "error": "rclone not installed"}
+    r = run([RCLONE, "about", name + ":", "--json"], timeout=30)
+    if r.returncode != 0:
+        return {"ok": False, "error": (r.stderr or "").strip()[:200]}
+    try:
+        d = json.loads(r.stdout)
+    except Exception:
+        return {"ok": False, "error": "bad about output"}
+    used = d.get("used")
+    total = d.get("total")
+    free = d.get("free")
+    return {
+        "ok": True, "used": used, "total": total, "free": free,
+        "used_str": human(used), "total_str": human(total), "free_str": human(free),
+    }
+
+
+def human(n):
+    if n is None:
+        return "—"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(n) < 1024.0:
+            return ("%.0f %s" if unit == "B" else "%.1f %s") % (n, unit)
+        n /= 1024.0
+    return "%.1f EB" % n
+
+
+def is_mounted(name):
+    """True if our mount point for <name> is an active fuse mount."""
+    mp = mount_point(name)
+    try:
+        with open("/proc/mounts") as f:
+            for ln in f:
+                parts = ln.split()
+                if len(parts) >= 2 and parts[1] == mp.replace(" ", "\\040"):
+                    return True
+                if len(parts) >= 2 and parts[1] == mp:
+                    return True
+    except Exception:
+        pass
+    # fallback: os.path.ismount
+    try:
+        return os.path.ismount(mp)
+    except Exception:
+        return False
+
+
+# ───────────────────────────── iCloud Drive config ───────────────────────────
+# rclone's iclouddrive backend (>= 1.66) signs in with an Apple ID + password
+# and then prompts for the 6-digit two-factor code, storing a trust token.
+# rclone obscures the password itself; we never persist any plaintext secret.
+ICLOUD_2FA_RE = re.compile(
+    r"(two[- ]?factor|2fa|verification code|enter the code|2-factor|"
+    r"please enter.*code|trust)", re.IGNORECASE)
+
+
+def icloud_config_argv(name, apple_id):
+    """Interactive `rclone config create` for an iCloud Drive remote.
+
+    Password is passed inline (rclone obscures it on write); the 2FA code is
+    answered on stdin by the GUI when rclone prompts for it.  We omit
+    --non-interactive precisely so rclone *can* prompt for the 2FA code.
+    """
+    return [RCLONE, "config", "create", name, "iclouddrive",
+            "apple_id", apple_id, "password", "__PASS__"]
+
+
+# ───────────────────────────── mount / unmount ───────────────────────────────
+def mount_cmd(name):
+    s = load_settings()
+    mp = mount_point(name)
+    os.makedirs(mp, exist_ok=True)
+    return [RCLONE, "mount", name + ":", mp,
+            "--vfs-cache-mode", s.get("vfs_cache_mode", "writes"),
+            "--vfs-cache-max-size", s.get("vfs_cache_max", "5G"),
+            # show the LATEST files/info when the drive is opened: poll the remote
+            # for changes (Drive/OneDrive notify), keep dir listings short-lived,
+            # and pre-warm the whole tree at mount.
+            "--poll-interval", "15s",
+            "--dir-cache-time", "30s",
+            "--vfs-refresh",
+            "--daemon"]
+
+
+def unmount_cmd(name):
+    mp = mount_point(name)
+    fm = shutil.which("fusermount3") or shutil.which("fusermount") or "fusermount"
+    return [fm, "-u", mp]
+
+
+def do_mount(name):
+    r = run(mount_cmd(name), timeout=30)
+    return r.returncode == 0, (r.stderr or r.stdout)
+
+
+def do_unmount(name):
+    r = run(unmount_cmd(name), timeout=20)
+    return r.returncode == 0, (r.stderr or r.stdout)
+
+
+# ───────────────────────────── systemd user units ────────────────────────────
+def unit_name(name):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    return "hash-cloud-%s.service" % safe
+
+
+def unit_path(name):
+    return os.path.join(SYSTEMD_USER, unit_name(name))
+
+
+def write_unit(name):
+    """Create the per-remote systemd user unit (auto-mount on login)."""
+    s = load_settings()
+    mp = mount_point(name)
+    os.makedirs(SYSTEMD_USER, exist_ok=True)
+    os.makedirs(mp, exist_ok=True)
+    fm = shutil.which("fusermount3") or shutil.which("fusermount") or "/usr/bin/fusermount3"
+    body = f"""[Unit]
+Description=HasH Accounts — mount cloud remote '{name}' at {mp}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStartPre=-/usr/bin/mkdir -p {mp}
+ExecStart={RCLONE} mount {name}: {mp} \\
+    --vfs-cache-mode {s.get('vfs_cache_mode', 'writes')} \\
+    --vfs-cache-max-size {s.get('vfs_cache_max', '5G')} \\
+    --poll-interval 15s --dir-cache-time 30s --vfs-refresh
+ExecStop={fm} -u {mp}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+    with open(unit_path(name), "w") as f:
+        f.write(body)
+    run(["systemctl", "--user", "daemon-reload"], timeout=20)
+    return unit_path(name)
+
+
+def unit_enabled(name):
+    r = run(["systemctl", "--user", "is-enabled", unit_name(name)], timeout=15)
+    return r.stdout.strip() == "enabled"
+
+
+def set_unit_enabled(name, enabled):
+    if enabled:
+        write_unit(name)
+        run(["systemctl", "--user", "enable", unit_name(name)], timeout=20)
+    else:
+        run(["systemctl", "--user", "disable", unit_name(name)], timeout=20)
+    return True
+
+
+def remove_unit(name):
+    run(["systemctl", "--user", "disable", "--now", unit_name(name)], timeout=20)
+    try:
+        os.remove(unit_path(name))
+    except OSError:
+        pass
+    run(["systemctl", "--user", "daemon-reload"], timeout=20)
+
+
+# ───────────────────────────── Dolphin Places ────────────────────────────────
+def places_has(href):
+    try:
+        with open(PLACES, encoding="utf-8") as f:
+            return ('href="%s"' % href) in f.read()
+    except Exception:
+        return False
+
+
+def add_to_places(name):
+    """Add file://<mountpoint> to KDE/Dolphin Places (idempotent)."""
+    mp = mount_point(name)
+    href = "file://" + mp
+    if places_has(href):
+        return False
+    block = f""" <bookmark href="{href}">
+  <title>{name} (Cloud)</title>
+  <info>
+   <metadata owner="http://freedesktop.org">
+    <bookmark:icon name="folder-cloud"/>
+   </metadata>
+   <metadata owner="http://www.kde.org">
+    <isSystemItem>false</isSystemItem>
+   </metadata>
+  </info>
+ </bookmark>
+"""
+    try:
+        with open(PLACES, encoding="utf-8") as f:
+            txt = f.read()
+        if "</xbel>" not in txt:
+            return False
+        txt = txt.replace("</xbel>", block + "</xbel>")
+        with open(PLACES, "w", encoding="utf-8") as f:
+            f.write(txt)
+        return True
+    except Exception:
+        # No places file yet — create a minimal one.
+        os.makedirs(os.path.dirname(PLACES), exist_ok=True)
+        with open(PLACES, "w", encoding="utf-8") as f:
+            f.write('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xbel>\n'
+                    '<xbel xmlns:bookmark="http://www.freedesktop.org/standards/'
+                    'desktop-bookmarks" xmlns:mime="http://www.freedesktop.org/'
+                    'standards/shared-mime-info">\n' + block + "</xbel>\n")
+        return True
+
+
+def remove_from_places(name):
+    href = "file://" + mount_point(name)
+    try:
+        with open(PLACES, encoding="utf-8") as f:
+            txt = f.read()
+    except Exception:
+        return False
+    pat = re.compile(r' <bookmark href="%s">.*?</bookmark>\n' % re.escape(href),
+                     re.DOTALL)
+    new = pat.sub("", txt)
+    if new != txt:
+        with open(PLACES, "w", encoding="utf-8") as f:
+            f.write(new)
+        return True
+    return False
+
+
+# ───────────────────────────── remove account ────────────────────────────────
+def remove_remote(name):
+    if is_mounted(name):
+        do_unmount(name)
+    remove_unit(name)
+    remove_from_places(name)
+    if HAS_RCLONE:
+        run([RCLONE, "config", "delete", name], timeout=20)
+    return True
+
+
+# ─────────────────────────────── headless CLI ────────────────────────────────
+def cli(a):
+    if not a:
+        print(__doc__)
+        return 0
+    c = a[0]
+    if c == "remotes":
+        rows = list_remotes()
+        for r in rows:
+            r["mounted"] = is_mounted(r["name"])
+            r["autostart"] = unit_enabled(r["name"])
+        print(json.dumps(rows, indent=2))
+    elif c == "about":
+        print(json.dumps(remote_about(a[1]) if len(a) > 1 else
+                         {"ok": False, "error": "need remote"}, indent=2))
+    elif c == "mounts":
+        print(json.dumps({r["name"]: is_mounted(r["name"])
+                          for r in list_remotes()}, indent=2))
+    elif c == "providers":
+        out = []
+        for p in PROVIDERS:
+            q = dict(p)
+            q["available"] = has_backend(p["rtype"]) if HAS_RCLONE else False
+            out.append(q)
+        print(json.dumps(out, indent=2))
+    else:
+        print("unknown:", c, file=sys.stderr)
+        return 2
+    return 0
+
+
+# ════════════════════════════════════ GUI ════════════════════════════════════
+def gui(start_page=0, shot=None):
+    from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QProcess, QSize, QRectF,
+                              QProcessEnvironment, QTimer)
+    from PyQt6.QtGui import (QPainter, QColor, QPainterPath, QIcon, QCursor,
+                             QFont)
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QLabel, QPushButton, QLineEdit, QComboBox,
+        QStackedWidget, QHBoxLayout, QVBoxLayout, QFrame, QCheckBox,
+        QScrollArea, QTextEdit, QGridLayout, QProgressBar, QSizePolicy)
+
+    ACCENT, DANGER, OK = "#56c5d8", "#e06c75", "#7fd684"
+
+    def btn_qss(a=ACCENT):
+        return f"""
+            QPushButton{{ background:rgba(255,255,255,0.07); color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.10); border-radius:9px;
+                padding:7px 16px; font-size:13px; }}
+            QPushButton:hover{{ background:rgba(255,255,255,0.13); }}
+            QPushButton#primary{{ background:{a}; color:#06222a; font-weight:600; border:none; }}
+            QPushButton#primary:hover{{ background:#6fd6e7; }}
+            QPushButton#danger{{ background:{DANGER}; color:#2a0a0c; font-weight:600; border:none; }}
+            QPushButton:disabled{{ color:#7f8a8d; background:rgba(255,255,255,0.05); }}
+        """
+
+    def qenv(d):
+        qe = QProcessEnvironment()
+        for k, v in d.items():
+            qe.insert(k, v)
+        return qe
+
+    class Worker(QThread):
+        done = pyqtSignal(object)
+
+        def __init__(self, fn, *a):
+            super().__init__()
+            self.fn, self.a = fn, a
+
+        def run(self):
+            try:
+                self.done.emit(self.fn(*self.a))
+            except Exception as e:
+                self.done.emit({"_error": str(e)})
+
+    # ── live process log window (used for OAuth/config create) ──
+    class ProcWin(QWidget):
+        finishedOk = pyqtSignal(bool)
+
+        def __init__(self, parent, title, argv, env=None):
+            super().__init__(parent, Qt.WindowType.Window
+                             | Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setObjectName("txwin")
+            self.resize(680, 460)
+            v = QVBoxLayout(self)
+            v.setContentsMargins(18, 16, 18, 16)
+            t = QLabel(title)
+            t.setObjectName("txtitle")
+            self.log = QTextEdit(readOnly=True)
+            self.log.setObjectName("txlog")
+            self.btn = QPushButton("Cancel")
+            self.btn.setObjectName("primary")
+            self.btn.clicked.connect(self._btn)
+            v.addWidget(t)
+            v.addWidget(self.log, 1)
+            v.addWidget(self.btn)
+            self.setStyleSheet("""
+                #txwin{ background:#14161d; border:1px solid rgba(255,255,255,0.12);
+                        border-radius:16px; }
+                #txtitle{ color:#fff; font-size:15px; font-weight:600; }
+                #txlog{ background:#0b0d12; color:#cfe9ee; border:1px solid #222;
+                        border-radius:10px; font-family:monospace; font-size:12px; }
+            """ + btn_qss())
+            self._done = False
+            self.p = QProcess(self)
+            self.p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            if env:
+                self.p.setProcessEnvironment(qenv(env))
+            self.p.readyReadStandardOutput.connect(self._read)
+            self.p.finished.connect(self._fin)
+            self._append("$ " + " ".join(argv) + "\n\n")
+            self.p.start(argv[0], argv[1:])
+
+        def _read(self):
+            self._append(bytes(self.p.readAllStandardOutput()).decode(errors="ignore"))
+
+        def _append(self, s):
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+            self.log.insertPlainText(s)
+            self.log.moveCursor(self.log.textCursor().MoveOperation.End)
+
+        def _btn(self):
+            if self._done:
+                self.close()
+            else:
+                self.p.kill()
+                self.close()
+
+        def _fin(self, code, _st):
+            self._done = True
+            ok = code == 0
+            self._append("\n" + ("✓ Done." if ok else "✗ Failed (exit %d)." % code) + "\n")
+            self.btn.setText("Close")
+            self.finishedOk.emit(ok)
+
+    # ── iCloud Drive sign-in: Apple ID + password, then an in-GUI 2FA prompt ──
+    # rclone's iclouddrive `config create` runs interactively; when Apple sends
+    # the 6-digit two-factor code we detect rclone's prompt on stdout and pop a
+    # dialog to collect it, then write it to the process's stdin.  The password
+    # is supplied to rclone (which obscures it) but is NEVER shown in the log.
+    class IcloudWin(ProcWin):
+        def __init__(self, parent, title, argv, password):
+            # Build the real argv (with the password) and a masked one for display.
+            self._password = password
+            self._asked_2fa = False
+            self._buf = ""
+            real_argv = [a if a != "__PASS__" else password for a in argv]
+            # Initialise the QWidget chrome exactly like ProcWin, but start the
+            # *real* argv while echoing only the masked form.
+            QWidget.__init__(self, parent, Qt.WindowType.Window
+                             | Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setObjectName("txwin")
+            self.resize(680, 460)
+            v = QVBoxLayout(self)
+            v.setContentsMargins(18, 16, 18, 16)
+            t = QLabel(title)
+            t.setObjectName("txtitle")
+            self.log = QTextEdit(readOnly=True)
+            self.log.setObjectName("txlog")
+            self.btn = QPushButton("Cancel")
+            self.btn.setObjectName("primary")
+            self.btn.clicked.connect(self._btn)
+            v.addWidget(t)
+            v.addWidget(self.log, 1)
+            v.addWidget(self.btn)
+            self.setStyleSheet("""
+                #txwin{ background:#14161d; border:1px solid rgba(255,255,255,0.12);
+                        border-radius:16px; }
+                #txtitle{ color:#fff; font-size:15px; font-weight:600; }
+                #txlog{ background:#0b0d12; color:#cfe9ee; border:1px solid #222;
+                        border-radius:10px; font-family:monospace; font-size:12px; }
+            """ + btn_qss())
+            self._done = False
+            self.p = QProcess(self)
+            self.p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            self.p.readyReadStandardOutput.connect(self._read)
+            self.p.finished.connect(self._fin)
+            self._append("$ rclone config create … iclouddrive apple_id=… "
+                         "password=********\n\n")
+            self.p.start(real_argv[0], real_argv[1:])
+
+        def _read(self):
+            chunk = bytes(self.p.readAllStandardOutput()).decode(errors="ignore")
+            self._append(chunk)
+            self._buf += chunk
+            # When rclone asks for the two-factor code, collect it from the user.
+            if (not self._asked_2fa) and ICLOUD_2FA_RE.search(self._buf) \
+                    and ("code" in self._buf.lower()):
+                self._asked_2fa = True
+                self._ask_2fa()
+
+        def _ask_2fa(self):
+            self._dlg = TwoFactorDialog(self, self._submit_2fa, self._cancel_2fa)
+            g = self.geometry()
+            self._dlg.move(g.center().x() - 180, g.center().y() - 90)
+            self._dlg.show()
+
+        def _submit_2fa(self, code):
+            self._append("\n[entered 2FA code]\n")
+            try:
+                self.p.write((code + "\n").encode())
+            except Exception:
+                pass
+            # Allow a second prompt (e.g. "trust this device?") to re-trigger.
+            self._buf = ""
+            self._asked_2fa = False
+
+        def _cancel_2fa(self):
+            self.p.kill()
+            self.close()
+
+    class TitleBar(QWidget):
+        def __init__(self, win):
+            super().__init__(win)
+            self.win, self._off = win, None
+            self.setFixedHeight(46)
+            h = QHBoxLayout(self)
+            h.setContentsMargins(18, 0, 12, 0)
+            ttl = QLabel("  HasH Accounts")
+            ttl.setObjectName("apptitle")
+            mn, cl = QPushButton("—"), QPushButton("✕")
+            for b in (mn, cl):
+                b.setFixedSize(30, 30)
+                b.setObjectName("winbtn")
+            mn.clicked.connect(win.showMinimized)
+            cl.clicked.connect(win.close)
+            h.addWidget(ttl)
+            h.addStretch(1)
+            h.addWidget(mn)
+            h.addWidget(cl)
+
+        def mousePressEvent(self, e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self._off = e.globalPosition().toPoint() - self.win.frameGeometry().topLeft()
+
+        def mouseMoveEvent(self, e):
+            if self._off is not None and (e.buttons() & Qt.MouseButton.LeftButton):
+                self.win.move(e.globalPosition().toPoint() - self._off)
+
+        def mouseReleaseEvent(self, e):
+            self._off = None
+
+    def icon_for(item):
+        ic = QIcon.fromTheme(item.get("icon", "folder-cloud"))
+        if ic.isNull():
+            ic = QIcon.fromTheme("folder-cloud")
+        if ic.isNull():
+            ic = QIcon.fromTheme("network-server")
+        return ic
+
+    # ── Accounts page: cards with quota bar, mount/unmount, autostart, remove ──
+    class AccountCard(QFrame):
+        def __init__(self, page, rec):
+            super().__init__()
+            self.page, self.rec = page, rec
+            name = rec["name"]
+            self.setObjectName("card")
+            g = QGridLayout(self)
+            g.setContentsMargins(16, 14, 16, 14)
+            g.setHorizontalSpacing(14)
+            g.setVerticalSpacing(8)
+
+            ic = QLabel()
+            ic.setPixmap(icon_for(rec).pixmap(QSize(48, 48)))
+            ic.setFixedSize(48, 48)
+            g.addWidget(ic, 0, 0, 2, 1)
+
+            title = QLabel(name)
+            title.setObjectName("cardname")
+            g.addWidget(title, 0, 1)
+            sub = QLabel(rec["provider"])
+            sub.setObjectName("cardsub")
+            g.addWidget(sub, 1, 1)
+
+            self.statusLbl = QLabel("")
+            self.statusLbl.setObjectName("cardstat")
+            self.statusLbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            g.addWidget(self.statusLbl, 0, 2, 2, 1)
+
+            self.bar = QProgressBar()
+            self.bar.setObjectName("quota")
+            self.bar.setTextVisible(False)
+            self.bar.setFixedHeight(10)
+            self.bar.setRange(0, 1000)
+            self.bar.setValue(0)
+            g.addWidget(self.bar, 2, 1, 1, 2)
+            self.quotaLbl = QLabel("Loading quota…")
+            self.quotaLbl.setObjectName("cardsub")
+            g.addWidget(self.quotaLbl, 3, 1, 1, 2)
+
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            self.mountBtn = QPushButton("Mount")
+            self.mountBtn.clicked.connect(self.toggle_mount)
+            self.autoChk = QCheckBox("Auto-mount on login")
+            self.autoChk.setChecked(rec.get("autostart", False))
+            self.autoChk.stateChanged.connect(self.toggle_auto)
+            self.openBtn = QPushButton("Open in Files")
+            self.openBtn.clicked.connect(self.open_files)
+            rm = QPushButton("Remove")
+            rm.setObjectName("danger")
+            rm.clicked.connect(self.remove)
+            row.addWidget(self.mountBtn)
+            row.addWidget(self.autoChk)
+            row.addStretch(1)
+            row.addWidget(self.openBtn)
+            row.addWidget(rm)
+            g.addLayout(row, 4, 0, 1, 3)
+
+            self.setStyleSheet(
+                "#card{ background:#0d1016; border:1px solid rgba(255,255,255,0.08);"
+                " border-radius:14px; }"
+                "#cardname{ color:#fff; font-size:17px; font-weight:700; }"
+                "#cardsub{ color:#94a3a6; font-size:12px; }"
+                "#cardstat{ font-size:12px; font-weight:600; }"
+                "QProgressBar#quota{ background:rgba(255,255,255,0.08);"
+                " border:none; border-radius:5px; }"
+                f"QProgressBar#quota::chunk{{ background:{ACCENT}; border-radius:5px; }}"
+                "QCheckBox{ color:#c6d2d5; font-size:12px; }"
+                + btn_qss())
+            self.refresh_mount_ui()
+            self.load_quota()
+
+        def refresh_mount_ui(self):
+            mounted = is_mounted(self.rec["name"])
+            self.mountBtn.setText("Unmount" if mounted else "Mount")
+            self.mountBtn.setObjectName("" if mounted else "primary")
+            self.mountBtn.setStyleSheet(btn_qss())
+            self.openBtn.setEnabled(mounted)
+            self.statusLbl.setText("● Mounted" if mounted else "○ Not mounted")
+            self.statusLbl.setStyleSheet("color:%s;" % (OK if mounted else "#94a3a6"))
+
+        def load_quota(self):
+            self._qw = Worker(remote_about, self.rec["name"])
+            self._qw.done.connect(self._got_quota)
+            self._qw.start()
+
+        def _got_quota(self, d):
+            if not isinstance(d, dict) or not d.get("ok"):
+                err = d.get("error", "") if isinstance(d, dict) else ""
+                self.quotaLbl.setText("Quota unavailable" + (" — " + err if err else ""))
+                self.bar.setValue(0)
+                return
+            used, total = d.get("used"), d.get("total")
+            if total:
+                pct = max(0, min(1000, int(used / total * 1000))) if used else 0
+                self.bar.setValue(pct)
+                self.quotaLbl.setText("%s of %s used  ·  %s free"
+                                      % (d["used_str"], d["total_str"], d["free_str"]))
+            else:
+                self.bar.setValue(0)
+                self.quotaLbl.setText("%s used (no total reported)" % d["used_str"])
+
+        def toggle_mount(self):
+            name = self.rec["name"]
+            if is_mounted(name):
+                ok, msg = do_unmount(name)
+            else:
+                ok, msg = do_mount(name)
+            if not ok:
+                self.page.win.toast("Mount error: " + (msg or "")[:120])
+            QTimer.singleShot(400, self.refresh_mount_ui)
+
+        def toggle_auto(self, state):
+            enabled = state == Qt.CheckState.Checked.value
+            set_unit_enabled(self.rec["name"], enabled)
+            if enabled:
+                add_to_places(self.rec["name"])
+            self.page.win.toast(
+                ("Auto-mount enabled" if enabled else "Auto-mount disabled")
+                + " for " + self.rec["name"])
+
+        def open_files(self):
+            QProcess.startDetached("xdg-open", [mount_point(self.rec["name"])])
+
+        def remove(self):
+            self.page.win.confirm_remove(self.rec["name"], self.page.reload)
+
+    class AccountsPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self._loaded = False
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(10)
+            head = QHBoxLayout()
+            ttl = QLabel("Your Accounts")
+            ttl.setObjectName("h1")
+            self.refBtn = QPushButton("Refresh")
+            self.refBtn.clicked.connect(self.reload)
+            addBtn = QPushButton("+ Add account")
+            addBtn.setObjectName("primary")
+            addBtn.clicked.connect(lambda: win.go(1))
+            head.addWidget(ttl, 1)
+            head.addWidget(self.refBtn)
+            head.addWidget(addBtn)
+            v.addLayout(head)
+
+            self.depWarn = QLabel("")
+            self.depWarn.setObjectName("warn")
+            self.depWarn.setWordWrap(True)
+            self.depWarn.hide()
+            v.addWidget(self.depWarn)
+
+            self.box = QVBoxLayout()
+            self.box.setSpacing(12)
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            sc.setObjectName("scroll")
+            inner = QWidget()
+            inner.setLayout(self.box)
+            sc.setWidget(inner)
+            v.addWidget(sc, 1)
+
+        def reload(self):
+            self._loaded = True
+            while self.box.count():
+                it = self.box.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+            if not HAS_RCLONE:
+                self.depWarn.setText(
+                    "rclone is not installed — accounts and cloud mounting are "
+                    "unavailable.  Install it from the HasH Software Center, or run:  "
+                    "sudo pacman -S rclone fuse3")
+                self.depWarn.show()
+                empty = QLabel("No cloud engine.  Install rclone to get started.")
+                empty.setObjectName("cardsub")
+                self.box.addWidget(empty)
+                self.box.addStretch(1)
+                return
+            if not HAS_FUSE:
+                self.depWarn.setText("fuse3 is not installed — mounting will fail.  "
+                                     "Install with:  sudo pacman -S fuse3")
+                self.depWarn.show()
+            else:
+                self.depWarn.hide()
+            rows = list_remotes()
+            for r in rows:
+                r["autostart"] = unit_enabled(r["name"])
+            if not rows:
+                empty = QLabel("No accounts yet.  Click “+ Add account” to connect "
+                               "your first cloud drive.")
+                empty.setObjectName("cardsub")
+                empty.setWordWrap(True)
+                self.box.addWidget(empty)
+            for r in rows:
+                self.box.addWidget(AccountCard(self, r))
+            self.box.addStretch(1)
+
+    # ── Add-account wizard ──
+    class WizardPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self.sel = None
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(12)
+            self.steps = QStackedWidget()
+            v.addWidget(self.steps, 1)
+            self.steps.addWidget(self._step_provider())
+            self.steps.addWidget(self._step_name())
+
+        def reload(self):
+            self.steps.setCurrentIndex(0)
+
+        def _step_provider(self):
+            w = QWidget()
+            v = QVBoxLayout(w)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(10)
+            t = QLabel("Add an account — pick a service")
+            t.setObjectName("h1")
+            v.addWidget(t)
+            if not HAS_RCLONE:
+                warn = QLabel("rclone is required to add accounts.  Install it from "
+                              "the HasH Software Center (rclone + fuse3).")
+                warn.setObjectName("warn")
+                warn.setWordWrap(True)
+                v.addWidget(warn)
+            grid = QGridLayout()
+            grid.setSpacing(12)
+            for i, p in enumerate(PROVIDERS):
+                grid.addWidget(self._provider_card(p), i // 2, i % 2)
+            holder = QWidget()
+            holder.setLayout(grid)
+            v.addWidget(holder)
+            v.addStretch(1)
+            return w
+
+        def _provider_card(self, p):
+            c = QFrame()
+            c.setObjectName("provcard")
+            c.setCursor(Qt.CursorShape.PointingHandCursor)
+            h = QHBoxLayout(c)
+            h.setContentsMargins(16, 14, 16, 14)
+            h.setSpacing(14)
+            ic = QLabel()
+            ic.setPixmap(icon_for(p).pixmap(QSize(44, 44)))
+            ic.setFixedSize(44, 44)
+            txt = QVBoxLayout()
+            txt.setSpacing(3)
+            nm = QLabel(p["name"])
+            nm.setObjectName("cardname")
+            bl = QLabel(p["blurb"])
+            bl.setObjectName("cardsub")
+            bl.setWordWrap(True)
+            txt.addWidget(nm)
+            txt.addWidget(bl)
+            h.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+            h.addLayout(txt, 1)
+            c.setStyleSheet(
+                "#provcard{ background:#0d1016; border:1px solid rgba(255,255,255,0.08);"
+                " border-radius:14px; }"
+                f"#provcard:hover{{ border:1px solid {ACCENT}; }}"
+                "#cardname{ color:#fff; font-size:16px; font-weight:700; }"
+                "#cardsub{ color:#94a3a6; font-size:12px; }")
+            c.mousePressEvent = lambda _e, prov=p: self.pick(prov)
+            return c
+
+        def pick(self, p):
+            if not HAS_RCLONE:
+                self.win.toast("Install rclone first (HasH Software Center).")
+                return
+            # iCloud Drive needs the iclouddrive backend (rclone >= 1.66).
+            if p.get("icloud") and not has_backend("iclouddrive"):
+                self.win.toast(
+                    "This rclone build lacks the iclouddrive backend — "
+                    "needs rclone ≥ 1.66. Update rclone, then try again.")
+                return
+            self.sel = p
+            self.nameEdit.setText("")
+            self.nameEdit.setPlaceholderText(p["key"])
+            self.stepTitle.setText("Name your %s account" % p["name"])
+            is_icloud = bool(p.get("icloud"))
+            self.wdavBox.setVisible(not p["oauth"] and not is_icloud)
+            self.icloudBox.setVisible(is_icloud)
+            self.oauthNote.setVisible(p["oauth"])
+            self.icloudNote.setVisible(is_icloud)
+            self.connectBtn.setText("Sign in to iCloud" if is_icloud
+                                    else "Connect & sign in")
+            self.steps.setCurrentIndex(1)
+
+        def _step_name(self):
+            w = QWidget()
+            v = QVBoxLayout(w)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(12)
+            self.stepTitle = QLabel("Name your account")
+            self.stepTitle.setObjectName("h1")
+            v.addWidget(self.stepTitle)
+
+            form = QFrame()
+            form.setObjectName("card")
+            fl = QVBoxLayout(form)
+            fl.setContentsMargins(18, 16, 18, 16)
+            fl.setSpacing(10)
+            fl.addWidget(QLabel("A short name (used for the folder ~/Cloud/<name> "
+                                "and in Dolphin):"))
+            self.nameEdit = QLineEdit()
+            self.nameEdit.setPlaceholderText("e.g. gdrive")
+            fl.addWidget(self.nameEdit)
+
+            # WebDAV/Nextcloud-only fields
+            self.wdavBox = QWidget()
+            wl = QVBoxLayout(self.wdavBox)
+            wl.setContentsMargins(0, 0, 0, 0)
+            wl.setSpacing(8)
+            self.wdUrl = QLineEdit()
+            self.wdUrl.setPlaceholderText("WebDAV URL  e.g. https://cloud.example.com/remote.php/dav/files/USER/")
+            self.wdUser = QLineEdit()
+            self.wdUser.setPlaceholderText("Username")
+            self.wdPass = QLineEdit()
+            self.wdPass.setPlaceholderText("Password / app password")
+            self.wdPass.setEchoMode(QLineEdit.EchoMode.Password)
+            wl.addWidget(self.wdUrl)
+            wl.addWidget(self.wdUser)
+            wl.addWidget(self.wdPass)
+            fl.addWidget(self.wdavBox)
+
+            # iCloud Drive-only fields (Apple ID + password; 2FA handled live)
+            self.icloudBox = QWidget()
+            il = QVBoxLayout(self.icloudBox)
+            il.setContentsMargins(0, 0, 0, 0)
+            il.setSpacing(8)
+            self.icAppleId = QLineEdit()
+            self.icAppleId.setPlaceholderText("Apple ID  e.g. you@icloud.com")
+            self.icPass = QLineEdit()
+            self.icPass.setPlaceholderText("Apple ID password")
+            self.icPass.setEchoMode(QLineEdit.EchoMode.Password)
+            il.addWidget(self.icAppleId)
+            il.addWidget(self.icPass)
+            self.icloudBox.hide()
+            fl.addWidget(self.icloudBox)
+
+            self.mountChk = QCheckBox("Mount as a drive at ~/Cloud/<name> and add to Dolphin")
+            self.mountChk.setChecked(True)
+            self.autoChk = QCheckBox("Auto-mount on login (systemd user service)")
+            self.autoChk.setChecked(load_settings().get("auto_mount", True))
+            fl.addWidget(self.mountChk)
+            fl.addWidget(self.autoChk)
+
+            self.oauthNote = QLabel("Sign-in opens your browser automatically (OAuth). "
+                          "No terminal needed — just approve access and return here.")
+            self.oauthNote.setObjectName("cardsub")
+            self.oauthNote.setWordWrap(True)
+            fl.addWidget(self.oauthNote)
+            self.icloudNote = QLabel("After you sign in, Apple sends a 6-digit "
+                          "two-factor code to your trusted devices — we'll ask for "
+                          "it in a moment. Your password is handed to rclone (which "
+                          "obscures it) and is never stored in plaintext.")
+            self.icloudNote.setObjectName("cardsub")
+            self.icloudNote.setWordWrap(True)
+            self.icloudNote.hide()
+            fl.addWidget(self.icloudNote)
+            v.addWidget(form)
+
+            btns = QHBoxLayout()
+            back = QPushButton("← Back")
+            back.clicked.connect(lambda: self.steps.setCurrentIndex(0))
+            self.connectBtn = QPushButton("Connect & sign in")
+            self.connectBtn.setObjectName("primary")
+            self.connectBtn.clicked.connect(self.do_connect)
+            btns.addWidget(back)
+            btns.addStretch(1)
+            btns.addWidget(self.connectBtn)
+            v.addLayout(btns)
+            v.addStretch(1)
+            return w
+
+        def do_connect(self):
+            name = (self.nameEdit.text().strip() or self.nameEdit.placeholderText()).strip()
+            if not re.match(r"^[A-Za-z0-9_-]+$", name):
+                self.win.toast("Use only letters, numbers, _ and - in the name.")
+                return
+            if name in {r["name"] for r in list_remotes()}:
+                self.win.toast("An account named '%s' already exists." % name)
+                return
+            p = self.sel
+            self._post = {"name": name,
+                          "mount": self.mountChk.isChecked(),
+                          "auto": self.autoChk.isChecked()}
+            # iCloud Drive: Apple ID + password, then a live 2FA-code prompt.
+            if p.get("icloud"):
+                apple_id = self.icAppleId.text().strip()
+                pw = self.icPass.text()
+                if not apple_id or not pw:
+                    self.win.toast("Enter your Apple ID and password.")
+                    return
+                self.win.run_icloud(
+                    "Signing in to iCloud Drive — Apple may ask for a 2FA code",
+                    icloud_config_argv(name, apple_id), pw, self._connected)
+                return
+            argv = [RCLONE, "config", "create", name, p["rtype"]]
+            if not p["oauth"]:
+                url = self.wdUrl.text().strip()
+                if not url:
+                    self.win.toast("Enter the WebDAV/Nextcloud URL.")
+                    return
+                argv += ["url", url, "vendor", "nextcloud",
+                         "user", self.wdUser.text().strip(),
+                         "pass", self.wdPass.text()]
+            # For OAuth providers, `rclone config create` opens the browser and
+            # captures the token automatically (no terminal interaction).
+            self.win.run_proc("Connecting %s — approve access in your browser" % p["name"],
+                              argv, self._connected)
+
+        def _connected(self, ok):
+            if not ok:
+                self.win.toast("Sign-in failed or cancelled.")
+                return
+            d = self._post
+            name = d["name"]
+            if d["mount"]:
+                os.makedirs(mount_point(name), exist_ok=True)
+                add_to_places(name)
+                do_mount(name)
+            if d["auto"]:
+                set_unit_enabled(name, True)
+            self.win.toast("Connected '%s'." % name)
+            self.win.go(0)
+            self.win.pages[0].reload()
+
+    # ── Storage page: unified quota view ──
+    class StoragePage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self._loaded = False
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(10)
+            head = QHBoxLayout()
+            ttl = QLabel("Cloud Storage")
+            ttl.setObjectName("h1")
+            ref = QPushButton("Refresh")
+            ref.clicked.connect(self.reload)
+            head.addWidget(ttl, 1)
+            head.addWidget(ref)
+            v.addLayout(head)
+            self.box = QVBoxLayout()
+            self.box.setSpacing(12)
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            sc.setObjectName("scroll")
+            inner = QWidget()
+            inner.setLayout(self.box)
+            sc.setWidget(inner)
+            v.addWidget(sc, 1)
+
+        def reload(self):
+            self._loaded = True
+            while self.box.count():
+                it = self.box.takeAt(0)
+                w = it.widget()
+                if w:
+                    w.deleteLater()
+            rows = list_remotes() if HAS_RCLONE else []
+            if not rows:
+                lbl = QLabel("No accounts connected yet." if HAS_RCLONE else
+                             "rclone not installed.")
+                lbl.setObjectName("cardsub")
+                self.box.addWidget(lbl)
+                self.box.addStretch(1)
+                return
+            for r in rows:
+                self.box.addWidget(self._storage_row(r))
+            self.box.addStretch(1)
+
+        def _storage_row(self, rec):
+            c = QFrame()
+            c.setObjectName("card")
+            g = QGridLayout(c)
+            g.setContentsMargins(16, 14, 16, 14)
+            g.setHorizontalSpacing(14)
+            ic = QLabel()
+            ic.setPixmap(icon_for(rec).pixmap(QSize(40, 40)))
+            ic.setFixedSize(40, 40)
+            g.addWidget(ic, 0, 0, 2, 1)
+            nm = QLabel(rec["name"])
+            nm.setObjectName("cardname")
+            g.addWidget(nm, 0, 1)
+            bar = QProgressBar()
+            bar.setObjectName("quota")
+            bar.setTextVisible(False)
+            bar.setFixedHeight(10)
+            bar.setRange(0, 1000)
+            g.addWidget(bar, 1, 1)
+            lbl = QLabel("Loading…")
+            lbl.setObjectName("cardsub")
+            g.addWidget(lbl, 2, 1)
+            c.setStyleSheet(
+                "#card{ background:#0d1016; border:1px solid rgba(255,255,255,0.08);"
+                " border-radius:14px; }"
+                "#cardname{ color:#fff; font-size:16px; font-weight:700; }"
+                "#cardsub{ color:#94a3a6; font-size:12px; }"
+                "QProgressBar#quota{ background:rgba(255,255,255,0.08); border:none;"
+                " border-radius:5px; }"
+                f"QProgressBar#quota::chunk{{ background:{ACCENT}; border-radius:5px; }}")
+            w = Worker(remote_about, rec["name"])
+
+            def got(d, bar=bar, lbl=lbl):
+                if isinstance(d, dict) and d.get("ok") and d.get("total"):
+                    used = d.get("used") or 0
+                    bar.setValue(max(0, min(1000, int(used / d["total"] * 1000))))
+                    lbl.setText("%s of %s used  ·  %s free"
+                                % (d["used_str"], d["total_str"], d["free_str"]))
+                else:
+                    bar.setValue(0)
+                    lbl.setText("Quota unavailable")
+            w.done.connect(got)
+            w.start()
+            self._keep = getattr(self, "_keep", [])
+            self._keep.append(w)
+            return c
+
+    # ── Settings page ──
+    class SettingsPage(QWidget):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self._loaded = False
+            v = QVBoxLayout(self)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(12)
+            ttl = QLabel("Settings")
+            ttl.setObjectName("h1")
+            v.addWidget(ttl)
+
+            form = QFrame()
+            form.setObjectName("card")
+            fl = QVBoxLayout(form)
+            fl.setContentsMargins(18, 16, 18, 16)
+            fl.setSpacing(10)
+
+            fl.addWidget(QLabel("Mount root — where cloud drives appear:"))
+            self.rootEdit = QLineEdit()
+            fl.addWidget(self.rootEdit)
+
+            fl.addWidget(QLabel("VFS cache size — max disk used for on-demand caching:"))
+            self.cacheEdit = QLineEdit()
+            self.cacheEdit.setPlaceholderText("e.g. 5G, 20G, 100M")
+            fl.addWidget(self.cacheEdit)
+
+            fl.addWidget(QLabel("VFS cache mode:"))
+            self.modeBox = QComboBox()
+            for m in ("off", "minimal", "writes", "full"):
+                self.modeBox.addItem(m)
+            fl.addWidget(self.modeBox)
+
+            self.autoChk = QCheckBox("Default new accounts to auto-mount on login")
+            fl.addWidget(self.autoChk)
+
+            save = QPushButton("Save settings")
+            save.setObjectName("primary")
+            save.clicked.connect(self.save)
+            fl.addWidget(save)
+
+            self.depLbl = QLabel("")
+            self.depLbl.setObjectName("cardsub")
+            self.depLbl.setWordWrap(True)
+            fl.addWidget(self.depLbl)
+            v.addWidget(form)
+            v.addStretch(1)
+
+        def reload(self):
+            self._loaded = True
+            s = load_settings()
+            self.rootEdit.setText(s.get("mount_root", DEFAULTS["mount_root"]))
+            self.cacheEdit.setText(s.get("vfs_cache_max", "5G"))
+            idx = self.modeBox.findText(s.get("vfs_cache_mode", "writes"))
+            self.modeBox.setCurrentIndex(max(0, idx))
+            self.autoChk.setChecked(s.get("auto_mount", True))
+            deps = []
+            deps.append("rclone: " + ("installed (%s)" % RCLONE if HAS_RCLONE
+                        else "MISSING — install rclone"))
+            deps.append("fuse3: " + ("installed" if HAS_FUSE else "MISSING — install fuse3"))
+            self.depLbl.setText("Dependencies — " + "   ·   ".join(deps))
+
+        def save(self):
+            s = load_settings()
+            s["mount_root"] = self.rootEdit.text().strip() or DEFAULTS["mount_root"]
+            s["vfs_cache_max"] = self.cacheEdit.text().strip() or "5G"
+            s["vfs_cache_mode"] = self.modeBox.currentText()
+            s["auto_mount"] = self.autoChk.isChecked()
+            save_settings(s)
+            self.win.toast("Settings saved.")
+
+    # ── toast / confirm ──
+    class Toast(QLabel):
+        def __init__(self, win):
+            super().__init__(win)
+            self.setObjectName("toast")
+            self.hide()
+            self.setStyleSheet(
+                "#toast{ background:#1b2730; color:#dff0f3; border:1px solid %s;"
+                " border-radius:10px; padding:9px 16px; font-size:13px; }" % ACCENT)
+            self._t = QTimer(self)
+            self._t.setSingleShot(True)
+            self._t.timeout.connect(self.hide)
+
+        def show_msg(self, txt):
+            self.setText(txt)
+            self.adjustSize()
+            pw = self.parent().width()
+            self.move((pw - self.width()) // 2, self.parent().height() - self.height() - 28)
+            self.show()
+            self.raise_()
+            self._t.start(3200)
+
+    class TwoFactorDialog(QWidget):
+        """Collects the Apple 2-factor code and hands it back to IcloudWin."""
+        def __init__(self, parent, on_submit, on_cancel):
+            super().__init__(parent, Qt.WindowType.Window
+                             | Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setObjectName("txwin")
+            self.resize(360, 200)
+            self._on_submit, self._on_cancel = on_submit, on_cancel
+            v = QVBoxLayout(self)
+            v.setContentsMargins(22, 20, 22, 18)
+            v.setSpacing(12)
+            t = QLabel("Apple two-factor code")
+            t.setObjectName("txtitle")
+            d = QLabel("Apple sent a 6-digit verification code to your trusted "
+                       "devices. Enter it to finish signing in to iCloud Drive.")
+            d.setObjectName("cardsub")
+            d.setWordWrap(True)
+            self.code = QLineEdit()
+            self.code.setPlaceholderText("123456")
+            self.code.setMaxLength(8)
+            self.code.returnPressed.connect(self._go)
+            row = QHBoxLayout()
+            cancel = QPushButton("Cancel")
+            cancel.clicked.connect(self._cancel)
+            ok = QPushButton("Verify")
+            ok.setObjectName("primary")
+            ok.clicked.connect(self._go)
+            row.addStretch(1)
+            row.addWidget(cancel)
+            row.addWidget(ok)
+            v.addWidget(t)
+            v.addWidget(d)
+            v.addWidget(self.code)
+            v.addLayout(row)
+            self.setStyleSheet("""
+                #txwin{ background:#14161d; border:1px solid rgba(255,255,255,0.12);
+                        border-radius:16px; }
+                #txtitle{ color:#fff; font-size:16px; font-weight:700; }
+                #cardsub{ color:#94a3a6; font-size:12px; }
+            """ + btn_qss())
+            self.code.setFocus()
+
+        def _go(self):
+            c = self.code.text().strip()
+            if not re.match(r"^\d{4,8}$", c):
+                self.code.setStyleSheet("border:1px solid %s;" % DANGER)
+                return
+            self._on_submit(c)
+            self.close()
+
+        def _cancel(self):
+            self._on_cancel()
+            self.close()
+
+    class ConfirmDialog(QWidget):
+        def __init__(self, parent, name, on_yes):
+            super().__init__(parent, Qt.WindowType.Window
+                             | Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setObjectName("txwin")
+            self.resize(420, 190)
+            v = QVBoxLayout(self)
+            v.setContentsMargins(22, 20, 22, 18)
+            v.setSpacing(12)
+            t = QLabel("Remove account '%s'?" % name)
+            t.setObjectName("txtitle")
+            d = QLabel("This unmounts the drive, removes its auto-mount service and "
+                       "Dolphin entry, and deletes the rclone remote (token).")
+            d.setObjectName("cardsub")
+            d.setWordWrap(True)
+            row = QHBoxLayout()
+            cancel = QPushButton("Cancel")
+            cancel.clicked.connect(self.close)
+            yes = QPushButton("Remove")
+            yes.setObjectName("danger")
+
+            def go():
+                remove_remote(name)
+                on_yes()
+                self.close()
+            yes.clicked.connect(go)
+            row.addStretch(1)
+            row.addWidget(cancel)
+            row.addWidget(yes)
+            v.addWidget(t)
+            v.addWidget(d, 1)
+            v.addLayout(row)
+            self.setStyleSheet("""
+                #txwin{ background:#14161d; border:1px solid rgba(255,255,255,0.12);
+                        border-radius:16px; }
+                #txtitle{ color:#fff; font-size:16px; font-weight:700; }
+                #cardsub{ color:#94a3a6; font-size:12px; }
+            """ + btn_qss())
+
+    class Accounts(QWidget):
+        def __init__(self):
+            super().__init__(None, Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setWindowTitle("HasH Accounts")
+            scr = (QApplication.screenAt(QCursor.pos())
+                   or QApplication.primaryScreen()).geometry()
+            W = max(880, int(scr.height() * 0.86))
+            H = max(560, int(scr.height() * 0.66))
+            self.resize(W, H)
+            self.move(scr.center().x() - W // 2, scr.center().y() - H // 2)
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(1, 1, 1, 1)
+            root.setSpacing(0)
+            root.addWidget(TitleBar(self))
+
+            body = QHBoxLayout()
+            body.setContentsMargins(14, 4, 14, 14)
+            body.setSpacing(14)
+
+            side = QVBoxLayout()
+            side.setSpacing(6)
+            self.nav, self.pages = [], []
+            self.stack = QStackedWidget()
+            specs = [("accounts", "Accounts", "user-identity"),
+                     ("add", "Add account", "list-add"),
+                     ("storage", "Storage", "drive-harddisk"),
+                     ("settings", "Settings", "configure")]
+            builders = {"accounts": AccountsPage, "add": WizardPage,
+                        "storage": StoragePage, "settings": SettingsPage}
+            for i, (key, label, icon) in enumerate(specs):
+                b = QPushButton("  " + label)
+                b.setCheckable(True)
+                b.setObjectName("nav")
+                b.setIcon(QIcon.fromTheme(icon))
+                b.setIconSize(QSize(20, 20))
+                b.clicked.connect(lambda _, n=i: self.go(n))
+                side.addWidget(b)
+                self.nav.append(b)
+                pg = builders[key](self)
+                self.pages.append(pg)
+                self.stack.addWidget(pg)
+            side.addStretch(1)
+            brand = QLabel("HasH-Arch")
+            brand.setObjectName("brand")
+            side.addWidget(brand)
+            sw = QWidget()
+            sw.setObjectName("sidebar")
+            sw.setLayout(side)
+            sw.setFixedWidth(184)
+            body.addWidget(sw)
+            body.addWidget(self.stack, 1)
+            root.addLayout(body, 1)
+            self.setStyleSheet(app_qss())
+            self.toaster = Toast(self)
+            self.go(start_page)
+
+        def go(self, n):
+            for i, b in enumerate(self.nav):
+                b.setChecked(i == n)
+            self.stack.setCurrentIndex(n)
+            pg = self.stack.currentWidget()
+            if hasattr(pg, "reload") and not getattr(pg, "_loaded", True):
+                pg.reload()
+            elif n in (0, 2) and hasattr(pg, "reload"):
+                pg.reload()
+            elif n == 1 and hasattr(pg, "reload"):
+                pg.reload()
+            elif n == 3 and hasattr(pg, "reload"):
+                pg.reload()
+
+        def toast(self, txt):
+            self.toaster.show_msg(txt)
+
+        def confirm_remove(self, name, on_done):
+            self._cd = ConfirmDialog(self, name, on_done)
+            g = self.geometry()
+            self._cd.move(g.center().x() - 210, g.center().y() - 95)
+            self._cd.show()
+
+        def run_proc(self, title, argv, on_done):
+            self._pw = ProcWin(self, title, argv)
+            self._pw.finishedOk.connect(on_done)
+            g = self.geometry()
+            self._pw.move(g.center().x() - 340, g.center().y() - 230)
+            self._pw.show()
+
+        def run_icloud(self, title, argv, password, on_done):
+            self._pw = IcloudWin(self, title, argv, password)
+            self._pw.finishedOk.connect(on_done)
+            g = self.geometry()
+            self._pw.move(g.center().x() - 340, g.center().y() - 230)
+            self._pw.show()
+
+        def paintEvent(self, _e):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1, 20, 20)
+            p.fillPath(path, QColor(0x12, 0x14, 0x1a))
+            p.setPen(QColor(255, 255, 255, 30))
+            p.drawPath(path)
+
+    def app_qss():
+        return f"""
+            #sidebar{{ background:rgba(255,255,255,0.03); border-radius:14px; }}
+            #apptitle{{ color:#fff; font-size:15px; font-weight:700; }}
+            QPushButton#winbtn{{ background:transparent; color:#9fb0b4; border:none;
+                border-radius:8px; font-size:14px; }}
+            QPushButton#winbtn:hover{{ background:rgba(255,255,255,0.12); color:#fff; }}
+            QPushButton#nav{{ text-align:left; background:transparent; color:#c6d2d5;
+                border:none; border-radius:10px; padding:10px 12px; font-size:14px; }}
+            QPushButton#nav:hover{{ background:rgba(255,255,255,0.07); }}
+            QPushButton#nav:checked{{ background:{ACCENT}; color:#06222a; font-weight:700; }}
+            #brand{{ color:rgba(255,255,255,0.30); font-size:11px;
+                qproperty-alignment:'AlignCenter'; padding:4px; }}
+            #h1{{ color:#fff; font-size:20px; font-weight:800; }}
+            #warn{{ color:#f6c177; background:rgba(246,193,119,0.08);
+                border:1px solid rgba(246,193,119,0.30); border-radius:10px;
+                padding:9px 12px; font-size:12px; }}
+            QLineEdit,QComboBox{{ background:#0e1117; color:#e8eef0;
+                border:1px solid rgba(255,255,255,0.12); border-radius:10px;
+                padding:7px 11px; font-size:13px; }}
+            QLineEdit:focus,QComboBox:focus{{ border:1px solid {ACCENT}; }}
+            QComboBox QAbstractItemView{{ background:#14161d; color:#e8eef0;
+                selection-background-color:{ACCENT}; selection-color:#06222a; }}
+            QCheckBox{{ color:#c6d2d5; font-size:13px; }}
+            QLabel{{ color:#dfe9eb; }}
+            QScrollArea#scroll{{ background:transparent; border:none; }}
+            QScrollArea#scroll > QWidget > QWidget{{ background:transparent; }}
+            QScrollBar:vertical{{ background:transparent; width:10px; }}
+            QScrollBar::handle:vertical{{ background:rgba(255,255,255,0.18);
+                border-radius:5px; min-height:30px; }}
+            QScrollBar::add-line,QScrollBar::sub-line{{ height:0; }}
+        """ + btn_qss()
+
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("HasH Accounts")
+    app.setDesktopFileName("hash-accounts")
+    app.setWindowIcon(QIcon.fromTheme("hash-accounts"))
+    w = Accounts()
+    w.show()
+    if shot:
+        def _grab():
+            w.grab().save(shot)
+            os._exit(0)
+        QTimer.singleShot(2200, _grab)
+    return app.exec()
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] == "backend":
+        return cli(a[1:])
+    start = 0
+    if "--add" in a:
+        start = 1
+    elif "--storage" in a:
+        start = 2
+    elif "--settings" in a:
+        start = 3
+    shot = None
+    if "--shot" in a:
+        i = a.index("--shot")
+        shot = a[i + 1] if i + 1 < len(a) else "/tmp/hash-accounts-shot.png"
+    return gui(start, shot)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

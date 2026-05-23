@@ -1,0 +1,34 @@
+# HasH-Arch Watch Dogs boot animation. Plays the frame sequence centred on a
+# black background, looping, with NO text/prompts/spinner — just the animation.
+
+Window.SetBackgroundTopColor(0.0, 0.0, 0.0);
+Window.SetBackgroundBottomColor(0.0, 0.0, 0.0);
+
+logo.num_frames = 181;
+for (i = 1; i <= logo.num_frames; i++)
+    logo.frames[i] = Image("frames/frame-" + i + ".png");
+
+logo.sprite = Sprite();
+logo.w = logo.frames[1].GetWidth();
+logo.h = logo.frames[1].GetHeight();
+logo.sprite.SetX(Window.GetWidth()  / 2 - logo.w / 2);
+logo.sprite.SetY(Window.GetHeight() / 2 - logo.h / 2);
+logo.sprite.SetImage(logo.frames[1]);
+
+# Plymouth refreshes ~50x/sec; advance one frame every 3rd tick (~17fps), loop.
+progress = 0;
+fun refresh_callback() {
+    progress++;
+    f = Math.Int(progress / 3);
+    while (f >= logo.num_frames) f -= logo.num_frames;
+    logo.sprite.SetImage(logo.frames[f + 1]);
+}
+Plymouth.SetRefreshFunction(refresh_callback);
+
+# Silent: swallow any boot messages / password prompts so nothing but the
+# animation shows (the user wanted no code/lines).
+fun quiet() { }
+Plymouth.SetDisplayPasswordFunction(quiet);
+Plymouth.SetDisplayQuestionFunction(quiet);
+Plymouth.SetMessageFunction(quiet);
+Plymouth.SetDisplayNormalFunction(quiet);
